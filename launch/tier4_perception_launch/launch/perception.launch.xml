@@ -93,7 +93,7 @@
   <arg name="use_pointcloud_map" default="true" description="use pointcloud map in detection"/>
   <arg name="use_low_height_cropbox" default="true" description="use low height crop filter in the euclidean clustering"/>
   <arg name="use_object_filter" default="true" description="use object filter"/>
-  <arg name="objects_filter_method" default="lanelet_filter" description="options: `lanelet_filter` or `position_filter`"/>
+  <arg name="detected_objects_filter_method" default="lanelet_filter" description="options: `lanelet_filter` or `position_filter`"/>
   <arg name="use_irregular_object_detector" default="true" description="enable pipeline for small unknown object detection"/>
   <arg name="use_low_intensity_cluster_filter" default="true" description="use low_intensity_cluster_filter in clustering"/>
   <arg name="use_image_segmentation_based_filter" default="false" description="use image_segmentation_based_filter in clustering"/>
@@ -141,9 +141,9 @@
 
   <!-- Downsample pointcloud for perception usage -->
   <arg name="downsample_perception_common_pointcloud" default="false"/>
-  <arg name="common_downsample_voxel_size_x" default="0.05"/>
-  <arg name="common_downsample_voxel_size_y" default="0.05"/>
-  <arg name="common_downsample_voxel_size_z" default="0.05"/>
+  <arg name="common_downsample_voxel_size_x" default="0.2"/>
+  <arg name="common_downsample_voxel_size_y" default="0.2"/>
+  <arg name="common_downsample_voxel_size_z" default="0.2"/>
 
   <!-- Perception module -->
   <group>
@@ -266,7 +266,7 @@
           <arg name="use_low_intensity_cluster_filter" value="$(var use_low_intensity_cluster_filter)"/>
           <arg name="use_image_segmentation_based_filter" value="$(var use_image_segmentation_based_filter)"/>
           <arg name="use_object_filter" value="$(var use_object_filter)"/>
-          <arg name="objects_filter_method" value="$(var objects_filter_method)"/>
+          <arg name="objects_filter_method" value="$(var detected_objects_filter_method)"/>
           <arg name="use_irregular_object_detector" value="$(var use_irregular_object_detector)"/>
           <arg name="image_topic_name" value="$(var image_topic_name)"/>
         </include>
