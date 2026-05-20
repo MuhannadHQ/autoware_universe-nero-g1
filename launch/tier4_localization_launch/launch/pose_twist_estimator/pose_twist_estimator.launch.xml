@@ -137,6 +137,11 @@
       <include file="$(find-pkg-share autoware_automatic_pose_initializer)/launch/automatic_pose_initializer.launch.xml"/>
     </group>
 
+    <!-- autooware_pose_reinitializer -->
+    <group>
+      <include file="$(find-pkg-share autoware_pose_reinitializer)/launch/pose_reinitializer.launch.xml"/>
+    </group>
+
     <!-- pointcloud_downsampling -->
     <let name="override_input_pointcloud" value="$(var input_pointcloud)"/>
     <let name="override_input_pointcloud" value="$(var input_pointcloud)/relay" if="$(var multi_localizer_mode)"/>
