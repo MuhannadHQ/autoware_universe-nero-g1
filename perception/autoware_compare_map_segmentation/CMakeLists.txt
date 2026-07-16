@@ -47,6 +47,7 @@ ament_target_dependencies(${PROJECT_NAME}
   autoware_utils
   autoware_map_msgs
   nav_msgs
+  diagnostic_updater
 )
 
 if(OPENMP_FOUND)
