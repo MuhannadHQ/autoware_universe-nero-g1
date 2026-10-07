@@ -345,6 +345,12 @@ void FreespacePlannerNode::onTimer()
 
   // StopTrajectory
   if (trajectory_.points.size() <= 1) {
+    // NERO: no plan yet (waiting to stop, replanning, A* failed, new parking cycle).
+    // Hold in place instead of going silent: a silent output trips
+    // topic_state_monitor (timeout 1 s) and the MRM emergency stop.
+    const auto hold = utils::create_stop_trajectory(current_pose_, get_clock());
+    trajectory_pub_->publish(hold);
+    debug_partial_pose_array_pub_->publish(utils::trajectory_to_pose_array(hold));
     is_new_parking_cycle_ = false;
     return;
   }

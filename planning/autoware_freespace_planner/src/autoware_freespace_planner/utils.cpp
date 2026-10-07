@@ -18,6 +18,9 @@
 #include <autoware_utils/geometry/geometry.hpp>
 #include <autoware_utils/geometry/pose_deviation.hpp>
 
+#include <tf2/utils.h>
+
+#include <cmath>
 #include <deque>
 #include <vector>
 
@@ -152,6 +155,17 @@ Trajectory create_stop_trajectory(
   waypoint.pose.pose = current_pose.pose;
   waypoint.is_back = false;
   waypoints.waypoints.push_back(waypoint);
+
+  // NERO: a one-point trajectory is dropped by the velocity smoother ("size must > 1"),
+  // which silences the planning output and trips the topic monitor -> MRM.
+  // Add a short zero-speed tail (1 m, 0.1 m steps) ahead of ego.
+  const double yaw = tf2::getYaw(current_pose.pose.orientation);
+  for (int i = 1; i <= 10; ++i) {
+    PlannerWaypoint ahead = waypoint;
+    ahead.pose.pose.position.x += 0.1 * i * std::cos(yaw);
+    ahead.pose.pose.position.y += 0.1 * i * std::sin(yaw);
+    waypoints.waypoints.push_back(ahead);
+  }
 
   return create_trajectory(current_pose, waypoints, 0.0);
 }

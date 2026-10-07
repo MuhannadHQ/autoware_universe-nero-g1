@@ -86,8 +86,12 @@ GoalPlannerModule::GoalPlannerModule(
 
   // timer callback for generating lane parking candidate paths
   const auto lane_parking_period_ns = rclcpp::Rate(1.0).period();
-  lane_parking_timer_cb_group_ =
+  // static: created once per process. A route reset destroys this module while the
+  // MultiThreadedExecutor waits on its group -> "guard condition implementation is
+  // invalid" kills behavior_planning_container (autoware_universe #12460).
+  static const auto lane_parking_timer_cb_group =
     node.create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+  lane_parking_timer_cb_group_ = lane_parking_timer_cb_group;
   lane_parking_timer_ = rclcpp::create_timer(
     &node, clock_, lane_parking_period_ns,
     [lane_parking_executor = std::make_unique<LaneParkingPlanner>(
@@ -101,8 +105,10 @@ GoalPlannerModule::GoalPlannerModule(
   if (parameters_.enable_freespace_parking) {
     auto freespace_planner = std::make_shared<FreespacePullOver>(node, *parameters);
     const auto freespace_parking_period_ns = rclcpp::Rate(1.0).period();
-    freespace_parking_timer_cb_group_ =
+    // static for the same reason as lane_parking_timer_cb_group (#12460)
+    static const auto freespace_parking_timer_cb_group =
       node.create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+    freespace_parking_timer_cb_group_ = freespace_parking_timer_cb_group;
     freespace_parking_timer_ = rclcpp::create_timer(
       &node, clock_, freespace_parking_period_ns,
       [freespace_parking_executor = std::make_unique<FreespaceParkingPlanner>(

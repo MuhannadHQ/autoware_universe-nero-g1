@@ -45,6 +45,13 @@ MrmHandler::MrmHandler(const rclcpp::NodeOptions & options) : Node("mrm_handler"
       "~/input/operation_mode_availability", rclcpp::QoS{1},
       std::bind(&MrmHandler::onOperationModeAvailability, this, _1));
 
+  // NERO: nothing in v0.44 ever resets is_emergency_holding_, so without this the latch
+  // only clears by restarting the node. Default callback group: mutually exclusive with the
+  // availability subscription and the timer that read the flag.
+  srv_clear_emergency_holding_ = create_service<std_srvs::srv::Trigger>(
+    "~/clear_emergency_holding",
+    std::bind(&MrmHandler::onClearEmergencyHolding, this, _1, std::placeholders::_2));
+
   // Publisher
   pub_hazard_cmd_ = create_publisher<autoware_vehicle_msgs::msg::HazardLightsCommand>(
     "~/output/hazard", rclcpp::QoS{1});
@@ -110,6 +117,28 @@ void MrmHandler::onOperationModeAvailability(
   const auto emergency_duration =
     (this->now() - stamp_autonomous_become_unavailable_.value()).seconds();
   is_emergency_holding_ = (emergency_duration > param_.timeout_emergency_recovery);
+}
+
+void MrmHandler::onClearEmergencyHolding(
+  const std_srvs::srv::Trigger::Request::SharedPtr /*request*/,
+  std_srvs::srv::Trigger::Response::SharedPtr response)
+{
+  if (!is_emergency_holding_) {
+    response->success = true;
+    response->message = "not latched";
+    return;
+  }
+  // Releasing while the cause is still there would only re-latch it.
+  if (!operation_mode_availability_ || !operation_mode_availability_->autonomous) {
+    response->success = false;
+    response->message = "the cause is still active: autonomous mode is unavailable";
+    return;
+  }
+  is_emergency_holding_ = false;
+  stamp_autonomous_become_unavailable_.reset();
+  RCLCPP_WARN(get_logger(), "Emergency holding cleared by operator request.");
+  response->success = true;
+  response->message = "latch cleared";
 }
 
 void MrmHandler::publishHazardCmd()

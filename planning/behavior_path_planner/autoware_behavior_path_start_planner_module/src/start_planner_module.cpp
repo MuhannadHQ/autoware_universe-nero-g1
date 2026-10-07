@@ -83,8 +83,12 @@ StartPlannerModule::StartPlannerModule(
   if (parameters_->enable_freespace_planner) {
     freespace_planner_ = std::make_unique<FreespacePullOut>(node, *parameters);
     const auto freespace_planner_period_ns = rclcpp::Rate(1.0).period();
-    freespace_planner_timer_cb_group_ =
+    // static: created once per process. A route reset destroys this module while the
+    // MultiThreadedExecutor waits on its group -> "guard condition implementation is
+    // invalid" kills behavior_planning_container (autoware_universe #12460).
+    static const auto freespace_planner_timer_cb_group =
       node.create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+    freespace_planner_timer_cb_group_ = freespace_planner_timer_cb_group;
     freespace_planner_timer_ = rclcpp::create_timer(
       &node, clock_, freespace_planner_period_ns,
       std::bind(&StartPlannerModule::onFreespacePlannerTimer, this),

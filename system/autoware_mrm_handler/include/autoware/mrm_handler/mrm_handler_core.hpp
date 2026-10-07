@@ -33,6 +33,7 @@
 #include <tier4_system_msgs/msg/mrm_behavior_status.hpp>
 #include <tier4_system_msgs/msg/operation_mode_availability.hpp>
 #include <tier4_system_msgs/srv/operate_mrm.hpp>
+#include <std_srvs/srv/trigger.hpp>
 
 // ROS 2 core
 #include <rclcpp/create_timer.hpp>
@@ -75,6 +76,12 @@ private:
   // Subscribers with callback
   rclcpp::Subscription<tier4_system_msgs::msg::OperationModeAvailability>::SharedPtr
     sub_operation_mode_availability_;
+
+  // NERO: operator release of the emergency holding latch (dashboard button via the bridge).
+  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr srv_clear_emergency_holding_;
+  void onClearEmergencyHolding(
+    const std_srvs::srv::Trigger::Request::SharedPtr request,
+    std_srvs::srv::Trigger::Response::SharedPtr response);
   // Subscribers without callback
   autoware_utils::InterProcessPollingSubscriber<nav_msgs::msg::Odometry> sub_odom_{
     this, "~/input/odometry"};
