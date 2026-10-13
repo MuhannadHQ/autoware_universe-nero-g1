@@ -28,6 +28,21 @@
 #include <utility>
 #include <vector>
 
+namespace
+{
+// Nero c3: like autoware_utils::get_or_declare_parameter, but with a default value for the new
+// optional parameters (the stock helper throws if the parameter is not in the param file)
+template <class T>
+T get_or_declare_parameter_with_default(
+  rclcpp::Node & node, const std::string & name, const T & default_value)
+{
+  if (node.has_parameter(name)) {
+    return node.get_parameter(name).get_value<T>();
+  }
+  return node.declare_parameter<T>(name, default_value);
+}
+}  // namespace
+
 namespace autoware::behavior_velocity_planner
 {
 using autoware_utils::get_or_declare_parameter;
@@ -149,6 +164,13 @@ IntersectionModuleManager::IntersectionModuleManager(rclcpp::Node & node)
       node, ns + ".collision_detection.collision_detection_hold_time");
     ip.collision_detection.min_predicted_path_confidence = get_or_declare_parameter<double>(
       node, ns + ".collision_detection.min_predicted_path_confidence");
+    {
+      // junction-yield 10-11: optional, absent from the stock yaml -> false (stock behaviour)
+      const std::string name = ns + ".collision_detection.cut_predicted_path_with_start_margin";
+      ip.collision_detection.cut_predicted_path_with_start_margin =
+        node.has_parameter(name) ? node.get_parameter(name).as_bool()
+                                 : node.declare_parameter<bool>(name, false);
+    }
 
     // target_type
     {
@@ -180,6 +202,15 @@ IntersectionModuleManager::IntersectionModuleManager(rclcpp::Node & node)
       ip.collision_detection.velocity_profile.minimum_default_velocity =
         get_or_declare_parameter<double>(
           node, ns + ".collision_detection.velocity_profile.minimum_default_velocity");
+      // junction-yield 10-11: optional, absent from the stock yaml -> 0.0 (stock behaviour)
+      for (const auto & [key, dst] : std::vector<std::pair<std::string, double *>>{
+             {"standstill_start_acceleration",
+              &ip.collision_detection.velocity_profile.standstill_start_acceleration},
+             {"standstill_start_delay", &ip.collision_detection.velocity_profile.standstill_start_delay}}) {
+        const std::string name = ns + ".collision_detection.velocity_profile." + key;
+        *dst = node.has_parameter(name) ? node.get_parameter(name).as_double()
+                                        : node.declare_parameter<double>(name, 0.0);
+      }
     }
 
     // fully_prioritized
@@ -249,6 +280,33 @@ IntersectionModuleManager::IntersectionModuleManager(rclcpp::Node & node)
         node, ns +
                 ".collision_detection.avoid_collision_by_acceleration.object_time_margin_to_"
                 "collision_point");
+
+    // Nero c3: optional parameters. They are declared WITH defaults so that existing param files
+    // (which do not have them) still load, and the defaults reproduce the c2 behaviour.
+    // unknown_filter
+    {
+      auto & uf = ip.collision_detection.unknown_filter;
+      uf.enable = ::get_or_declare_parameter_with_default<bool>(
+        node, ns + ".collision_detection.unknown_filter.enable", false);
+      uf.min_area = ::get_or_declare_parameter_with_default<double>(
+        node, ns + ".collision_detection.unknown_filter.min_area", 2.0);
+      uf.min_speed = ::get_or_declare_parameter_with_default<double>(
+        node, ns + ".collision_detection.unknown_filter.min_speed", 1.0);
+      uf.min_duration = ::get_or_declare_parameter_with_default<double>(
+        node, ns + ".collision_detection.unknown_filter.min_duration", 0.5);
+    }
+    // wrong_way_watch
+    {
+      auto & ww = ip.collision_detection.wrong_way_watch;
+      ww.enable = ::get_or_declare_parameter_with_default<bool>(
+        node, ns + ".collision_detection.wrong_way_watch.enable", false);
+      ww.max_decel = ::get_or_declare_parameter_with_default<double>(
+        node, ns + ".collision_detection.wrong_way_watch.max_decel", 2.5);
+      ww.min_speed = ::get_or_declare_parameter_with_default<double>(
+        node, ns + ".collision_detection.wrong_way_watch.min_speed", 1.0);
+      ww.prediction_horizon = ::get_or_declare_parameter_with_default<double>(
+        node, ns + ".collision_detection.wrong_way_watch.prediction_horizon", 5.0);
+    }
   }
 
   // occlusion

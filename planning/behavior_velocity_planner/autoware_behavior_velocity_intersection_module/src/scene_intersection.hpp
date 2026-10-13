@@ -34,6 +34,7 @@
 #include <lanelet2_core/primitives/LineString.h>
 #include <lanelet2_routing/Forward.h>
 
+#include <map>
 #include <memory>
 #include <optional>
 #include <set>
@@ -45,6 +46,12 @@
 
 namespace autoware::behavior_velocity_planner
 {
+
+//! Nero c3: map key of an object uuid (raw 16 bytes)
+inline std::string uuidKey(const unique_identifier_msgs::msg::UUID & uuid)
+{
+  return std::string(uuid.uuid.begin(), uuid.uuid.end());
+}
 
 class IntersectionModule : public SceneModuleInterfaceWithRTC
 {
@@ -106,6 +113,9 @@ public:
       bool consider_wrong_direction_vehicle;
       double collision_detection_hold_time;
       double min_predicted_path_confidence;
+      //! junction-yield 10-11 (port of autoware_universe#11774, param-gated, default false = stock):
+      //! cut the predicted paths at passing_time + collision_start_margin_time instead of passing_time
+      bool cut_predicted_path_with_start_margin{false};
       TargetType target_type;
       struct VelocityProfile
       {
@@ -113,6 +123,10 @@ public:
         double minimum_upstream_velocity;
         double default_velocity;
         double minimum_default_velocity;
+        //! junction-yield 10-11 (param-gated, 0 = stock): below 0.5 m/s model the ego pulling away from rest,
+        //! v(s) = min(sqrt(v0^2 + 2 a s), raw path velocity), after a start delay when standing (< 0.1 m/s)
+        double standstill_start_acceleration{0.0};
+        double standstill_start_delay{0.0};
       } velocity_profile;
       struct FullyPrioritized
       {
@@ -151,6 +165,24 @@ public:
       {
         double object_time_margin_to_collision_point;
       } avoid_collision_by_acceleration;
+      // Nero c3: UNKNOWN target filter. Only used when target_type.unknown is true. When enable is
+      // false (default), every UNKNOWN object is a target, as in stock/c2.
+      struct UnknownFilter
+      {
+        bool enable{false};
+        double min_area{2.0};      //!< [m^2] footprint area that makes an UNKNOWN a target
+        double min_speed{1.0};     //!< [m/s] OR: absolute speed held ...
+        double min_duration{0.5};  //!< [s]   ... continuously for at least this long
+      } unknown_filter;
+      // Nero c3: keep watching wrong-way vehicles on ego's own lane ahead (assigned lanelet and
+      // its following = exit lane) after the pass judge line. Off by default (= c2 behaviour).
+      struct WrongWayWatch
+      {
+        bool enable{false};
+        double max_decel{2.5};           //!< [m/s^2] stop only if ego can stop this gently
+        double min_speed{1.0};           //!< [m/s] object speed below this is never "wrong-way"
+        double prediction_horizon{5.0};  //!< [s] min horizon of the wrong-way collision check
+      } wrong_way_watch;
     } collision_detection;
 
     struct Occlusion
@@ -430,6 +462,22 @@ private:
 
   //! container for storing safety status of objects on the attention area
   ObjectInfoManager object_info_manager_;
+
+  //! Nero c3 (unknown_filter): per UNKNOWN object (raw uuid bytes), the time its speed first went
+  //! >= min_speed in the current streak (nullopt = currently slow), and when it was last seen
+  struct UnknownSpeedHistory
+  {
+    std::optional<rclcpp::Time> fast_since{std::nullopt};
+    rclcpp::Time last_seen;
+  };
+  std::map<std::string, UnknownSpeedHistory> unknown_speed_history_;
+
+  //! Nero c3 (wrong_way_watch): uuidKey() of attention objects that drive against ego's exit lane
+  //! (or, once flagged, against the assigned lanelet). Rebuilt every cycle.
+  std::set<std::string> wrong_way_ego_lane_object_uuids_;
+
+  //! Nero c3 (wrong_way_watch): stop point latched when the wrong-way stop was first decided
+  std::optional<geometry_msgs::msg::Point> wrong_way_stop_point_{std::nullopt};
   /** @} */
 
 private:
@@ -738,6 +786,35 @@ private:
    */
   bool isTargetCollisionVehicleType(
     const autoware_perception_msgs::msg::PredictedObject & object) const;
+
+  /**
+   * @brief Nero c3 (unknown_filter): refresh unknown_speed_history_ from the latest objects
+   */
+  void updateUnknownSpeedHistory();
+
+  /**
+   * @brief Nero c3 (unknown_filter): true if an UNKNOWN object is big enough or has been fast
+   * long enough to be treated as a collision target
+   */
+  bool isUnknownObjectCollisionTarget(
+    const autoware_perception_msgs::msg::PredictedObject & object) const;
+
+  /**
+   * @brief Nero c3 (wrong_way_watch): true if the object (moving at >= wrong_way_watch.min_speed)
+   * is inside one of ego_lanelets and heads against its direction (|angle diff| > pi/2)
+   */
+  bool isWrongWayOnLanelets(
+    const autoware_perception_msgs::msg::PredictedObject & object,
+    const lanelet::ConstLanelets & ego_lanelets) const;
+
+  /**
+   * @brief Nero c3 (wrong_way_watch): after the pass judge line, return the path index to stop at
+   * if an UNSAFE wrong-way object is ahead of ego on its own lane and ego can stop no harsher
+   * than wrong_way_watch.max_decel, else nullopt
+   */
+  std::optional<size_t> findWrongWayWatchStopIndex(
+    const autoware_internal_planning_msgs::msg::PathWithLaneId & path,
+    const PathLanelets & path_lanelets, const size_t closest_idx);
 
   /**
    * @brief find the objects on attention_area/intersection_area and update positional information

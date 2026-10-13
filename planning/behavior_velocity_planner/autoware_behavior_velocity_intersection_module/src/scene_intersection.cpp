@@ -269,6 +269,18 @@ DecisionResult IntersectionModule::modifyPathVelocityDetail(PathWithLaneId * pat
   const std::string occlusion_diag = formatOcclusionType(occlusion_status);
 
   if (is_permanent_go_) {
+    // ==========================================================================================
+    // Nero c3 (wrong_way_watch): stock never stops after this point. With wrong_way_watch on, ego
+    // still stops for an UNSAFE vehicle driving against ego's exit lane towards ego, if it can stop
+    // no harsher than wrong_way_watch.max_decel. A lead car driving away (same direction) or ego's
+    // follower (behind ego) are never wrong-way targets.
+    // ==========================================================================================
+    if (const auto ww_stop_idx =
+          findWrongWayWatchStopIndex(*path, path_lanelets, intersection_stoplines.closest_idx)) {
+      return NonOccludedCollisionStop{
+        intersection_stoplines.closest_idx, ww_stop_idx.value(), ww_stop_idx.value(),
+        "wrong_way_watch: wrong-way vehicle ahead on ego's lane"};
+    }
     if (has_collision) {
       const auto closest_idx = intersection_stoplines.closest_idx;
       const std::string evasive_diag = generateEgoRiskEvasiveDiagnosis(
@@ -386,6 +398,12 @@ DecisionResult IntersectionModule::modifyPathVelocityDetail(PathWithLaneId * pat
         : false;
     if (!has_traffic_light_) {
       if (fromEgoDist(occlusion_wo_tl_pass_judge_line_idx) < 0) {
+        // Nero c3 (wrong_way_watch): same as in the is_permanent_go_ branch above
+        if (const auto ww_stop_idx = findWrongWayWatchStopIndex(*path, path_lanelets, closest_idx)) {
+          return NonOccludedCollisionStop{
+            closest_idx, ww_stop_idx.value(), ww_stop_idx.value(),
+            "wrong_way_watch: wrong-way vehicle ahead on ego's lane"};
+        }
         if (has_collision) {
           const std::string evasive_diag = generateEgoRiskEvasiveDiagnosis(
             *path, closest_idx, time_distance_array, too_late_detect_objects, misjudge_objects);
@@ -1282,6 +1300,98 @@ void IntersectionModule::updateTrafficSignalObservation()
   }
   last_tl_valid_observation_ = tl_info_opt.value();
   internal_debug_data_.tl_observation = tl_info_opt.value();
+}
+
+std::optional<size_t> IntersectionModule::findWrongWayWatchStopIndex(
+  const autoware_internal_planning_msgs::msg::PathWithLaneId & path,
+  const PathLanelets & path_lanelets, const size_t closest_idx)
+{
+  // ==========================================================================================
+  // Nero c3 (wrong_way_watch)
+  // ==========================================================================================
+  const auto & ww = planner_param_.collision_detection.wrong_way_watch;
+  if (!ww.enable || wrong_way_ego_lane_object_uuids_.empty() || path.points.empty()) {
+    wrong_way_stop_point_ = std::nullopt;
+    return std::nullopt;
+  }
+  const auto & concat_lanelets = path_lanelets.all;
+  const auto & ego_pose = planner_data_->current_odometry->pose;
+  const double ego_s = lanelet::utils::getArcCoordinates(concat_lanelets, ego_pose).length;
+  const double baselink2front = planner_data_->vehicle_info_.max_longitudinal_offset_m;
+
+  // free distance along ego's path from ego's front to the nearest UNSAFE wrong-way object ahead
+  std::optional<double> min_gap{std::nullopt};
+  for (const auto & object_info : object_info_manager_.attentionObjects()) {
+    const auto & object = object_info->predicted_object();
+    if (wrong_way_ego_lane_object_uuids_.count(uuidKey(object.object_id)) == 0) {
+      continue;
+    }
+    if (!object_info->unsafe_info()) {
+      continue;  // its predicted footprint does not reach ego's remaining path
+    }
+    const double obj_s =
+      lanelet::utils::getArcCoordinates(
+        concat_lanelets, object.kinematics.initial_pose_with_covariance.pose)
+        .length;
+    if (obj_s <= ego_s) {
+      continue;  // behind ego (e.g. it has already passed ego): no head-on threat
+    }
+    const double gap = obj_s - ego_s - baselink2front - object.shape.dimensions.x / 2.0;
+    if (!min_gap || gap < min_gap.value()) {
+      min_gap = gap;
+    }
+  }
+  if (!min_gap) {
+    wrong_way_stop_point_ = std::nullopt;
+    return std::nullopt;
+  }
+
+  const auto & ego_pos = ego_pose.position;
+  // keep the stop point latched while the threat persists, so it does not creep with ego
+  if (wrong_way_stop_point_) {
+    const double dist_to_latched = autoware::motion_utils::calcSignedArcLength(
+      path.points, ego_pos, wrong_way_stop_point_.value());
+    if (dist_to_latched <= 0.0) {
+      return closest_idx;
+    }
+    const size_t nearest_idx =
+      autoware::motion_utils::findNearestIndex(path.points, wrong_way_stop_point_.value());
+    return std::max(closest_idx, nearest_idx);
+  }
+
+  // braking distance (incl. response delay) at the allowed deceleration
+  const double v = std::max(0.0, planner_data_->current_velocity->twist.linear.x);
+  const double decel = std::max(ww.max_decel, 0.1);
+  const double braking_dist =
+    v * planner_param_.common.delay_response_time + v * v / (2.0 * decel);
+  if (braking_dist > min_gap.value()) {
+    RCLCPP_WARN_THROTTLE(
+      logger_, *clock_, 1000,
+      "wrong_way_watch: wrong-way vehicle %.1f m ahead but stopping needs %.1f m at %.1f m/s^2, "
+      "keep going (OverPassJudge)",
+      min_gap.value(), braking_dist, decel);
+    return std::nullopt;
+  }
+  // first path point at least braking_dist ahead of ego, but not beyond the free gap
+  size_t stop_idx = path.points.size() - 1;
+  for (size_t i = closest_idx; i < path.points.size(); ++i) {
+    if (autoware::motion_utils::calcSignedArcLength(path.points, ego_pos, i) >= braking_dist) {
+      stop_idx = i;
+      break;
+    }
+  }
+  if (
+    stop_idx > closest_idx &&
+    autoware::motion_utils::calcSignedArcLength(path.points, ego_pos, stop_idx) > min_gap.value()) {
+    --stop_idx;
+  }
+  wrong_way_stop_point_ = path.points.at(stop_idx).point.pose.position;
+  RCLCPP_WARN(
+    logger_,
+    "wrong_way_watch: STOP for wrong-way vehicle %.1f m ahead (braking %.1f m at %.1f m/s, "
+    "max_decel %.1f)",
+    min_gap.value(), braking_dist, v, decel);
+  return stop_idx;
 }
 
 IntersectionModule::PassJudgeStatus IntersectionModule::isOverPassJudgeLinesStatus(

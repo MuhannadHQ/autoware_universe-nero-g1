@@ -29,8 +29,10 @@
 
 #include <fmt/format.h>
 #include <lanelet2_core/geometry/Polygon.h>
+#include <lanelet2_routing/RoutingGraph.h>  // Nero c3: following() of the assigned lanelet
 
 #include <algorithm>
+#include <cmath>
 #include <limits>
 #include <list>
 #include <memory>
@@ -67,7 +69,128 @@ bool IntersectionModule::isTargetCollisionVehicleType(
     return true;
   }
   if (label == autoware_perception_msgs::msg::ObjectClassification::UNKNOWN && p.unknown) {
+    // Nero c3 (unknown_filter): with the filter on, an UNKNOWN is a target only if it is big or
+    // has been moving fast for a while (small/static UNKNOWN blobs such as curbs, bushes or ghost
+    // points no longer make ego yield). Filter off = stock behaviour.
+    if (planner_param_.collision_detection.unknown_filter.enable) {
+      return isUnknownObjectCollisionTarget(object);
+    }
     return true;
+  }
+  return false;
+}
+
+// ==========================================================================================
+// Nero c3 (unknown_filter)
+// ==========================================================================================
+namespace
+{
+double footprintArea(const autoware_perception_msgs::msg::Shape & shape)
+{
+  using autoware_perception_msgs::msg::Shape;
+  if (shape.type == Shape::BOUNDING_BOX) {
+    return shape.dimensions.x * shape.dimensions.y;
+  }
+  if (shape.type == Shape::CYLINDER) {
+    const double r = shape.dimensions.x / 2.0;  // dimensions.x is the diameter
+    return M_PI * r * r;
+  }
+  // POLYGON: shoelace formula on the footprint
+  const auto & pts = shape.footprint.points;
+  double twice_area = 0.0;
+  for (size_t i = 0; i < pts.size(); ++i) {
+    const auto & a = pts.at(i);
+    const auto & b = pts.at((i + 1) % pts.size());
+    twice_area += static_cast<double>(a.x) * b.y - static_cast<double>(b.x) * a.y;
+  }
+  return std::fabs(twice_area) / 2.0;
+}
+
+double objectSpeed(const autoware_perception_msgs::msg::PredictedObject & object)
+{
+  const auto & v = object.kinematics.initial_twist_with_covariance.twist.linear;
+  return std::hypot(v.x, v.y);
+}
+}  // namespace
+
+void IntersectionModule::updateUnknownSpeedHistory()
+{
+  const auto & uf = planner_param_.collision_detection.unknown_filter;
+  if (!uf.enable || !planner_param_.collision_detection.target_type.unknown) {
+    unknown_speed_history_.clear();
+    return;
+  }
+  const auto now = clock_->now();
+  for (const auto & object : planner_data_->predicted_objects->objects) {
+    if (
+      object.classification.empty() || object.classification.at(0).label !=
+                                          autoware_perception_msgs::msg::ObjectClassification::UNKNOWN) {
+      continue;
+    }
+    auto & history = unknown_speed_history_[uuidKey(object.object_id)];
+    history.last_seen = now;
+    if (objectSpeed(object) >= uf.min_speed) {
+      if (!history.fast_since) {
+        history.fast_since = now;  // start of a new "fast" streak
+      }
+    } else {
+      history.fast_since = std::nullopt;  // streak broken
+    }
+  }
+  // forget objects that have not been seen for a while (track lost / uuid changed)
+  static constexpr double forget_after_sec = 1.0;
+  for (auto it = unknown_speed_history_.begin(); it != unknown_speed_history_.end();) {
+    if ((now - it->second.last_seen).seconds() > forget_after_sec) {
+      it = unknown_speed_history_.erase(it);
+    } else {
+      ++it;
+    }
+  }
+}
+
+bool IntersectionModule::isUnknownObjectCollisionTarget(
+  const autoware_perception_msgs::msg::PredictedObject & object) const
+{
+  const auto & uf = planner_param_.collision_detection.unknown_filter;
+  // (a) big enough footprint
+  if (footprintArea(object.shape) >= uf.min_area) {
+    return true;
+  }
+  // (b) speed >= min_speed held continuously for >= min_duration
+  const auto it = unknown_speed_history_.find(uuidKey(object.object_id));
+  if (it == unknown_speed_history_.end() || !it->second.fast_since) {
+    return false;
+  }
+  return (clock_->now() - it->second.fast_since.value()).seconds() >= uf.min_duration;
+}
+
+// ==========================================================================================
+// Nero c3 (wrong_way_watch)
+// ==========================================================================================
+bool IntersectionModule::isWrongWayOnLanelets(
+  const autoware_perception_msgs::msg::PredictedObject & object,
+  const lanelet::ConstLanelets & ego_lanelets) const
+{
+  const auto & ww = planner_param_.collision_detection.wrong_way_watch;
+  // slow objects are excluded: the tracker often flips the heading of slow/stopped vehicles, and
+  // a flipped lead car must not look like an oncoming wrong-way car
+  if (objectSpeed(object) < ww.min_speed) {  // planar speed (UNKNOWN hulls move in vy)
+    return false;
+  }
+  // heading of motion (flipped if the object reports negative longitudinal velocity)
+  const auto pose = util::getObjectPoseWithVelocityDirection(object.kinematics);
+  const double pose_angle = tf2::getYaw(pose.orientation);
+  for (const auto & ll : ego_lanelets) {
+    // object centre must be inside the lanelet itself (no margin): an oncoming car on the
+    // neighbouring (opposite) lane is not "on ego's lane"
+    if (!lanelet::utils::isInLanelet(pose, ll, 0.0)) {
+      continue;
+    }
+    const double ll_angle = lanelet::utils::getLaneletAngle(ll, pose.position);
+    const double angle_diff = autoware_utils::normalize_radian(ll_angle - pose_angle, -M_PI);
+    if (std::fabs(angle_diff) > M_PI / 2.0) {
+      return true;
+    }
   }
   return false;
 }
@@ -81,6 +204,26 @@ void IntersectionModule::updateObjectInfoManagerArea()
   const auto lanelet_map_ptr = planner_data_->route_handler_->getLaneletMapPtr();
   const auto & assigned_lanelet = lanelet_map_ptr->laneletLayer.get(lane_id_);
   const auto intersection_area = util::getIntersectionArea(assigned_lanelet, lanelet_map_ptr);
+
+  // Nero c3 (unknown_filter): keep the per-object speed streaks up to date
+  updateUnknownSpeedHistory();
+
+  // Nero c3 (wrong_way_watch): a vehicle driving against ego's exit lane (following lanelets of
+  // the assigned lanelet) is registered as an attention object even if it is not on an attention
+  // lanelet, and is never dropped as an "adjacent" (same-lane) object. Once flagged, it stays
+  // flagged while it drives against the assigned lanelet itself (it came out of the exit lane into
+  // the junction towards ego). The assigned lanelet alone is NOT enough to flag an object, since
+  // crossing/turning traffic inside the junction often lies on it with a heading > pi/2 off.
+  const bool wrong_way_watch = planner_param_.collision_detection.wrong_way_watch.enable;
+  const auto prev_wrong_way_uuids = wrong_way_ego_lane_object_uuids_;
+  wrong_way_ego_lane_object_uuids_.clear();
+  lanelet::ConstLanelets ego_exit_lanelets{};
+  if (wrong_way_watch) {
+    for (const auto & ll :
+         planner_data_->route_handler_->getRoutingGraphPtr()->following(assigned_lanelet)) {
+      ego_exit_lanelets.push_back(ll);
+    }
+  }
 
   // ==========================================================================================
   // entries that are not observed in this iteration need to be cleared
@@ -102,13 +245,25 @@ void IntersectionModule::updateObjectInfoManagerArea()
     // ==========================================================================================
     const auto object_direction =
       util::getObjectPoseWithVelocityDirection(predicted_object.kinematics);
+    // Nero c3: use the full planar speed (UNKNOWN hull objects move mostly in vy)
     const auto is_parked_vehicle =
-      std::fabs(predicted_object.kinematics.initial_twist_with_covariance.twist.linear.x) <
+      std::hypot(
+        predicted_object.kinematics.initial_twist_with_covariance.twist.linear.x,
+        predicted_object.kinematics.initial_twist_with_covariance.twist.linear.y) <
       planner_param_.occlusion.ignore_parked_vehicle_speed_threshold;
+
+    const bool is_wrong_way_on_ego_lane =
+      wrong_way_watch &&
+      (isWrongWayOnLanelets(predicted_object, ego_exit_lanelets) ||
+       (prev_wrong_way_uuids.count(uuidKey(predicted_object.object_id)) > 0 &&
+        isWrongWayOnLanelets(predicted_object, lanelet::ConstLanelets{assigned_lanelet})));
+    if (is_wrong_way_on_ego_lane) {
+      wrong_way_ego_lane_object_uuids_.insert(uuidKey(predicted_object.object_id));
+    }
 
     const auto belong_adjacent_lanelet_id =
       checkAngleForTargetLanelets(object_direction, adjacent_lanelets, false);
-    if (belong_adjacent_lanelet_id) {
+    if (belong_adjacent_lanelet_id && !is_wrong_way_on_ego_lane) {
       continue;
     }
     const auto belong_attention_lanelet_id =
@@ -122,24 +277,27 @@ void IntersectionModule::updateObjectInfoManagerArea()
     }();
     std::optional<lanelet::ConstLanelet> attention_lanelet{std::nullopt};
     std::optional<lanelet::ConstLineString3d> stopline{std::nullopt};
-    if (!belong_attention_lanelet_id && !in_intersection_area) {
+    if (!belong_attention_lanelet_id && !in_intersection_area && !is_wrong_way_on_ego_lane) {
       continue;
     } else if (belong_attention_lanelet_id) {
       const auto idx = belong_attention_lanelet_id.value();
       attention_lanelet = attention_lanelets.at(idx);
       stopline = attention_lanelet_stoplines.at(idx);
     }
+    // Nero c3 (wrong_way_watch): a wrong-way vehicle on ego's own lane ahead is an attention object
+    const bool belong_attention_area =
+      belong_attention_lanelet_id.has_value() || is_wrong_way_on_ego_lane;
 
     const auto object_it = old_map.find(predicted_object.object_id);
     if (object_it != old_map.end()) {
       auto object_info = object_it->second;
       object_info_manager_.registerExistingObject(
-        predicted_object.object_id, belong_attention_lanelet_id.has_value(), in_intersection_area,
-        is_parked_vehicle, object_info);
+        predicted_object.object_id, belong_attention_area, in_intersection_area, is_parked_vehicle,
+        object_info);
       object_info->initialize(predicted_object, attention_lanelet, stopline);
     } else {
       auto object_info = object_info_manager_.registerObject(
-        predicted_object.object_id, belong_attention_lanelet_id.has_value(), in_intersection_area,
+        predicted_object.object_id, belong_attention_area, in_intersection_area,
         is_parked_vehicle);
       object_info->initialize(predicted_object, attention_lanelet, stopline);
     }
@@ -169,6 +327,21 @@ void IntersectionModule::updateObjectInfoManagerCollision(
   const auto & ego_lane = path_lanelets.ego_or_entry2exit;
   debug_data_.ego_lane = ego_lane.polygon3d();
   const auto ego_poly = ego_lane.polygon2d().basicPolygon();
+
+  // Nero c3 (wrong_way_watch): for wrong-way objects on ego's own lane the collision area is ego's
+  // whole remaining path from its current position: ego_or_entry2exit plus path_lanelets.next
+  // (the exit lane), because a head-on conflict with such a car happens on the exit lane, which
+  // the stock ego_poly (assigned lane part only) does not cover.
+  const auto & ww_param = planner_param_.collision_detection.wrong_way_watch;
+  lanelet::BasicPolygon2d ego_forward_poly{};
+  if (ww_param.enable && !wrong_way_ego_lane_object_uuids_.empty()) {
+    const auto forward_poly3d = lanelet::utils::getPolygonFromArcLength(
+      concat_lanelets, std::max(0.0, closest_arc_coords.length),
+      lanelet::utils::getLaneletLength2d(concat_lanelets));
+    for (const auto & p : forward_poly3d) {
+      ego_forward_poly.emplace_back(p.x(), p.y());
+    }
+  }
 
   // ==========================================================================================
   // dynamically change TTC margin according to traffic light color to gradually relax from green to
@@ -211,6 +384,10 @@ void IntersectionModule::updateObjectInfoManagerCollision(
 
   for (auto & object_info : object_info_manager_.attentionObjects()) {
     const auto & predicted_object = object_info->predicted_object();
+    // Nero c3 (wrong_way_watch)
+    const bool is_wrong_way_on_ego_lane =
+      ww_param.enable && ego_forward_poly.size() >= 3 &&
+      wrong_way_ego_lane_object_uuids_.count(uuidKey(predicted_object.object_id)) > 0;
     bool safe_under_traffic_control = false;
     const auto label = predicted_object.classification.at(0).label;
     const auto expected_deceleration =
@@ -232,6 +409,10 @@ void IntersectionModule::updateObjectInfoManagerCollision(
         planner_param_.collision_detection.ignore_on_red_traffic_light.object_margin_to_path,
         ego_lane)) {
       safe_under_traffic_control = true;
+    }
+    if (is_wrong_way_on_ego_lane) {
+      // Nero c3: a wrong-way driver is not expected to obey the traffic control of its lane
+      safe_under_traffic_control = false;
     }
 
     // ==========================================================================================
@@ -261,8 +442,36 @@ void IntersectionModule::updateObjectInfoManagerCollision(
         planner_param_.collision_detection.min_predicted_path_confidence) {
         continue;
       }
+      if (is_wrong_way_on_ego_lane) {
+        // ==========================================================================================
+        // Nero c3 (wrong_way_watch): the object drives against ego's lane, so any overlap of its
+        // predicted footprint with ego's remaining path (from ego to the end of the exit lane) is a
+        // head-on conflict, whatever the timing. ego's time/distance profile only spans the
+        // intersection, so the stock TTC window is not used here. The horizon is at least
+        // prediction_horizon so that a conflict further down the exit lane is still seen.
+        // ==========================================================================================
+        cutPredictPathWithinDuration(
+          planner_data_->predicted_objects->header.stamp,
+          std::max(passing_time, ww_param.prediction_horizon), &predicted_path);
+        const auto ww_interval_opt = findPassageInterval(
+          predicted_path, predicted_object.shape, ego_forward_poly,
+          intersection_lanelets.first_attention_lane(),
+          intersection_lanelets.second_attention_lane());
+        if (ww_interval_opt) {
+          safe_interval = std::nullopt;
+          unsafe_interval = ww_interval_opt;
+          break;
+        }
+        continue;
+      }
+      // junction-yield 10-11 (autoware_universe#11774): with the flag the horizon covers the start margin, so an
+      // object entering up to collision_start_margin_time after the ego's (modelled) exit is still checked
+      const double prediction_horizon =
+        planner_param_.collision_detection.cut_predicted_path_with_start_margin
+          ? passing_time + collision_start_margin_time
+          : passing_time;
       cutPredictPathWithinDuration(
-        planner_data_->predicted_objects->header.stamp, passing_time, &predicted_path);
+        planner_data_->predicted_objects->header.stamp, prediction_horizon, &predicted_path);
       const auto object_passage_interval_opt = findPassageInterval(
         predicted_path, predicted_object.shape, ego_poly,
         intersection_lanelets.first_attention_lane(),
@@ -777,8 +986,10 @@ std::optional<size_t> IntersectionModule::checkAngleForTargetLanelets(
   const bool is_parked_vehicle) const
 {
   const double detection_area_angle_thr = planner_param_.common.attention_area_angle_threshold;
+  // Nero c3 fix: this used to read common.attention_area_angle_threshold (a non-zero double),
+  // which made it always true regardless of collision_detection.consider_wrong_direction_vehicle
   const bool consider_wrong_direction_vehicle =
-    planner_param_.common.attention_area_angle_threshold;
+    planner_param_.collision_detection.consider_wrong_direction_vehicle;
   const double dist_margin = planner_param_.common.attention_area_margin;
 
   for (unsigned i = 0; i < target_lanelets.size(); ++i) {
@@ -922,6 +1133,31 @@ IntersectionModule::TimeDistanceArray IntersectionModule::calcIntersectionPassin
     }
   }();
 
+  // junction-yield 10-11 (param-gated, standstill_start_acceleration 0 = stock): while (almost) standing the smoothed
+  // reference velocity is ~0 and the profile collapses to minimum_default_velocity, a constant speed the robot never
+  // drives (it waits, then accelerates). Model the pull-away instead: v(s) = min(sqrt(v0^2 + 2 a s), raw path velocity),
+  // plus standstill_start_delay when standing.
+  const double standstill_acc =
+    planner_param_.collision_detection.velocity_profile.standstill_start_acceleration;
+  const bool standstill_model = standstill_acc > 0.0 && current_velocity < 0.5;
+  std::vector<double> raw_s;
+  std::vector<double> raw_v;
+  if (standstill_model) {
+    double s = 0.0;
+    for (size_t i = std::min(closest_idx, reference_path.points.size() - 1); i < reference_path.points.size();
+         ++i) {
+      if (!raw_s.empty()) {
+        s += autoware_utils::calc_distance2d(reference_path.points.at(i - 1), reference_path.points.at(i));
+      }
+      raw_s.push_back(s);
+      raw_v.push_back(path.points.at(i).point.longitudinal_velocity_mps);
+    }
+    if (current_velocity < 0.1) {
+      passing_time += planner_param_.collision_detection.velocity_profile.standstill_start_delay;
+      time_distance_array.back().first = passing_time;
+    }
+  }
+
   for (size_t i = smoothed_path_closest_idx; i + 1 < smoothed_reference_path.points.size(); ++i) {
     const auto & p1 = smoothed_reference_path.points.at(i);
     const auto & p2 = smoothed_reference_path.points.at(i + 1);
@@ -932,15 +1168,23 @@ IntersectionModule::TimeDistanceArray IntersectionModule::calcIntersectionPassin
     // use average velocity between p1 and p2
     const double average_velocity =
       (p1.point.longitudinal_velocity_mps + p2.point.longitudinal_velocity_mps) / 2.0;
-    const double passing_velocity = [=]() {
+    const double passing_velocity = [&]() {
       if (use_upstream_velocity) {
         if (upstream_stopline_idx_opt && i > upstream_stopline_idx_opt.value()) {
           return minimum_upstream_velocity;
         }
-        return std::max<double>(average_velocity, minimum_ego_velocity);
-      } else {
-        return std::max<double>(average_velocity, minimum_ego_velocity);
       }
+      if (standstill_model && !raw_s.empty()) {
+        const double s_mid = std::max(dist_sum - dist / 2.0, 0.0);
+        const auto it = std::upper_bound(raw_s.begin(), raw_s.end(), s_mid);
+        const size_t k = (it == raw_s.begin()) ? 0 : static_cast<size_t>(it - raw_s.begin() - 1);
+        // a stop point in the raw path (the stop sign the ego stands at) is not a speed: use the intersection velocity
+        const double cap = raw_v.at(k) < 0.1 ? intersection_velocity : raw_v.at(k);
+        const double v_kin =
+          std::sqrt(current_velocity * current_velocity + 2.0 * standstill_acc * s_mid);
+        return std::max(std::min(v_kin, cap), 0.1);
+      }
+      return std::max<double>(average_velocity, minimum_ego_velocity);
     }();
     passing_time += (dist / passing_velocity);
 

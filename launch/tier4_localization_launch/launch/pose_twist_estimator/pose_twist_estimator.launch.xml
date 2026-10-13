@@ -1,6 +1,7 @@
 <?xml version="1.0"?>
 <launch>
   <arg name="use_autoware_pose_covariance_modifier" default="false"/>
+  <arg name="pose_covariance_modifier_param_path" default="$(find-pkg-share autoware_pose_covariance_modifier)/config/pose_covariance_modifier.param.yaml"/>
   <!-- only when running with a real vehicle, the pose_initializer judges the stop -->
   <let name="stop_check_enabled" if="$(eval &quot;'$(var system_run_mode)'=='online'&quot;)" value="true"/>
   <let name="stop_check_enabled" if="$(eval &quot;'$(var system_run_mode)'=='logging_simulation'&quot;)" value="false"/>
@@ -42,8 +43,14 @@
     </include>
 
     <!-- Autoware Pose Covariance Modifier Node Launch -->
+    <!-- The modifier reads the relay's corrected GNSS pose (map z offset, std floors, stamp offset,
+         EKF yaw so GNSS adds position only), not gnss_poser's raw output, which pose_initializer keeps using. -->
     <group if="$(var use_autoware_pose_covariance_modifier)">
-      <include file="$(find-pkg-share autoware_pose_covariance_modifier)/launch/pose_covariance_modifier.launch.xml"/>
+      <include file="$(find-pkg-share nero_gnss_pose_relay)/launch/gnss_pose_relay.launch.xml"/>
+      <include file="$(find-pkg-share autoware_pose_covariance_modifier)/launch/pose_covariance_modifier.launch.xml">
+        <arg name="param_file" value="$(var pose_covariance_modifier_param_path)"/>
+        <arg name="autoware_pose_covariance_modifier/input_gnss_pose_with_cov_topic" value="/sensing/gnss/pose_with_covariance_corrected"/>
+      </include>
     </group>
   </group>
 

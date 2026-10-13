@@ -727,13 +727,34 @@ IntersectionLanelets IntersectionModule::generateObjectiveLanelets(
     // if assigned lanelet is "straight" with traffic light, detection area is not necessary
   } else {
     if (consider_wrong_direction_vehicle) {
+      // Nero patch (wrong-way watch without ego's own lanes):
+      // previous() of a sibling branch is ego's own approach lane, so the stock code put ego's
+      // approach (and the cars behind ego) into the attention area. That made ego yield to its
+      // follower and, when ego's footprint was already inside the first attention area, made the
+      // stop lines null (InternalError, no decision at all). Skip ego's own lanes here: ego's
+      // previous lanes and their followings (ego approach + sibling branches), and the lanes
+      // directly before/after the assigned lanelet. The following/previous lanes of genuine
+      // crossing lanes stay, so a wrong-way car coming out of an exit lane is still watched.
+      lanelet::ConstLanelets ego_own_lanelets = ego_lanelets;
+      // c2 variant: following(assigned_lanelet) (ego's exit lane) is NOT excluded, so a wrong-way car
+      // driving toward the junction on ego's exit lane is watched as well.
+      for (const auto & ll : routing_graph_ptr->previous(assigned_lanelet)) {
+        ego_own_lanelets.push_back(ll);
+      }
       for (const auto & conflicting_lanelet : conflicting_lanelets) {
-        if (lanelet::utils::contains(yield_lanelets, conflicting_lanelet)) {
+        if (
+          lanelet::utils::contains(yield_lanelets, conflicting_lanelet) ||
+          lanelet::utils::contains(ego_own_lanelets, conflicting_lanelet)) {
           continue;
         }
         detection_lanelets.push_back(conflicting_lanelet);
       }
       for (const auto & adjacent_following : adjacent_followings) {
+        if (
+          lanelet::utils::contains(ego_own_lanelets, adjacent_following) ||
+          lanelet::utils::contains(detection_lanelets, adjacent_following)) {
+          continue;
+        }
         detection_lanelets.push_back(adjacent_following);
       }
     } else {

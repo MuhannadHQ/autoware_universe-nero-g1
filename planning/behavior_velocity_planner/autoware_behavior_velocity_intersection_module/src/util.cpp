@@ -380,6 +380,27 @@ std::optional<InterpolatedPathInfo> generateInterpolatedPath(
 geometry_msgs::msg::Pose getObjectPoseWithVelocityDirection(
   const autoware_perception_msgs::msg::PredictedObjectKinematics & obj_state)
 {
+  // ==========================================================================================
+  // Nero c3: if the object moves (|v| > 0.5 m/s), use the heading of its velocity vector in the
+  // map frame (yaw + atan2(vy, vx)). Tracked UNKNOWN convex-hull objects keep an identity
+  // orientation (yaw = ego yaw) and move mostly in vy, so the stock "flip on sign of vx" gave a
+  // crossing UNKNOWN car a heading ~86 deg off its lane. For vehicles (vy ~ 0) this equals the
+  // stock result: atan2(0, vx>0) = 0, atan2(0, vx<0) = pi.
+  // ==========================================================================================
+  static constexpr double velocity_heading_min_speed = 0.5;  // [m/s]
+  {
+    const auto & v = obj_state.initial_twist_with_covariance.twist.linear;
+    if (std::hypot(v.x, v.y) > velocity_heading_min_speed) {
+      auto obj_pose = obj_state.initial_pose_with_covariance.pose;
+      double yaw, pitch, roll;
+      tf2::getEulerYPR(obj_pose.orientation, yaw, pitch, roll);
+      tf2::Quaternion q;
+      q.setRPY(roll, pitch, yaw + std::atan2(v.y, v.x));
+      obj_pose.orientation = tf2::toMsg(q);
+      return obj_pose;
+    }
+  }
+
   if (obj_state.initial_twist_with_covariance.twist.linear.x >= 0) {
     return obj_state.initial_pose_with_covariance.pose;
   }
