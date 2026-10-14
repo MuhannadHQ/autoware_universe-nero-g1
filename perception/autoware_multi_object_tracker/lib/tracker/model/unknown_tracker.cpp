@@ -35,6 +35,8 @@
 namespace autoware::multi_object_tracker
 {
 
+UnknownTracker::Options UnknownTracker::options;
+
 UnknownTracker::UnknownTracker(const rclcpp::Time & time, const types::DynamicObject & object)
 : Tracker(time, object), logger_(rclcpp::get_logger("UnknownTracker"))
 {
@@ -54,7 +56,17 @@ UnknownTracker::UnknownTracker(const rclcpp::Time & time, const types::DynamicOb
   );
 
   // Set initial state
-  {
+  initializeState(time, object, false);
+  has_meas_ = true;
+  last_meas_x_ = object.pose.position.x;
+  last_meas_y_ = object.pose.position.y;
+  last_meas_area_ = footprintArea(object);
+  last_meas_time_ = time;
+}
+
+void UnknownTracker::initializeState(
+  const rclcpp::Time & time, const types::DynamicObject & object, const bool zero_velocity)
+{
     using autoware_utils::xyzrpy_covariance_index::XYZRPY_COV_IDX;
     const double x = object.pose.position.x;
     const double y = object.pose.position.y;
@@ -64,7 +76,7 @@ UnknownTracker::UnknownTracker(const rclcpp::Time & time, const types::DynamicOb
 
     double vx = 0.0;
     double vy = 0.0;
-    if (object.kinematics.has_twist) {
+    if (object.kinematics.has_twist && !zero_velocity) {
       const double & vel_x = object.twist.linear.x;
       const double & vel_y = object.twist.linear.y;
       vx = std::cos(yaw) * vel_x - std::sin(yaw) * vel_y;
@@ -113,7 +125,21 @@ UnknownTracker::UnknownTracker(const rclcpp::Time & time, const types::DynamicOb
 
     // initialize motion model
     motion_model_.initialize(time, x, y, pose_cov, vx, vy, twist_cov);
+}
+
+double UnknownTracker::footprintArea(const types::DynamicObject & object)
+{
+  const auto & pts = object.shape.footprint.points;
+  if (pts.size() >= 3) {
+    double a = 0.0;
+    for (size_t i = 0; i < pts.size(); ++i) {
+      const auto & p = pts[i];
+      const auto & q = pts[(i + 1) % pts.size()];
+      a += static_cast<double>(p.x) * q.y - static_cast<double>(q.x) * p.y;
+    }
+    return std::abs(a) * 0.5;
   }
+  return object.shape.dimensions.x * object.shape.dimensions.y;
 }
 
 bool UnknownTracker::predict(const rclcpp::Time & time)
@@ -159,7 +185,25 @@ bool UnknownTracker::measure(
   }
 
   // update object
-  measureWithPose(object);
+  bool reset = false;
+  if (options.shape_jump_reset_distance > 0.0 && has_meas_) {
+    const double px = motion_model_.getStateElement(IDX::X);
+    const double py = motion_model_.getStateElement(IDX::Y);
+    const double jump = std::hypot(object.pose.position.x - px, object.pose.position.y - py);
+    const double a1 = footprintArea(object);
+    const double ratio = std::max(a1, last_meas_area_) / std::max(std::min(a1, last_meas_area_), 1e-3);
+    reset = jump > options.shape_jump_reset_distance && ratio > options.shape_jump_area_ratio;
+  }
+  if (reset) {
+    initializeState(time, object, true);
+  } else {
+    measureWithPose(object);
+  }
+  has_meas_ = true;
+  last_meas_x_ = object.pose.position.x;
+  last_meas_y_ = object.pose.position.y;
+  last_meas_area_ = footprintArea(object);
+  last_meas_time_ = time;
 
   return true;
 }
@@ -177,6 +221,12 @@ bool UnknownTracker::getTrackedObject(
   if (!motion_model_.getPredictedState(time, pose, pose_cov, twist, twist_cov)) {
     RCLCPP_WARN(logger_, "UnknownTracker::getTrackedObject: Failed to get predicted state.");
     return false;
+  }
+
+  if (options.measured_footprint && has_meas_) {
+    const double dt = std::clamp((time - last_meas_time_).seconds(), 0.0, 0.5);
+    pose.position.x = last_meas_x_ + motion_model_.getStateElement(IDX::VX) * dt;
+    pose.position.y = last_meas_y_ + motion_model_.getStateElement(IDX::VY) * dt;
   }
 
   return true;

@@ -15,6 +15,8 @@
 #define EIGEN_MPL2_ONLY
 
 #include "multi_object_tracker_node.hpp"
+#include "autoware/multi_object_tracker/tracker/model/unknown_tracker.hpp"
+#include "autoware/multi_object_tracker/tracker/model/vehicle_tracker.hpp"
 
 #include "autoware/multi_object_tracker/object_model/shapes.hpp"
 #include "autoware/multi_object_tracker/object_model/types.hpp"
@@ -171,6 +173,16 @@ MultiObjectTracker::MultiObjectTracker(const rclcpp::NodeOptions & node_options)
         declare_parameter<double>("min_known_object_removal_iou");
       config.min_unknown_object_removal_iou =
         declare_parameter<double>("min_unknown_object_removal_iou");
+      // bb1012 UNKNOWN tracker options (defaults = stock behaviour)
+      UnknownTracker::options.measured_footprint =
+        declare_parameter<bool>("unknown_tracker.measured_footprint", false);
+      UnknownTracker::options.shape_jump_reset_distance =
+        declare_parameter<double>("unknown_tracker.shape_jump_reset_distance", 0.0);
+      UnknownTracker::options.shape_jump_area_ratio =
+        declare_parameter<double>("unknown_tracker.shape_jump_area_ratio", 1.5);
+      // bb1012 bicycle yaw option (default = stock behaviour)
+      VehicleTracker::options.use_unavailable_bicycle_yaw =
+        declare_parameter<bool>("vehicle_tracker.use_unavailable_bicycle_yaw", false);
 
       // Map from class name to label
       std::map<std::string, LabelType> class_name_to_label = {

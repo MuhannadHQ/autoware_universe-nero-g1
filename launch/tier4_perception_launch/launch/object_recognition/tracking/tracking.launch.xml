@@ -18,7 +18,7 @@
   <arg name="use_validator" description="use obstacle_pointcloud based validator"/>
 
   <!-- External interface -->
-  <let name="input/detection_input_channels" value="['detected_objects']"/>
+  <let name="input/detection_input_channels" value="['detected_objects', 'detection_by_tracker']"/>
   <arg name="input/radar/objects" default="/perception/object_recognition/detection/radar/far_objects"/>
   <arg name="output/objects" default="$(var ns)/objects"/>
 

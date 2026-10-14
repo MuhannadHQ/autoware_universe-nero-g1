@@ -43,6 +43,16 @@ private:
   using IDX = BicycleMotionModel::IDX;
 
 public:
+  struct Options
+  {
+    // bb1012 (2026-10-13): lidar_centerpoint marks BICYCLE/MOTORCYCLE orientation UNAVAILABLE (only car-like classes get
+    // SIGN_UNKNOWN), so a bicycle track keeps the yaw of its birth detection forever (an outlier birth yaw is never
+    // corrected). true = update the bicycle-model yaw from BICYCLE/MOTORCYCLE measurements too, as front/back-ambiguous,
+    // with the model yaw measurement noise. false = stock behaviour.
+    bool use_unavailable_bicycle_yaw{false};
+  };
+  static Options options;
+
   VehicleTracker(
     const object_model::ObjectModel & object_model, const rclcpp::Time & time,
     const types::DynamicObject & object);

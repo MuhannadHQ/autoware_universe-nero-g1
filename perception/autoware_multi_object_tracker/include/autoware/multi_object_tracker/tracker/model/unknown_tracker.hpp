@@ -39,7 +39,30 @@ private:
   CVMotionModel motion_model_;
   using IDX = CVMotionModel::IDX;
 
+  // bb1012 (2026-10-13) param-gated fixes, defaults = stock behaviour
+  bool has_meas_{false};
+  double last_meas_x_{0.0};
+  double last_meas_y_{0.0};
+  double last_meas_area_{0.0};
+  rclcpp::Time last_meas_time_;
+  void initializeState(
+    const rclcpp::Time & time, const types::DynamicObject & object, const bool zero_velocity);
+  static double footprintArea(const types::DynamicObject & object);
+
 public:
+  struct Options
+  {
+    // publish the footprint where it was last measured (+ velocity * time since that measurement)
+    // instead of re-centring the latest measured footprint on the filtered centre
+    bool measured_footprint{false};
+    // a measurement whose centre jumps more than this from the prediction [m] while its footprint area changes by more
+    // than shape_jump_area_ratio is a cluster fragment/merge flip, not motion: restart the state there with zero
+    // velocity (0.0 = off)
+    double shape_jump_reset_distance{0.0};
+    double shape_jump_area_ratio{1.5};
+  };
+  static Options options;
+
   UnknownTracker(const rclcpp::Time & time, const types::DynamicObject & object);
 
   bool predict(const rclcpp::Time & time) override;

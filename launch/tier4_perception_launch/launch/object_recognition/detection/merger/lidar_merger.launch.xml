@@ -22,14 +22,16 @@
   <let name="merger1/input/objects0" value="$(var input/lidar_ml/objects)"/>
   <let name="merger1/input/objects1" value="$(var input/lidar_rule/objects)"/>
   <let name="merger1/output/objects" value="$(var output/objects)" if="$(var without_dbt_and_filter)"/>
-  <let name="merger1/output/objects" value="temporary_merged_objects" unless="$(var without_dbt_and_filter)"/>
+  <let name="merger1/output/objects" value="objects_before_filter" if="$(var use_object_filter)"/>
+  <let name="merger1/output/objects" value="$(var output/objects)" unless="$(var use_object_filter)"/>
+  <!-- bb1012 dbtchan: detection_by_tracker goes to the tracker as its own input channel (cannot spawn / no orientation) -->
 
   <let name="merger2/input/objects0" value="$(var merger1/output/objects)"/>
   <let name="merger2/input/objects1" value="$(var input/detection_by_tracker/objects)"/>
   <let name="merger2/output/objects" value="objects_before_filter" if="$(var use_object_filter)"/>
   <let name="merger2/output/objects" value="$(var output/objects)" unless="$(var use_object_filter)"/>
 
-  <let name="filter/input/objects" value="$(var merger2/output/objects)" if="$(var use_detection_by_tracker)"/>
+  <let name="filter/input/objects" value="$(var merger1/output/objects)" if="$(var use_detection_by_tracker)"/>
   <let name="filter/input/objects" value="$(var merger1/output/objects)" unless="$(var use_detection_by_tracker)"/>
   <let name="filter/output/objects" value="$(var output/objects)"/>
 
@@ -47,7 +49,7 @@
   </group>
 
   <!-- 2nd merger: + detection_by_tracker -->
-  <group if="$(var use_detection_by_tracker)">
+  <group if="false">
     <include file="$(find-pkg-share autoware_object_merger)/launch/object_association_merger.launch.xml">
       <arg name="node_name" value="object_association_merger_beta"/>
       <arg name="input/object0" value="$(var merger2/input/objects0)"/>

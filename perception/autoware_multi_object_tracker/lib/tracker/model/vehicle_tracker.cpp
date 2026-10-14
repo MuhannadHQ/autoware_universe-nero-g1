@@ -40,6 +40,8 @@
 
 namespace autoware::multi_object_tracker
 {
+
+VehicleTracker::Options VehicleTracker::options{};
 VehicleTracker::VehicleTracker(
   const object_model::ObjectModel & object_model, const rclcpp::Time & time,
   const types::DynamicObject & object)
@@ -139,12 +141,26 @@ bool VehicleTracker::predict(const rclcpp::Time & time)
 }
 
 bool VehicleTracker::measureWithPose(
-  const types::DynamicObject & object, const types::InputChannel & channel_info)
+  const types::DynamicObject & in_object, const types::InputChannel & channel_info)
 {
+  types::DynamicObject object = in_object;
   // get measurement yaw angle to update
   bool is_yaw_available =
     object.kinematics.orientation_availability != types::OrientationAvailability::UNAVAILABLE &&
     channel_info.trust_orientation;
+  if (
+    options.use_unavailable_bicycle_yaw && !is_yaw_available && channel_info.trust_orientation &&
+    object.kinematics.orientation_availability == types::OrientationAvailability::UNAVAILABLE) {
+    using Label = autoware_perception_msgs::msg::ObjectClassification;
+    const auto label =
+      autoware::object_recognition_utils::getHighestProbLabel(object.classification);
+    if (label == Label::BICYCLE || label == Label::MOTORCYCLE) {
+      // the uncertainty model inflated the yaw variance x1e3 for UNAVAILABLE; use the model measurement noise instead
+      using autoware_utils::xyzrpy_covariance_index::XYZRPY_COV_IDX;
+      object.pose_covariance[XYZRPY_COV_IDX::YAW_YAW] = object_model_.measurement_covariance.yaw;
+      is_yaw_available = true;  // updateStatePoseHead folds the yaw within +-90 deg (sign unknown)
+    }
+  }
 
   // velocity capability is checked only when the object has velocity measurement
   // and the predicted velocity is close to the observed velocity
