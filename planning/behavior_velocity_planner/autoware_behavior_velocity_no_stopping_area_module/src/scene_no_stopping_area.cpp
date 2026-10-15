@@ -39,7 +39,7 @@ namespace bg = boost::geometry;
 
 NoStoppingAreaModule::NoStoppingAreaModule(
   const int64_t module_id, const int64_t lane_id,
-  const lanelet::autoware::NoStoppingArea & no_stopping_area_reg_elem,
+  std::shared_ptr<const lanelet::autoware::NoStoppingArea> no_stopping_area_reg_elem,
   const PlannerParam & planner_param, const rclcpp::Logger & logger,
   const rclcpp::Clock::SharedPtr clock,
   const std::shared_ptr<autoware_utils::TimeKeeper> time_keeper,
@@ -47,7 +47,8 @@ NoStoppingAreaModule::NoStoppingAreaModule(
     planning_factor_interface)
 : SceneModuleInterfaceWithRTC(module_id, logger, clock, time_keeper, planning_factor_interface),
   lane_id_(lane_id),
-  no_stopping_area_reg_elem_(no_stopping_area_reg_elem),
+  no_stopping_area_reg_elem_ptr_(std::move(no_stopping_area_reg_elem)),
+  no_stopping_area_reg_elem_(*no_stopping_area_reg_elem_ptr_),
   planner_param_(planner_param),
   debug_data_()
 {

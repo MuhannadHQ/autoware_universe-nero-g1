@@ -34,7 +34,7 @@ using autoware::motion_utils::calcSignedArcLength;
 
 DetectionAreaModule::DetectionAreaModule(
   const int64_t module_id, const int64_t lane_id,
-  const lanelet::autoware::DetectionArea & detection_area_reg_elem,
+  std::shared_ptr<const lanelet::autoware::DetectionArea> detection_area_reg_elem,
   const PlannerParam & planner_param, const rclcpp::Logger & logger,
   const rclcpp::Clock::SharedPtr clock,
   const std::shared_ptr<autoware_utils::TimeKeeper> time_keeper,
@@ -42,7 +42,8 @@ DetectionAreaModule::DetectionAreaModule(
     planning_factor_interface)
 : SceneModuleInterfaceWithRTC(module_id, logger, clock, time_keeper, planning_factor_interface),
   lane_id_(lane_id),
-  detection_area_reg_elem_(detection_area_reg_elem),
+  detection_area_reg_elem_ptr_(std::move(detection_area_reg_elem)),
+  detection_area_reg_elem_(*detection_area_reg_elem_ptr_),
   state_(State::GO),
   planner_param_(planner_param),
   debug_data_()

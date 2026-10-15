@@ -37,15 +37,16 @@ using virtual_traffic_light::toAutowarePoints;
 
 VirtualTrafficLightModule::VirtualTrafficLightModule(
   const int64_t module_id, const int64_t lane_id,
-  const lanelet::autoware::VirtualTrafficLight & reg_elem, lanelet::ConstLanelet lane,
-  const PlannerParam & planner_param, const rclcpp::Logger logger,
+  std::shared_ptr<const lanelet::autoware::VirtualTrafficLight> reg_elem,
+  lanelet::ConstLanelet lane, const PlannerParam & planner_param, const rclcpp::Logger logger,
   const rclcpp::Clock::SharedPtr clock,
   const std::shared_ptr<autoware_utils::TimeKeeper> time_keeper,
   const std::shared_ptr<planning_factor_interface::PlanningFactorInterface>
     planning_factor_interface)
 : SceneModuleInterface(module_id, logger, clock, time_keeper, planning_factor_interface),
   lane_id_(lane_id),
-  reg_elem_(reg_elem),
+  reg_elem_ptr_(std::move(reg_elem)),
+  reg_elem_(*reg_elem_ptr_),
   lane_(lane),
   planner_param_(planner_param)
 {

@@ -66,7 +66,7 @@ public:
 
   DetectionAreaModule(
     const int64_t module_id, const int64_t lane_id,
-    const lanelet::autoware::DetectionArea & detection_area_reg_elem,
+    std::shared_ptr<const lanelet::autoware::DetectionArea> detection_area_reg_elem,
     const PlannerParam & planner_param, const rclcpp::Logger & logger,
     const rclcpp::Clock::SharedPtr clock,
     const std::shared_ptr<autoware_utils::TimeKeeper> time_keeper,
@@ -83,6 +83,10 @@ private:
   int64_t lane_id_;
 
   // Key Feature
+  // Holds the regulatory element so it outlives a lanelet map reload: the new
+  // map frees the old one and its elements, while this module lives on as long
+  // as the element id stays on the path - the reference below points into it.
+  std::shared_ptr<const lanelet::autoware::DetectionArea> detection_area_reg_elem_ptr_;
   const lanelet::autoware::DetectionArea & detection_area_reg_elem_;
 
   // State

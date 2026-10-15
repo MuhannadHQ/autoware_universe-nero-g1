@@ -41,7 +41,7 @@
 namespace autoware::behavior_velocity_planner
 {
 TrafficLightModule::TrafficLightModule(
-  const int64_t lane_id, const lanelet::TrafficLight & traffic_light_reg_elem,
+  const int64_t lane_id, std::shared_ptr<const lanelet::TrafficLight> traffic_light_reg_elem,
   lanelet::ConstLanelet lane, const PlannerParam & planner_param, const rclcpp::Logger logger,
   const rclcpp::Clock::SharedPtr clock,
   const std::shared_ptr<autoware_utils::TimeKeeper> time_keeper,
@@ -49,7 +49,8 @@ TrafficLightModule::TrafficLightModule(
     planning_factor_interface)
 : SceneModuleInterfaceWithRTC(lane_id, logger, clock, time_keeper, planning_factor_interface),
   lane_id_(lane_id),
-  traffic_light_reg_elem_(traffic_light_reg_elem),
+  traffic_light_reg_elem_ptr_(std::move(traffic_light_reg_elem)),
+  traffic_light_reg_elem_(*traffic_light_reg_elem_ptr_),
   lane_(lane),
   state_(State::APPROACH),
   debug_data_(),

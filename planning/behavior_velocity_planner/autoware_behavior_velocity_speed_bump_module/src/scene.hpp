@@ -54,8 +54,9 @@ public:
 
   SpeedBumpModule(
     const int64_t module_id, const int64_t lane_id,
-    const lanelet::autoware::SpeedBump & speed_bump_reg_elem, const PlannerParam & planner_param,
-    const rclcpp::Logger & logger, const rclcpp::Clock::SharedPtr clock,
+    std::shared_ptr<const lanelet::autoware::SpeedBump> speed_bump_reg_elem,
+    const PlannerParam & planner_param, const rclcpp::Logger & logger,
+    const rclcpp::Clock::SharedPtr clock,
     const std::shared_ptr<autoware_utils::TimeKeeper> time_keeper,
     const std::shared_ptr<planning_factor_interface::PlanningFactorInterface>
       planning_factor_interface);
@@ -70,6 +71,10 @@ private:
   int64_t lane_id_;
 
   // Speed Bump Regulatory Element
+  // Holds the regulatory element so it outlives a lanelet map reload: the new
+  // map frees the old one and its elements, while this module lives on as long
+  // as the element id stays on the path - the reference below points into it.
+  std::shared_ptr<const lanelet::autoware::SpeedBump> speed_bump_reg_elem_ptr_;
   const lanelet::autoware::SpeedBump & speed_bump_reg_elem_;
 
   // Parameter
