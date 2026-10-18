@@ -14,6 +14,8 @@
 
 #include "scene_intersection.hpp"
 
+#include <cstdlib>
+
 #include "util.hpp"
 
 #include <autoware/behavior_velocity_planner_common/utilization/boost_geometry_helper.hpp>  // for toGeomPoly
@@ -42,6 +44,8 @@
 
 namespace autoware::behavior_velocity_planner
 {
+double & nero_creep_last_exempt_ref();  // scene_intersection_collision.cpp (NERO_IX_CREEP)
+double nero_creep_steady_now();
 namespace bg = boost::geometry;
 
 IntersectionModule::IntersectionModule(
@@ -1500,8 +1504,24 @@ IntersectionModule::PassJudgeStatus IntersectionModule::isOverPassJudgeLinesStat
     is_over_default_stopline || planner_param_.common.enable_pass_judge_before_default_stopline;
   const bool over_pass_judge_line_overall =
     is_over_2nd_pass_judge_line ? is_over_2nd_pass_judge_line.value() : is_over_1st_pass_judge_line;
+  // NERO_IX_CREEP_COMMIT_M=<m> (session 4): while a creeper is being treated as yielding (NERO_IX_CREEP, within the
+  // last second), ego does not commit (permanent GO) until it is <m> past the default stop line: during the slow
+  // launch the module keeps checking every cycle, so a creeper that goes the moment ego goes stops ego at 1-3 km/h
+  // (it otherwise passed the 1st pass judge line ~1 m after the stop line and only AEB was left: 0.29 m, ut_press_mod:5).
+  const bool nero_defer_commit = [&]() {
+    static const double d = [] {
+      const char * e = std::getenv("NERO_IX_CREEP_COMMIT_M");
+      return e ? std::atof(e) : -1.0;
+    }();
+    if (d <= 0.0 || is_permanent_go_) return false;
+    if (nero_creep_steady_now() - nero_creep_last_exempt_ref() > 1.0) return false;
+    const double past =
+      autoware::motion_utils::calcSignedArcLength(path.points, default_stopline_idx, closest_idx);
+    return past < d;
+  }();
   if (
-    (over_default_stopline_for_pass_judge && over_pass_judge_line_overall && was_safe) ||
+    (over_default_stopline_for_pass_judge && over_pass_judge_line_overall && was_safe &&
+     !nero_defer_commit) ||
     is_permanent_go_) {
     // ==========================================================================================
     // this body is active if ego is

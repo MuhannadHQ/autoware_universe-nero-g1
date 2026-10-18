@@ -13,6 +13,14 @@
 // limitations under the License.
 
 #include "scene_intersection.hpp"
+
+#include <chrono>
+#include <cstdio>
+#include <deque>
+#include <unordered_map>
+#include <utility>
+#include <cstdlib>
+#include <string>
 #include "util.hpp"
 
 #include <autoware/behavior_velocity_planner_common/utilization/boost_geometry_helper.hpp>  // for toGeomPoly
@@ -26,9 +34,11 @@
 #include <boost/geometry/algorithms/correct.hpp>
 #include <boost/geometry/algorithms/intersects.hpp>
 #include <boost/geometry/algorithms/within.hpp>
+#include <boost/geometry/algorithms/distance.hpp>
 
 #include <fmt/format.h>
 #include <lanelet2_core/geometry/Polygon.h>
+#include <tf2/utils.h>
 #include <lanelet2_routing/RoutingGraph.h>  // Nero c3: following() of the assigned lanelet
 
 #include <algorithm>
@@ -39,6 +49,163 @@
 #include <string>
 #include <utility>
 #include <vector>
+
+namespace
+{
+double nero_ego_acc_param()
+{
+  static const double a = [] {
+    const char * v = std::getenv("NERO_IX_EGO_ACC");
+    return v != nullptr ? std::max(0.0, std::atof(v)) : 0.0;
+  }();
+  return a;
+}
+
+struct NeroMerge
+{
+  bool on{false};
+  double react{1.0};   // [s] follower reaction time
+  double decel{2.0};   // [m/s^2] braking a follower may be asked for
+  double v_ref{2.0};   // [m/s] ego speed when it leaves the turn lanelet
+  double max{6.0};     // [s] cap of the required headway (and the prediction cut extension)
+};
+
+// NERO_IX_MERGE="react,decel,v_ref,max": a car that reaches ego's turn lanelet only after ego has left it
+// and then drives on in ego's direction (it will follow ego) needs a headway of
+// react + (v_car - v_ref) / (2 decel) behind ego, not upstream's "anything after passing_time is safe".
+NeroMerge nero_merge_param()
+{
+  static const NeroMerge m = [] {
+    NeroMerge r;
+    const char * v = std::getenv("NERO_IX_MERGE");
+    if (v == nullptr) return r;
+    double a[4] = {r.react, r.decel, r.v_ref, r.max};
+    if (std::sscanf(v, "%lf,%lf,%lf,%lf", &a[0], &a[1], &a[2], &a[3]) >= 2) {
+      r.on = true;
+      r.react = a[0];
+      r.decel = std::max(0.1, a[1]);
+      r.v_ref = a[2];
+      r.max = a[3];
+    }
+    return r;
+  }();
+  return m;
+}
+
+double nero_cut_extra()
+{
+  static const double extra = [] {
+    const char * v = std::getenv("NERO_IX_CUT_EXTRA");
+    return v != nullptr ? std::max(0.0, std::atof(v)) : 0.0;
+  }();
+  return extra;
+}
+
+// NERO_IX_CREEP="v_creep,t_react,a_stop,acc_th,hold_s,margin" (session 4, Saudi-style pressure): a vehicle that
+// CREEPS — at most v_creep for the last hold_s seconds and not accelerating more than acc_th (its own speed history: the
+// tracker reports no acceleration) — and that can stop with its whole footprint clear of ego's path (stopping distance
+// v*t_react + v^2/(2*a_stop) along its heading; footprint farther than ego's half width + margin from the centreline of
+// ego's turn lanelet and the lanelet after it) is treated as yielding: it is left out of the attention objects, i.e. out
+// of the TTC collision check and of yield-stuck. Upstream predicts a 1 m/s creeper at constant speed (it "occupies" ego's
+// lane for ~8 s: always unsafe) and holds ego for any stopped car within 5 m of its crossing, so impatient drivers rolling
+// toward a waiting / turning ego held it at the apex for good. A car that speeds up, or whose stop would still reach ego's
+// path, keeps the full upstream check. Unset = upstream.
+struct NeroCreepIx
+{
+  double v_creep{-1.0};
+  double t_react{0.5};
+  double a_stop{2.0};
+  double acc_th{0.3};
+  double hold_s{2.0};
+  double margin{0.5};
+  double t_pass{0.0};  // 7th value: the creeper keeps creeping this long while ego passes (reach v * (t_react + t_pass))
+};
+const NeroCreepIx & nero_creep_ix()
+{
+  static const NeroCreepIx p = [] {
+    NeroCreepIx r;
+    if (const char * e = std::getenv("NERO_IX_CREEP")) {
+      std::sscanf(
+        e, "%lf,%lf,%lf,%lf,%lf,%lf,%lf", &r.v_creep, &r.t_react, &r.a_stop, &r.acc_th, &r.hold_s, &r.margin,
+        &r.t_pass);
+    }
+    return r;
+  }();
+  return p;
+}
+struct NeroCreepHist
+{
+  std::deque<std::pair<double, double>> s;  // (t, v)
+  double last{0.0};
+};
+std::unordered_map<std::string, NeroCreepHist> & nero_creep_hists()
+{
+  static std::unordered_map<std::string, NeroCreepHist> h;
+  return h;
+}
+double nero_steady_now()
+{
+  return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+// records the speed; returns true if the object has been creeping (and is not pulling away)
+bool nero_is_creeper(const autoware_perception_msgs::msg::PredictedObject & o, double * v_out, double * acc_out)
+{
+  const auto & p = nero_creep_ix();
+  const double t = nero_steady_now();
+  const std::string key(reinterpret_cast<const char *>(o.object_id.uuid.data()), o.object_id.uuid.size());
+  auto & h = nero_creep_hists()[key];
+  const double v = std::hypot(
+    o.kinematics.initial_twist_with_covariance.twist.linear.x,
+    o.kinematics.initial_twist_with_covariance.twist.linear.y);
+  if (h.s.empty() || t - h.s.back().first > 0.02) {
+    h.s.emplace_back(t, v);
+  }
+  h.last = t;
+  while (!h.s.empty() && t - h.s.front().first > p.hold_s + 1.5) h.s.pop_front();
+  static double last_prune = 0.0;
+  if (t - last_prune > 5.0) {
+    last_prune = t;
+    for (auto it = nero_creep_hists().begin(); it != nero_creep_hists().end();) {
+      if (t - it->second.last > 10.0) it = nero_creep_hists().erase(it); else ++it;
+    }
+  }
+  *v_out = v;
+  *acc_out = 0.0;
+  if (v > p.v_creep || h.s.size() < 3 || t - h.s.front().first < p.hold_s - 0.2) return false;
+  double v_min_1s = v;
+  for (const auto & [ti, vi] : h.s) {
+    if (t - ti <= p.hold_s && vi > p.v_creep) return false;
+    if (t - ti <= 1.0) v_min_1s = std::min(v_min_1s, vi);
+  }
+  *acc_out = v - v_min_1s;  // speed gained within the last second: a launch shows at once
+  return *acc_out <= p.acc_th;
+}
+
+}  // namespace
+namespace autoware::behavior_velocity_planner
+{
+// steady time of the last creeper exemption (read by the pass-judge logic, NERO_IX_CREEP_COMMIT_M)
+double & nero_creep_last_exempt_ref()
+{
+  static double t = -1e9;
+  return t;
+}
+double nero_creep_steady_now()
+{
+  return nero_steady_now();
+}
+}  // namespace autoware::behavior_velocity_planner
+namespace
+{
+bool nero_adjacent_fix()
+{
+  static const bool on = [] {
+    const char * v = std::getenv("NERO_IX_ADJACENT_FIX");
+    return v != nullptr && std::string(v) == "1";
+  }();
+  return on;
+}
+}  // namespace
 
 namespace autoware::behavior_velocity_planner
 {
@@ -233,6 +400,17 @@ void IntersectionModule::updateObjectInfoManagerArea()
   const auto old_map = object_info_manager_.getObjectsMap();
   object_info_manager_.clearObjects();
 
+  // NERO_IX_CREEP: ego's path = the centreline of its turn lanelet and of the lanelet after it
+  autoware_utils::LineString2d nero_ego_path;
+  if (nero_creep_ix().v_creep > 0.0) {
+    for (const auto & p : assigned_lanelet.centerline2d()) nero_ego_path.emplace_back(p.x(), p.y());
+    const auto nexts = planner_data_->route_handler_->getRoutingGraphPtr()->following(assigned_lanelet);
+    if (!nexts.empty()) {
+      for (const auto & p : nexts.front().centerline2d()) nero_ego_path.emplace_back(p.x(), p.y());
+    }
+  }
+  const double nero_half_width = planner_data_->vehicle_info_.vehicle_width_m / 2.0;
+
   for (const auto & predicted_object : planner_data_->predicted_objects->objects) {
     if (!isTargetCollisionVehicleType(predicted_object)) {
       continue;
@@ -261,13 +439,19 @@ void IntersectionModule::updateObjectInfoManagerArea()
       wrong_way_ego_lane_object_uuids_.insert(uuidKey(predicted_object.object_id));
     }
 
-    const auto belong_adjacent_lanelet_id =
-      checkAngleForTargetLanelets(object_direction, adjacent_lanelets, false);
-    if (belong_adjacent_lanelet_id && !is_wrong_way_on_ego_lane) {
-      continue;
-    }
+    // NERO: with NERO_IX_ADJACENT_FIX=1 an object that is in an attention lanelet (with a matching
+    // heading) is kept even when it also lies on ego's own / sibling turn lanelets ("adjacent"). Upstream
+    // drops it first, so cars crossing the U-turn apex or merging into its exit vanish from the check
+    // exactly while they are in the conflict zone (the U-turn lanelets overlap the junction).
     const auto belong_attention_lanelet_id =
       checkAngleForTargetLanelets(object_direction, attention_lanelets, is_parked_vehicle);
+    const auto belong_adjacent_lanelet_id =
+      checkAngleForTargetLanelets(object_direction, adjacent_lanelets, false);
+    if (
+      belong_adjacent_lanelet_id && !is_wrong_way_on_ego_lane &&
+      !(nero_adjacent_fix() && belong_attention_lanelet_id)) {
+      continue;
+    }
     const auto & obj_pos = predicted_object.kinematics.initial_pose_with_covariance.pose.position;
     const bool in_intersection_area = [&]() {
       if (!intersection_area) {
@@ -288,6 +472,31 @@ void IntersectionModule::updateObjectInfoManagerArea()
     const bool belong_attention_area =
       belong_attention_lanelet_id.has_value() || is_wrong_way_on_ego_lane;
 
+    if (nero_creep_ix().v_creep > 0.0 && nero_ego_path.size() >= 2 && !is_wrong_way_on_ego_lane) {
+      double v = 0.0, acc = 0.0;
+      if (nero_is_creeper(predicted_object, &v, &acc)) {
+        const auto & cp = nero_creep_ix();
+        const double d_stop = v * (cp.t_react + cp.t_pass) + v * v / (2.0 * cp.a_stop);
+        auto stop_pose = predicted_object.kinematics.initial_pose_with_covariance.pose;
+        const double yaw = tf2::getYaw(stop_pose.orientation);
+        const double sgn = predicted_object.kinematics.initial_twist_with_covariance.twist.linear.x < 0.0 ? -1.0 : 1.0;
+        stop_pose.position.x += sgn * d_stop * std::cos(yaw);
+        stop_pose.position.y += sgn * d_stop * std::sin(yaw);
+        const auto stop_poly = autoware_utils::to_polygon2d(stop_pose, predicted_object.shape);
+        const double clear = bg::distance(stop_poly, nero_ego_path) - nero_half_width;
+        if (clear > cp.margin) {
+          static double last_log = 0.0;
+          const double now = nero_steady_now();
+          if (now - last_log > 1.0) {
+            last_log = now;
+            RCLCPP_INFO(logger_, "[NERO_IX] creeper treated as yielding: v %.2f acc %.2f, stops %.2f m clear of ego's path",
+              v, acc, clear);
+          }
+          nero_creep_last_exempt_ref() = nero_steady_now();
+          continue;  // it creeps and can stop clear of ego's path: yielding
+        }
+      }
+    }
     const auto object_it = old_map.find(predicted_object.object_id);
     if (object_it != old_map.end()) {
       auto object_info = object_it->second;
@@ -327,6 +536,16 @@ void IntersectionModule::updateObjectInfoManagerCollision(
   const auto & ego_lane = path_lanelets.ego_or_entry2exit;
   debug_data_.ego_lane = ego_lane.polygon3d();
   const auto ego_poly = ego_lane.polygon2d().basicPolygon();
+  const auto nero_merge = nero_merge_param();
+  const auto ego_centerline = ego_lane.centerline2d();
+  const bool has_ego_exit_yaw = ego_centerline.size() >= 2;
+  const double ego_exit_yaw =
+    has_ego_exit_yaw ? std::atan2(
+                         ego_centerline[ego_centerline.size() - 1].y() -
+                           ego_centerline[ego_centerline.size() - 2].y(),
+                         ego_centerline[ego_centerline.size() - 1].x() -
+                           ego_centerline[ego_centerline.size() - 2].x())
+                     : 0.0;
 
   // Nero c3 (wrong_way_watch): for wrong-way objects on ego's own lane the collision area is ego's
   // whole remaining path from its current position: ego_or_entry2exit plus path_lanelets.next
@@ -466,10 +685,17 @@ void IntersectionModule::updateObjectInfoManagerCollision(
       }
       // junction-yield 10-11 (autoware_universe#11774): with the flag the horizon covers the start margin, so an
       // object entering up to collision_start_margin_time after the ego's (modelled) exit is still checked
+      // NERO: NERO_IX_CUT_EXTRA=<s> keeps the predicted path up to passing_time + s (NERO_IX_MERGE: its max).
+      // Upstream 0.44.2 cuts at passing_time, so a car that reaches the merge into ego's exit lane just after
+      // ego leaves the turn lanelet is never a conflict, although it then closes on the slow ego from behind.
+      // With both this and the start-margin flag set, the longer horizon is used.
       const double prediction_horizon =
-        planner_param_.collision_detection.cut_predicted_path_with_start_margin
-          ? passing_time + collision_start_margin_time
-          : passing_time;
+        passing_time +
+        std::max(
+          planner_param_.collision_detection.cut_predicted_path_with_start_margin
+            ? collision_start_margin_time
+            : 0.0,
+          nero_merge.on ? nero_merge.max : nero_cut_extra());
       cutPredictPathWithinDuration(
         planner_data_->predicted_objects->header.stamp, prediction_horizon, &predicted_path);
       const auto object_passage_interval_opt = findPassageInterval(
@@ -484,10 +710,33 @@ void IntersectionModule::updateObjectInfoManagerCollision(
       const auto object_enter_exit_time = object_passage_interval.interval_time;
       const auto object_enter_time = std::get<0>(object_enter_exit_time);
       const auto object_exit_time = std::get<1>(object_enter_exit_time);
-      const auto ego_start_itr = std::lower_bound(
+      bool nero_force_unsafe = false;
+      if (nero_merge.on && object_enter_time > passing_time) {
+        // reaches ego's turn lanelet only after ego has left it
+        const auto & last_pose =
+          object_passage_interval.path.at(object_passage_interval.interval_position.second);
+        const double dyaw =
+          autoware_utils::normalize_radian(tf2::getYaw(last_pose.orientation) - ego_exit_yaw);
+        if (!has_ego_exit_yaw || std::fabs(dyaw) > M_PI / 4.0) {
+          continue;  // crosses where ego has already been: no conflict (as upstream)
+        }
+        const double v_obj = std::max(
+          0.0, predicted_object.kinematics.initial_twist_with_covariance.twist.linear.x);
+        const double headway = std::min(
+          nero_merge.max,
+          nero_merge.react + std::max(0.0, v_obj - nero_merge.v_ref) / (2.0 * nero_merge.decel));
+        if (object_enter_time >= passing_time + headway) {
+          continue;  // far enough behind ego to follow it comfortably
+        }
+        nero_force_unsafe = true;  // would close on ego from behind harder than `decel`
+      }
+      auto ego_start_itr = std::lower_bound(
         time_distance_array.begin(), time_distance_array.end(),
         object_enter_time - collision_start_margin_time,
         [](const auto & a, const double b) { return a.first < b; });
+      if (ego_start_itr == time_distance_array.end() && nero_force_unsafe) {
+        ego_start_itr = time_distance_array.end() - 1;
+      }
       if (ego_start_itr == time_distance_array.end()) {
         // ==========================================================================================
         // this is the case where at time "object_enter_time - collision_start_margin_time", ego is
@@ -513,7 +762,7 @@ void IntersectionModule::updateObjectInfoManagerCollision(
         lanelet::utils::getLaneletLength2d(concat_lanelets));
       const auto trimmed_ego_polygon = lanelet::utils::getPolygonFromArcLength(
         concat_lanelets, ego_start_arc_length, ego_end_arc_length);
-      if (trimmed_ego_polygon.empty()) {
+      if (trimmed_ego_polygon.empty() && !nero_force_unsafe) {
         continue;
       }
       Polygon2d polygon{};
@@ -525,8 +774,8 @@ void IntersectionModule::updateObjectInfoManagerCollision(
 
       const auto & object_path = object_passage_interval.path;
       const auto [begin, end] = object_passage_interval.interval_position;
-      bool collision_detected = false;
-      for (auto i = begin; i <= end; ++i) {
+      bool collision_detected = nero_force_unsafe;
+      for (auto i = begin; i <= end && !collision_detected; ++i) {
         if (bg::intersects(
               polygon, autoware_utils::to_polygon2d(object_path.at(i), predicted_object.shape))) {
           collision_detected = true;
@@ -1103,8 +1352,16 @@ IntersectionModule::TimeDistanceArray IntersectionModule::calcIntersectionPassin
   }
 
   // apply smoother to reference velocity
+  // NERO: with NERO_IX_EGO_ACC=<a> the smoother is skipped and ego is modelled as accelerating from its
+  // current speed at <a> m/s^2 up to the path's own speed: v(s) = min(v_path(s), sqrt(v0^2 + 2 a s)).
+  // Upstream's smoother output for a standing ego stays below minimum_default_velocity over the whole
+  // turn, so the standing ego was assumed to creep at that floor (0.5 m/s: 13 m in 26 s, really ~6 s),
+  // and a car crossing the U-turn's second half "would pass before ego gets there" when it would not.
+  const double nero_ego_acc = nero_ego_acc_param();
   PathWithLaneId smoothed_reference_path = reference_path;
-  if (!smoothPath(reference_path, smoothed_reference_path, planner_data_)) {
+  if (nero_ego_acc > 0.0) {
+    smoothed_reference_path = reference_path;
+  } else if (!smoothPath(reference_path, smoothed_reference_path, planner_data_)) {
     smoothed_reference_path = reference_path;
   }
 
@@ -1166,8 +1423,13 @@ IntersectionModule::TimeDistanceArray IntersectionModule::calcIntersectionPassin
     dist_sum += dist;
 
     // use average velocity between p1 and p2
-    const double average_velocity =
+    double average_velocity =
       (p1.point.longitudinal_velocity_mps + p2.point.longitudinal_velocity_mps) / 2.0;
+    if (nero_ego_acc > 0.0) {
+      const double v0 = std::max(current_velocity, 0.0);
+      const double v_reach = std::sqrt(v0 * v0 + 2.0 * nero_ego_acc * (dist_sum - 0.5 * dist));
+      average_velocity = std::min(std::max(average_velocity, 0.0), v_reach);
+    }
     const double passing_velocity = [&]() {
       if (use_upstream_velocity) {
         if (upstream_stopline_idx_opt && i > upstream_stopline_idx_opt.value()) {
