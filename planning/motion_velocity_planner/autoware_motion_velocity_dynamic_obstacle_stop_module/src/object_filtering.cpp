@@ -14,6 +14,8 @@
 
 #include "object_filtering.hpp"
 
+#include "nero_creep.hpp"
+
 #include "types.hpp"
 
 #include <autoware/motion_utils/trajectory/trajectory.hpp>
@@ -104,9 +106,11 @@ std::vector<autoware_perception_msgs::msg::PredictedObject> filter_predicted_obj
   std::vector<autoware_perception_msgs::msg::PredictedObject> filtered_objects;
   for (const auto & object : objects) {
     const auto & predicted_object = object->predicted_object;
+    if (is_vehicle(predicted_object)) nero_creep_observe(predicted_object);  // NERO_DOS_CREEP speed history
     const auto is_not_too_slow =
       predicted_object.kinematics.initial_twist_with_covariance.twist.linear.x >=
-      params.minimum_object_velocity;
+        params.minimum_object_velocity ||
+      nero_creep_launching(predicted_object);
     if (
       is_vehicle(predicted_object) && is_not_too_slow &&
       is_in_range(predicted_object, ego_data.trajectory, params, hysteresis) &&

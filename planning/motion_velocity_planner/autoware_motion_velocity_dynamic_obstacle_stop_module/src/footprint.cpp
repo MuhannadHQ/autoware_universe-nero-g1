@@ -14,6 +14,8 @@
 
 #include "footprint.hpp"
 
+#include "nero_creep.hpp"
+
 #include <autoware_utils/geometry/boost_polygon_utils.hpp>
 
 #include <geometry_msgs/msg/pose.hpp>
@@ -45,9 +47,12 @@ autoware_utils::Polygon2d make_forward_footprint(
   const double hysteresis)
 {
   const auto & shape = obstacle.shape.dimensions;
+  const auto nero_reach = nero_creep_reach(obstacle);  // NERO_DOS_CREEP: a creeper reaches only its stopping distance
   const auto longitudinal_offset =
     shape.x / 2.0 +
-    obstacle.kinematics.initial_twist_with_covariance.twist.linear.x * params.time_horizon;
+    (nero_reach >= 0.0
+       ? nero_reach
+       : obstacle.kinematics.initial_twist_with_covariance.twist.linear.x * params.time_horizon);
   const auto lateral_offset = (shape.y + params.extra_object_width) / 2.0 + hysteresis;
   return autoware_utils::Polygon2d{
     {{longitudinal_offset, -lateral_offset},

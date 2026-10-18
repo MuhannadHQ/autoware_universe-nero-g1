@@ -32,6 +32,8 @@
 #include <fmt/format.h>
 
 #include <algorithm>
+#include <cmath>
+#include <cstdlib>
 #include <limits>
 #include <vector>
 
@@ -736,6 +738,39 @@ void append_target_ref_to_candidate(
   }
   const auto add_size = target_lane_ref_path.size() - (lc_end_idx + 1);
   candidate_path.reserve(candidate_path.size() + add_size);
+  // NERO (NERO_LC_FRENET_JOIN_FIX=<m>): upstream drops EVERY target-lane point whose curvature, seen from the
+  // candidate's last point, is >= th_curvature_smoothing — meant to smooth the joint after the lane changing
+  // end, but where the target lane itself curves (here: it runs into a U-turn, radius ~3 m) the whole curve is
+  // dropped and the lane's last point (the far side of the U-turn) is appended: a 180 deg jump that trips
+  // planning_validator (relative angle / curvature) -> MRM. Fixed: skip points only to smooth the joint (the
+  // reference path itself straight there, within <m> of the lane changing end); once one point is appended,
+  // every following one is.
+  static const double nero_join_fix = [] {
+    const char * v = std::getenv("NERO_LC_FRENET_JOIN_FIX");
+    return v != nullptr ? std::atof(v) : -1.0;
+  }();
+  if (nero_join_fix > 0.0) {
+    bool joined = false;
+    for (size_t i = lc_end_idx + 1; i + 1 < points.size(); ++i) {
+      const auto & p2 = points.at(i);
+      if (!joined) {
+        const auto point1 = autoware_utils::get_point(candidate_path.back().point.pose);
+        const auto point2 = autoware_utils::get_point(p2);
+        const auto point3 = autoware_utils::get_point(points.at(i + 1));
+        const auto joint_curv = std::abs(autoware_utils::calc_curvature(point1, point2, point3));
+        const auto ref_curv = std::abs(autoware_utils::calc_curvature(
+          autoware_utils::get_point(points.at(i - 1)), point2, point3));
+        const auto dist = autoware_utils::calc_distance2d(lc_end_pose.position, point2);
+        if (joint_curv >= th_curvature_smoothing && ref_curv < th_curvature_smoothing && dist < nero_join_fix) {
+          continue;
+        }
+        joined = true;
+      }
+      candidate_path.push_back(p2);
+    }
+    candidate_path.push_back(target_lane_ref_path.back());
+    return;
+  }
   for (const auto & [p2, p3] : ranges::views::zip(
          points | ranges::views::drop(lc_end_idx + 1),
          points | ranges::views::drop(lc_end_idx + 2))) {

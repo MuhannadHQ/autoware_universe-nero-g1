@@ -18,12 +18,49 @@
 #include "autoware/behavior_path_static_obstacle_avoidance_module/utils.hpp"
 
 #include <algorithm>
+#include <unordered_map>
+#include <cstdlib>
+#include <chrono>
 #include <string>
 #include <utility>
 #include <vector>
 
 namespace autoware::behavior_path_planner::utils::static_obstacle_avoidance
 {
+namespace
+{
+// NERO_SOA_NO_CHATTER (session 5, upstream #11046 without changing ObjectData's layout, which avoidance_by_lane_change
+// shares): object id -> last time it was judged "avoidable by the desired shift length". Remembered while the object
+// keeps coming back every cycle (gap < 1 s); remember=true records it, false only reads.
+bool nero_avoidable_memory(const ObjectData & object, const bool remember)
+{
+  static const bool on = [] {
+    const char * v = std::getenv("NERO_SOA_NO_CHATTER");
+    return v && std::atoi(v) > 0;
+  }();
+  if (!on) {
+    return false;
+  }
+  static std::unordered_map<std::string, std::chrono::steady_clock::time_point> mem;
+  const auto & u = object.object.object_id.uuid;
+  const std::string key(u.begin(), u.end());
+  const auto now = std::chrono::steady_clock::now();
+  if (remember) {
+    mem[key] = now;
+    return true;
+  }
+  const auto it = mem.find(key);
+  if (it == mem.end()) {
+    return false;
+  }
+  if (now - it->second > std::chrono::seconds(1)) {
+    mem.erase(it);
+    return false;
+  }
+  it->second = now;
+  return true;
+}
+}  // namespace
 
 namespace
 {
@@ -183,12 +220,19 @@ AvoidOutlines ShiftLineGenerator::generateAvoidOutline(
       return std::nullopt;
     }
 
+    // NERO_SOA_NO_CHATTER (upstream #11046): once avoidable by the desired shift, it stays so while the object
+    // stays a target — the decision flipped between cycles as ego's speed / distance changed
+    if (nero_avoidable_memory(object, false)) {
+      return std::make_pair(desire_shift_length, avoidance_distance);
+    }
+
     // calculate lateral jerk.
     const auto required_jerk = autoware::motion_utils::calc_jerk_from_lat_lon_distance(
       avoiding_shift, avoidance_distance, helper_->getAvoidanceEgoSpeed());
 
     // relax lateral jerk limit. avoidable.
     if (required_jerk < helper_->getLateralMaxJerkLimit()) {
+      nero_avoidable_memory(object, true);
       return std::make_pair(desire_shift_length, avoidance_distance);
     }
 

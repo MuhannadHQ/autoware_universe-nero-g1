@@ -385,6 +385,34 @@ private:
    */
   bool isSafePath(ShiftedPath & shifted_path, DebugData & debug) const;
 
+  // ---- nero (session 5, 2026-10-17): moving around objects with traffic in the next lane. Inert unless the
+  // NERO_SOA_* environment variables are set (scene.cpp, namespace nero_soa). Members of this class only: the data
+  // structs are shared with avoidance_by_lane_change, so their layout stays stock.
+  // ego's predicted motion: from the current speed toward v_hold (decel / accel limited) until s_hold metres along
+  // the path, then back up to max_vel; never above max_vel (stock: +0.5 m/s² uncapped)
+  std::vector<utils::path_safety_checker::PoseWithVelocityStamped> neroEgoPredictedPath(
+    const ShiftedPath & shifted_path, bool for_front_object, double v_hold, double s_hold) const;
+  // the stock collision test of isSafePath with that prediction, no hysteresis counters touched
+  bool neroIsSafeRaw(
+    const ShiftedPath & shifted_path, double v_hold, double s_hold, DebugData & debug) const;
+  // distance from ego to where the candidate path starts to move sideways (< 0: already moving / no shift)
+  double neroShiftStartDistance(const ShiftedPath & shifted_path) const;
+  // gap timing: when the move is unsafe at the current speed, the highest approach speed at which it is safe
+  void neroGapTiming(AvoidancePlanningData & data, DebugData & debug) const;
+  void neroInsertGapVelocity(ShiftedPath & shifted_path) const;
+  mutable double nero_gap_v_{-1.0};  // < 0: no gap plan
+  mutable double nero_gap_s_hold_{0.0};
+  mutable int nero_gap_safe_n_{0};
+  mutable int nero_gap_up_n_{0};
+  mutable int nero_cruise_safe_n_{0};
+  // NERO_SOA_APPROVAL_KEEPS_SAFETY: ambiguous objects the operator approved moving around (object id -> last seen, s):
+  // not asked again (the yield after an approval drops the shift line and the next one would be a new request)
+  mutable std::unordered_map<std::string, double> nero_approved_;
+  // NERO_SOA_HOLD_IN_LANE at (nearly) standstill: stop where ego is (set in fillEgoStatus, used in updateEgoBehavior)
+  mutable bool nero_hold_now_{false};
+  // NERO_SOA_STILL_SHARP_S: since when ego stands still with an avoidance target (s, clock; < 0 = moving)
+  mutable double nero_still_since_{-1.0};
+
   auto getTurnSignal(const ShiftedPath & spline_shift_path, const ShiftedPath & linear_shift_path)
     -> TurnSignalInfo;
 

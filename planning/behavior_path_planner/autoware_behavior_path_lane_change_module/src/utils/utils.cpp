@@ -47,6 +47,8 @@
 #include <rclcpp/rclcpp.hpp>
 
 #include <boost/geometry/algorithms/buffer.hpp>
+#include <boost/geometry/algorithms/distance.hpp>
+#include <boost/geometry/algorithms/within.hpp>
 #include <boost/geometry/algorithms/detail/disjoint/interface.hpp>
 #include <boost/geometry/io/svg/svg_mapper.hpp>
 #include <boost/geometry/io/svg/write.hpp>
@@ -59,6 +61,7 @@
 #include <tf2_ros/transform_listener.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <iterator>
 #include <limits>
 #include <memory>
@@ -897,6 +900,35 @@ bool has_overtaking_turn_lane_object(
     trailing_objects.begin(), trailing_objects.end(), is_object_overlap_with_target);
 }
 
+// NERO_LC_STOPPED_MIN_INTRUSION=<m> (session 4, keep right): a stopped object counts as standing IN the target lane
+// (target_lane_leading.stopped: it can delay the lane change, "parked vehicle exists in the target lane") only when it
+// reaches more than <m> into the target lanes' polygon; one that only grazes the lane edge — an angle-parked car at the
+// curb whose corner is 0.1-0.4 m over the line — is kept as stopped_at_bound (still in the collision check). Upstream:
+// any overlap, so a row of cars parked along the curb of the target lane delayed a keep-right lane change for good.
+double nero_stopped_min_intrusion()
+{
+  static const double v = [] {
+    const char * e = std::getenv("NERO_LC_STOPPED_MIN_INTRUSION");
+    return e ? std::atof(e) : -1.0;
+  }();
+  return v;
+}
+
+double nero_intrusion_depth(const autoware_utils::Polygon2d & obj, const lanelet::BasicPolygon2d & lanes)
+{
+  if (lanes.size() < 3) return 0.0;
+  lanelet::BasicLineString2d ring(lanes.begin(), lanes.end());
+  ring.push_back(lanes.front());
+  double depth = 0.0;
+  for (const auto & p : obj.outer()) {
+    const lanelet::BasicPoint2d q(p.x(), p.y());
+    if (boost::geometry::within(q, lanes)) {
+      depth = std::max(depth, boost::geometry::distance(q, ring));
+    }
+  }
+  return depth;
+}
+
 bool filter_target_lane_objects(
   const CommonDataPtr & common_data_ptr, const ExtendedPredictedObject & object,
   const double dist_ego_to_current_lanes_center, const bool ahead_of_ego,
@@ -932,6 +964,12 @@ bool filter_target_lane_objects(
       }
 
       if (ahead_of_ego) {
+        if (
+          is_stopped && nero_stopped_min_intrusion() > 0.0 &&
+          nero_intrusion_depth(object.initial_polygon, lanes_polygon.target) < nero_stopped_min_intrusion()) {
+          leading_objects.stopped_at_bound.push_back(object);  // NERO: only grazes the lane edge
+          return true;
+        }
         if (is_stopped) {
           leading_objects.stopped.push_back(object);
         } else {
@@ -1010,6 +1048,51 @@ bool object_path_overlaps_lanes(
   });
 }
 
+namespace
+{
+// NERO (NERO_LC_PRED_LAUNCH_ACC=<m/s^2>): the ego prediction the safety check uses assumes ego reaches the prepare /
+// lane changing speed, which is clamped up to min_lane_changing_velocity (2.0 m/s): from standstill that is
+// 2 m/s^2 with a 1 s prepare, and the frenet path's lane changing phase simply starts at 2 m/s — while the vehicle
+// launches at ~0.33-0.5 m/s^2. Merging from a stop or a crawl (exactly what the rolling wait produces) was thus
+// judged with ego several metres further ahead than it will be (full_mixed:1: approved from standstill with a car
+// 29 m behind at 22 km/h -> collision). Cap the predicted speed at v0 + a t and re-place each predicted pose that
+// far along the predicted poses (never forward): the path is unchanged, only the check gets realistic.
+void nero_cap_predicted_launch(std::vector<PoseWithVelocityStamped> & pp, const double v0)
+{
+  static const double a_l = [] {
+    const char * v = std::getenv("NERO_LC_PRED_LAUNCH_ACC");
+    return v != nullptr ? std::atof(v) : -1.0;
+  }();
+  if (a_l <= 0.0 || pp.size() < 2) {
+    return;
+  }
+  const auto orig = pp;
+  std::vector<double> d(orig.size(), 0.0);
+  for (size_t i = 1; i < orig.size(); ++i) {
+    d.at(i) = d.at(i - 1) + autoware_utils::calc_distance2d(orig.at(i - 1).pose, orig.at(i).pose);
+  }
+  const double t0 = orig.front().time;
+  double r = 0.0;
+  double v_prev = std::min(orig.front().velocity, std::max(v0, 0.0));
+  pp.front().velocity = v_prev;
+  for (size_t i = 1; i < orig.size(); ++i) {
+    const double v_cap = std::max(v0, 0.0) + a_l * (orig.at(i).time - t0);
+    const double v = std::min(orig.at(i).velocity, v_cap);
+    r += 0.5 * (v_prev + v) * std::max(0.0, orig.at(i).time - orig.at(i - 1).time);
+    v_prev = v;
+    pp.at(i).velocity = v;
+    if (r >= d.at(i) - 1e-3) {
+      continue;  // never move a predicted pose forward
+    }
+    const auto it = std::upper_bound(d.begin(), d.end(), r);
+    const size_t j = std::clamp<size_t>(static_cast<size_t>(std::distance(d.begin(), it)), 1, d.size() - 1);
+    const double seg = d.at(j) - d.at(j - 1);
+    const double ratio = seg > 1e-6 ? (r - d.at(j - 1)) / seg : 0.0;
+    pp.at(i).pose = autoware_utils::calc_interpolated_pose(orig.at(j - 1).pose, orig.at(j).pose, ratio, false);
+  }
+}
+}  // namespace
+
 std::vector<std::vector<PoseWithVelocityStamped>> convert_to_predicted_paths(
   const CommonDataPtr & common_data_ptr, const LaneChangePath & lane_change_path,
   const size_t deceleration_sampling_num)
@@ -1025,12 +1108,16 @@ std::vector<std::vector<PoseWithVelocityStamped>> convert_to_predicted_paths(
   const auto acc_resolution = (min_acc - lane_changing_acc) / static_cast<double>(sampling_num);
 
   const auto ego_predicted_path = [&](size_t n) {
-    if (lane_change_path.type == PathType::FrenetPlanner) {
-      return convert_to_predicted_path(
-        common_data_ptr, lane_change_path.frenet_path, deceleration_sampling_num);
-    }
-    auto acc = lane_changing_acc + static_cast<double>(n) * acc_resolution;
-    return utils::lane_change::convert_to_predicted_path(common_data_ptr, lane_change_path, acc);
+    auto pp = std::invoke([&]() {
+      if (lane_change_path.type == PathType::FrenetPlanner) {
+        return convert_to_predicted_path(
+          common_data_ptr, lane_change_path.frenet_path, deceleration_sampling_num);
+      }
+      auto acc = lane_changing_acc + static_cast<double>(n) * acc_resolution;
+      return utils::lane_change::convert_to_predicted_path(common_data_ptr, lane_change_path, acc);
+    });
+    nero_cap_predicted_launch(pp, common_data_ptr->get_ego_speed());
+    return pp;
   };
 
   return ranges::views::iota(0UL, sampling_num) | ranges::views::transform(ego_predicted_path) |

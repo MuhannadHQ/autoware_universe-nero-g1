@@ -13,6 +13,10 @@
 // limitations under the License.
 
 #include "autoware/behavior_path_lane_change_module/interface.hpp"
+#include "autoware/behavior_path_lane_change_module/scene.hpp"
+#include <cstdio>
+#include <chrono>
+#include <array>
 
 #include "autoware/behavior_path_lane_change_module/utils/markers.hpp"
 #include "autoware/behavior_path_lane_change_module/utils/utils.hpp"
@@ -24,7 +28,12 @@
 #include <autoware_utils/ros/marker_helper.hpp>
 #include <autoware_utils/system/time_keeper.hpp>
 
+#include <autoware/motion_utils/trajectory/trajectory.hpp>
+#include <autoware_utils/geometry/geometry.hpp>
+
 #include <algorithm>
+#include <cmath>
+#include <cstdlib>
 #include <limits>
 #include <memory>
 #include <string>
@@ -159,11 +168,75 @@ BehaviorModuleOutput LaneChangeInterface::plan()
   return output;
 }
 
+namespace
+{
+double nero_env(const char * name, const double fallback)
+{
+  const char * v = std::getenv(name);
+  return v != nullptr ? std::atof(v) : fallback;
+}
+
+// NERO: with NERO_LC_WAIT_DECEL=<m/s^2>, while a lane change waits for a gap the speed toward the
+// waiting (stop) point is capped at sqrt(crawl^2 + 2 decel max(0, s - roll)): ego eases off early and
+// gradually, rolls the last NERO_LC_WAIT_ROLL m (default 0) at NERO_LC_WAIT_CRAWL (default 0.8 m/s)
+// signalling and hugging the line — time for drivers behind to let it in while it is still moving —
+// and stops only at the stop point itself if no gap has come by then.
+void nero_cap_waiting_velocity(PathWithLaneId & path, const PoseWithDetailOpt & stop, const Direction direction)
+{
+  static const int saudi_dir = static_cast<int>(nero_env("NERO_LC_SAUDI_DIR", 0.0));  // see scene.cpp
+  if (
+    (saudi_dir == 1 && direction != Direction::LEFT) || (saudi_dir == 2 && direction != Direction::RIGHT)) {
+    return;
+  }
+  static const double decel = nero_env("NERO_LC_WAIT_DECEL", 0.0);
+  static const double crawl = nero_env("NERO_LC_WAIT_CRAWL", 0.8);
+  static const double roll = nero_env("NERO_LC_WAIT_ROLL", 0.0);
+  if (decel <= 0.0 || !stop || path.points.size() < 2) {
+    return;
+  }
+  const size_t stop_idx =
+    autoware::motion_utils::findNearestIndex(path.points, stop->pose.position);
+  double s = 0.0;
+  for (size_t i = stop_idx; i > 0; --i) {
+    s += autoware_utils::calc_distance2d(path.points.at(i), path.points.at(i - 1));
+    const double v = std::sqrt(crawl * crawl + 2.0 * decel * std::max(0.0, s - roll));
+    auto & pv = path.points.at(i - 1).point.longitudinal_velocity_mps;
+    pv = std::min(pv, static_cast<float>(v));
+  }
+}
+// NERO_LC_YIELD_FRONT: see NormalLaneChange::nero_yield_cap() (scene.cpp), applied in planWaitingApproval below.
+}  // namespace
+
 BehaviorModuleOutput LaneChangeInterface::planWaitingApproval()
 {
   BehaviorModuleOutput out = module_type_->getTerminalLaneChangePath();
 
   module_type_->insert_stop_point(module_type_->get_current_lanes(), out.path, true);
+  nero_cap_waiting_velocity(out.path, module_type_->getStopPose(), module_type_->getDirection());
+  if (const auto * nlc = dynamic_cast<const NormalLaneChange *>(module_type_.get())) {
+    const double cap = nlc->nero_yield_cap();
+    if (cap >= 0.0 && out.path.points.size() >= 2) {
+      // ramp down from ego's speed at a comfortable 0.8 m/s^2 along the path (a step cap tripped the control /
+      // planning validators: "over-speeding against the target", "deceleration is too large" -> MRM)
+      constexpr double a_ease = 0.8;
+      const double v0 = std::max(0.0, module_type_->getEgoVelocity());
+      const size_t ego_idx = autoware::motion_utils::findNearestIndex(
+        out.path.points, module_type_->getEgoPose().position);
+      double s_acc = 0.0;
+      for (size_t i = ego_idx; i < out.path.points.size(); ++i) {
+        if (i > ego_idx) s_acc += autoware_utils::calc_distance2d(out.path.points.at(i - 1), out.path.points.at(i));
+        const double lim = std::max(cap, std::sqrt(std::max(0.0, v0 * v0 - 2.0 * a_ease * s_acc)));
+        auto & pv = out.path.points.at(i).point.longitudinal_velocity_mps;
+        pv = std::min(pv, static_cast<float>(lim));
+      }
+      static double last = 0.0;
+      const double now = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+      if (now - last > 1.0) {
+        last = now;
+        RCLCPP_INFO(getLogger(), "[NERO_LC] easing off for a car in the target lane: cap %.1f m/s", cap);
+      }
+    }
+  }
   out.turn_signal_info = module_type_->get_current_turn_signal_info();
 
   const auto & lane_change_debug = module_type_->getDebugData();

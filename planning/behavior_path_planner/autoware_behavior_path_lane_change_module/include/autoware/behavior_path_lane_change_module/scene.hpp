@@ -90,6 +90,11 @@ public:
 
   PathSafetyStatus isApprovedPathSafe() const override;
 
+  bool nero_in_hold_mode() const;  // NERO hold (non-virtual: no layout change)
+
+  // NERO_LC_YIELD_FRONT (session 4): the speed cap while waiting (< 0: none). Non-virtual: no layout change.
+  double nero_yield_cap() const;
+
   PathSafetyStatus evaluateApprovedPathWithUnsafeHysteresis(
     PathSafetyStatus approved_path_safety_status) override;
 

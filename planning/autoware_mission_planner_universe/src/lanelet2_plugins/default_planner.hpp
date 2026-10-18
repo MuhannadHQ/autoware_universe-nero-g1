@@ -28,6 +28,7 @@
 #include <lanelet2_routing/RoutingGraph.h>
 #include <lanelet2_traffic_rules/TrafficRulesFactory.h>
 
+#include <optional>
 #include <vector>
 
 namespace autoware::mission_planner_universe::lanelet2
@@ -70,6 +71,16 @@ protected:
   rclcpp::Publisher<MarkerArray>::SharedPtr pub_goal_footprint_marker_;
 
   void initialize_common(rclcpp::Node * node);
+  // NERO_KEEP_RIGHT: the goal moved to the rightmost same-direction lane (nullopt = keep it)
+  std::optional<Pose> nero_keep_right_goal(const Pose & goal) const;
+  // NERO_KEEP_RIGHT_EARLY: every lane change to the right in the lanelet path moved to the earliest lanelet from which
+  // the right lane runs parallel up to it (after the U-turn: on 18952 -> 18956, not on 93606 -> 28793)
+  // fallback: (right-lane lanelet, inner lanelet beside it) for every lanelet the change was moved past — the inner
+  // ones are put back into the route as non-preferred lanes, so ego that cannot change early stays in the inner lane
+  // and changes at the original place (the change is attempted early, not forced early)
+  lanelet::ConstLanelets nero_early_right_changes(
+    const lanelet::ConstLanelets & path,
+    std::vector<std::pair<lanelet::Id, lanelet::Id>> * fallback) const;
   void map_callback(const LaneletMapBin::ConstSharedPtr msg);
 
   /**
