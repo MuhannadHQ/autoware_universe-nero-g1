@@ -66,6 +66,7 @@ enum class ObjectInfo {
   INVALID_SHIFT_LINE,
   // others
   AMBIGUOUS_STOPPED_VEHICLE,
+  CLOSE_DISTANCE_AVOIDANCE,
 };
 
 struct ObjectParameter
@@ -115,6 +116,9 @@ struct AvoidanceParameters
 
   // enable yield maneuver.
   bool enable_yield_maneuver{false};
+
+  // policy for close distance avoidance
+  std::string policy_close_distance_avoidance{"ignore"};
 
   // enable yield maneuver.
   bool enable_yield_maneuver_during_shifting{false};

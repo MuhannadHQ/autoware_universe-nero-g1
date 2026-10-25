@@ -27,8 +27,11 @@
 #include <rclcpp/node.hpp>
 #include <rclcpp/time.hpp>
 
+#include <array>
+#include <deque>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <set>
 #include <string>
 #include <unordered_map>
@@ -412,6 +415,81 @@ private:
   mutable bool nero_hold_now_{false};
   // NERO_SOA_STILL_SHARP_S: since when ego stands still with an avoidance target (s, clock; < 0 = moving)
   mutable double nero_still_since_{-1.0};
+
+  // ---- nero (2026-10-24, oncominglate job): an oncoming car that comes into view once ego is out in the oncoming
+  // lane (scene.cpp, namespace nero_ovl). Members of this class only (the data structs stay stock).
+  // how far ego's body is over its own lane's bound on the shift side (m, > 0 = over; NaN = no lane)
+  double neroBodyOverLaneBound() const;
+  // NERO_SOA_ONCOMING_DEBUG: one log line per cycle (ego's shift and overhang, verdicts, moving safety-check objects)
+  void neroOncomingDebugLog() const;
+  struct NeroOncoming
+  {
+    std::string id;
+    double v{0.0};             // speed now (m/s)
+    double v_recent_max{0.0};  // highest speed of the last 2 s
+    double gap{0.0};           // its front to ego's front along the path (m)
+    bool slowing{false};
+    bool can_stop{false};      // a driver reacting now could still stop before ego
+    bool vehicle{false};
+  };
+  // the nearest oncoming car (see scene.cpp nero_ovl), with its speed history (kept across track ids)
+  std::optional<NeroOncoming> neroFindOncoming(const AvoidancePlanningData & data) const;
+  // the largest |shift| that keeps the body `margin` inside ego's lane on that side (nullopt: no lane)
+  std::optional<double> neroInLaneShiftLimit(
+    const AvoidancePlanningData & data, bool left, double margin) const;
+  // the first standing object (avoidance targets skipped if asked) within obstacle_stop's lateral margin of ego's body
+  // at any of these poses ("" if none)
+  std::string neroBlocker(
+    const std::vector<geometry_msgs::msg::Pose> & body_poses, const AvoidancePlanningData & data,
+    bool skip_targets) const;
+  // NERO_SOA_ONCOMING_CORRIDOR: blocker of the planned pass where the body is over the line ("" if none / not before
+  // the body leaves the lane)
+  std::string neroCorridorBlocker(const AvoidancePlanningData & data) const;
+  // blocker of the way back into the lane: the body at `shift` up to `start` m ahead, then back over `length` m
+  std::string neroReturnBlocker(
+    const AvoidancePlanningData & data, double shift, double start, double length) const;
+  // NERO_SOA_ONCOMING_SIGHT_M: the oncoming lane ego must see clear before its body leaves the lane (nullopt: not
+  // before a pass that leaves the lane)
+  std::optional<double> neroPassSightNeeded(const AvoidancePlanningData & data) const;
+  // the distance to the target the shift is for (the stop target, else the nearest target ahead)
+  std::optional<double> neroPauseTargetDistance(const AvoidancePlanningData & data) const;
+  // NERO_SOA_ONCOMING_PAUSE: start / keep / end the pause; true while paused
+  bool neroOncomingPause(AvoidancePlanningData & data) const;
+  // NERO_SOA_ONCOMING_COMMITTED: go through or stop now
+  void neroOncomingCommitted(const AvoidancePlanningData & data) const;
+  // the pause starts: the path holds `target_shift` (signed) from `ease_distance` ahead on (RC1 freezeShift)
+  void neroFreezeShift(
+    const AvoidancePlanningData & data, double target_shift, double ease_distance, double return_start = -1.0,
+    double return_length = 0.0);
+  // NERO_SOA_ONCOMING_COMMITTED: beside / past the targets with an oncoming car: return into the lane as soon as the
+  // rear has cleared them, at the module's sharpest lateral jerk at ego's own speed (RC1's oncoming return)
+  void neroOncomingReturn(AvoidancePlanningData & data);
+  mutable bool nero_returning_{false};
+  mutable bool nero_go_through_{false};  // NERO_SOA_ONCOMING_COMMITTED decided to go through this cycle
+  void neroInsertPauseStop(ShiftedPath & shifted_path) const;
+  mutable std::optional<NeroOncoming> nero_onc_;
+  struct NeroHist
+  {
+    double x, y, last;
+    std::deque<std::pair<double, double>> v;  // (time, speed)
+    double since;                             // first time over the speed threshold (< 0: not)
+    // this track id's own positions (time, x, y, speed toward ego along the path) for the position trigger
+    std::deque<std::array<double, 4>> pos;
+    bool latched{false};                      // judged an oncoming car (kept across ids by place)
+  };
+  mutable std::unordered_map<std::string, NeroHist> nero_onc_hist_;
+  mutable bool nero_paused_{false};
+  mutable bool nero_pause_start_{false};
+  mutable double nero_pause_shift_{0.0};  // signed hold shift
+  mutable double nero_pause_ease_{0.0};
+  mutable double nero_pause_desired_{0.0};  // signed shift ego was heading for when the pause began
+  mutable double nero_pause_clear_since_{-1.0};
+  mutable bool nero_stop_now_{false};
+  mutable std::string nero_corridor_blocker_;  // NERO_SOA_ONCOMING_CORRIDOR: this cycle's blocker ("" = free)
+
+  // ---- nero (2026-10-25, passstart job): an object ahead makes the pass unsafe in the last metres before the shift
+  // starts (scene.cpp, NERO_SOA_ONCOMING_START_YIELD). The unsafe object ahead in this cycle's safety check, or "".
+  std::string neroStartYieldObject() const;
 
   auto getTurnSignal(const ShiftedPath & spline_shift_path, const ShiftedPath & linear_shift_path)
     -> TurnSignalInfo;

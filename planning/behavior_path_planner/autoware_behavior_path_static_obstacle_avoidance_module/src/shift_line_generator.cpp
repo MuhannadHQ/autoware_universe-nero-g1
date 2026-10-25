@@ -18,6 +18,7 @@
 #include "autoware/behavior_path_static_obstacle_avoidance_module/utils.hpp"
 
 #include <algorithm>
+#include <cstdio>
 #include <unordered_map>
 #include <cstdlib>
 #include <chrono>
@@ -59,6 +60,23 @@ bool nero_avoidable_memory(const ObjectData & object, const bool remember)
   }
   it->second = now;
   return true;
+}
+
+// NERO_SOA_SAME_SIDE_RULE_HARMLESS=1 (2026-10-22, captures #1/#2): the same-side rule ("if an object cannot be avoided,
+// only avoid objects on its side") vetoes a target on the other side only when the unavoidable object really limits
+// that move: not when it is behind ego (the rear traffic is the safety check's job), and not when it is a
+// SAME_DIRECTION_SHIFT object (needs no shift) whose allowed shift still covers the move toward it. Stock: the first
+// unavoidable object vetoes every target on the other side (#1: a low UNKNOWN 2.4 m left of the lane blocked the move
+// round the nose-in car on the right; #2: the stopped follower behind-left did).
+bool nero_same_side_harmless()
+{
+  static const bool on = [] {
+    const char * v = std::getenv("NERO_SOA_SAME_SIDE_RULE_HARMLESS");
+    const bool r = v && std::atoi(v) > 0;
+    std::fprintf(stderr, "[NERO_SOA] same_side_rule_harmless=%d\n", r);
+    return r;
+  }();
+  return on;
 }
 }  // namespace
 
@@ -217,6 +235,10 @@ AvoidOutlines ShiftLineGenerator::generateAvoidOutline(
     // prepare distance is not enough. unavoidable.
     if (avoidance_distance < 1e-3) {
       object.info = ObjectInfo::INSUFFICIENT_LONGITUDINAL_DISTANCE;
+      if (helper_->isVehicleStopped() && parameters_->policy_close_distance_avoidance != "ignore") {
+        object.info = ObjectInfo::CLOSE_DISTANCE_AVOIDANCE;
+        return std::make_pair(desire_shift_length, object.longitudinal);
+      }
       return std::nullopt;
     }
 
@@ -241,6 +263,11 @@ AvoidOutlines ShiftLineGenerator::generateAvoidOutline(
     // avoidance distance is not enough. unavoidable.
     if (!isBestEffort(parameters_->policy_deceleration)) {
       if (avoidance_distance < helper_->getMinAvoidanceDistance(avoiding_shift) + LON_DIST_BUFFER) {
+        if (
+          helper_->isVehicleStopped() && parameters_->policy_close_distance_avoidance != "ignore") {
+          object.info = ObjectInfo::CLOSE_DISTANCE_AVOIDANCE;
+          return std::make_pair(desire_shift_length, object.longitudinal);
+        }
         object.info = ObjectInfo::INSUFFICIENT_LONGITUDINAL_DISTANCE;
         return std::nullopt;
       } else {
@@ -265,6 +292,10 @@ AvoidOutlines ShiftLineGenerator::generateAvoidOutline(
     if (
       avoidance_distance <
       helper_->getMinAvoidanceDistance(feasible_shift_length) + LON_DIST_BUFFER) {
+      if (helper_->isVehicleStopped() && parameters_->policy_close_distance_avoidance != "ignore") {
+        object.info = ObjectInfo::CLOSE_DISTANCE_AVOIDANCE;
+        return std::make_pair(desire_shift_length, object.longitudinal);
+      }
       object.info = ObjectInfo::INSUFFICIENT_LONGITUDINAL_DISTANCE;
       return std::nullopt;
     }
@@ -353,11 +384,28 @@ AvoidOutlines ShiftLineGenerator::generateAvoidOutline(
 
     // If there is an object that cannot be avoided, this module only avoids object on the same side
     // as unavoidable object.
-    if (!unavoidable_objects.empty()) {
+    if (!unavoidable_objects.empty() && !nero_same_side_harmless()) {
       if (isOnRight(unavoidable_objects.front()) && !isOnRight(o)) {
         break;
       }
       if (!isOnRight(unavoidable_objects.front()) && isOnRight(o)) {
+        break;
+      }
+    }
+    if (!unavoidable_objects.empty() && nero_same_side_harmless()) {
+      bool veto = false;
+      for (const auto & u : unavoidable_objects) {
+        if (isOnRight(u) == isOnRight(o)) continue;  // same side: no conflict
+        if (u.longitudinal < 0.0) continue;           // behind ego
+        if (u.info == ObjectInfo::SAME_DIRECTION_SHIFT && u.avoid_margin.has_value()) {
+          // the furthest ego may go toward u while keeping u's margin
+          const auto allowed = helper_->getShiftLength(u, isOnRight(u), u.avoid_margin.value());
+          if (std::abs(desire_shift_length) <= std::abs(allowed)) continue;
+        }
+        veto = true;
+        break;
+      }
+      if (veto) {
         break;
       }
     }
@@ -369,7 +417,9 @@ AvoidOutlines ShiftLineGenerator::generateAvoidOutline(
     AvoidLine al_avoid;
     {
       const auto constant_distance = helper_->getFrontConstantDistance(o);
-      const auto to_shift_end = o.longitudinal - constant_distance;
+      const auto to_shift_end = o.info == ObjectInfo::CLOSE_DISTANCE_AVOIDANCE
+                                  ? o.longitudinal
+                                  : o.longitudinal - constant_distance;
       const auto path_front_to_ego = data.arclength_from_ego.at(data.ego_closest_path_index);
 
       // start point (use previous linear shift length as start shift length.)
@@ -642,6 +692,10 @@ AvoidLineArray ShiftLineGenerator::extractShiftLinesFromLine(
 
   auto & sl = shift_line_data;
 
+  // nero: upstream #12105 rewrote this extraction together with the close-vehicle policy (tested together upstream);
+  // with the policy "ignore" (NERO_SOA_CLOSE_VEHICLE_POLICY unset) the 0.44.2 forward/backward-difference test stays.
+  const bool close_vehicle_on = parameters_->policy_close_distance_avoidance != "ignore";
+
   const auto backward_grad = [&](const size_t i) {
     if (i == 0) {
       return sl.shift_line_grad.at(i);
@@ -673,6 +727,16 @@ AvoidLineArray ShiftLineGenerator::extractShiftLinesFromLine(
     sl.backward_grad.at(i) = backward_grad(i);
   }
 
+  // Calculate second derivative of shift line directly from sl.shift_line_grad.
+  // This detects the start and end points of shift by finding where the gradient changes.
+  std::vector<double> shift_line_second_grad(N, 0.0);
+  for (size_t i = 0; i < N - 1; ++i) {
+    const double ds = arcs.at(i + 1) - arcs.at(i);
+    if (ds > 1.0e-5) {
+      shift_line_second_grad.at(i) = (sl.shift_line_grad.at(i + 1) - sl.shift_line_grad.at(i)) / ds;
+    }
+  }
+
   AvoidLineArray merged_avoid_lines;
   AvoidLine al{};
   bool found_first_start = false;
@@ -687,11 +751,17 @@ AvoidLineArray ShiftLineGenerator::extractShiftLinesFromLine(
     if (!found_first_start && std::abs(shift) > IS_ALREADY_SHIFTING_THR) {
       setStartData(al, 0.0, p, i, arcs.at(i));  // start length is overwritten later.
       found_first_start = true;
+      if (close_vehicle_on) {
+        continue;
+      }
     }
 
-    // find the point where the gradient of the shift is changed
+    // Find the point where the second derivative of shift gradient is significant.
+    // This indicates the start or end of a shift maneuver.
     const bool set_shift_line_flag =
-      std::abs(sl.forward_grad.at(i) - sl.backward_grad.at(i)) > CREATE_SHIFT_GRAD_THR;
+      close_vehicle_on
+        ? std::abs(shift_line_second_grad.at(i)) > CREATE_SHIFT_GRAD_THR
+        : std::abs(sl.forward_grad.at(i) - sl.backward_grad.at(i)) > CREATE_SHIFT_GRAD_THR;
 
     if (!set_shift_line_flag) {
       continue;
@@ -708,7 +778,11 @@ AvoidLineArray ShiftLineGenerator::extractShiftLinesFromLine(
     }
   }
 
-  if (std::abs(backward_grad(N - 1)) > CREATE_SHIFT_GRAD_THR) {
+  // Check if the last point still has a gradient (shift is ongoing at the end of path).
+  const bool ongoing_at_end = close_vehicle_on
+                                ? (N > 1 && std::abs(sl.shift_line_grad.at(N - 1)) > CREATE_SHIFT_GRAD_THR)
+                                : std::abs(backward_grad(N - 1)) > CREATE_SHIFT_GRAD_THR;
+  if (ongoing_at_end) {
     const auto & p = path.points.at(N - 1).point.pose;
     const auto shift = sl.shift_line.at(N - 1);
     setEndData(al, shift, p, N - 1, arcs.at(N - 1));

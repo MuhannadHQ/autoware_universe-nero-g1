@@ -21,6 +21,7 @@
 
 #include <autoware_perception_msgs/msg/detail/object_classification__struct.hpp>
 
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -156,6 +157,18 @@ AvoidanceParameters getParameter(rclcpp::Node * node)
       get_or_declare_parameter<double>(*node, ns + "ignore_area.crosswalk.front_distance");
     p.object_ignore_section_crosswalk_behind_distance =
       get_or_declare_parameter<double>(*node, ns + "ignore_area.crosswalk.behind_distance");
+  }
+
+  {
+    // upstream #12105 (0.51.0). nero: declared with the upstream default "ignore" so the 10-21 param files need no new
+    // key; NERO_SOA_CLOSE_VEHICLE_POLICY=auto|manual|ignore sets it (unset = as on 10-21)
+    const std::string name = "avoidance.target_filtering.avoidance_for_close_vehicle.policy";
+    p.policy_close_distance_avoidance = node->has_parameter(name)
+                                          ? node->get_parameter(name).as_string()
+                                          : node->declare_parameter<std::string>(name, "ignore");
+    if (const char * v = std::getenv("NERO_SOA_CLOSE_VEHICLE_POLICY"); v && *v) {
+      p.policy_close_distance_avoidance = v;
+    }
   }
 
   {

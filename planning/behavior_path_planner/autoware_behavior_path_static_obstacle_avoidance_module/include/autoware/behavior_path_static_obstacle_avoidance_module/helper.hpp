@@ -60,6 +60,8 @@ public:
 
   double getEgoSpeed() const { return std::abs(data_->self_odometry->twist.twist.linear.x); }
 
+  bool isVehicleStopped() const { return getEgoSpeed() < 0.3; }
+
   geometry_msgs::msg::Pose getEgoPose() const { return data_->self_odometry->pose.pose; }
 
   geometry_msgs::msg::Point getEgoPosition() const
@@ -306,6 +308,10 @@ public:
 
   bool isEnoughPrepareDistance(const double prepare_distance) const
   {
+    if (isVehicleStopped() && parameters_->policy_close_distance_avoidance != "ignore") {
+      return true;  // too slow to prepare
+    }
+
     const auto & p = parameters_;
     return prepare_distance >
            std::max(getEgoSpeed() * p->min_prepare_time, p->min_prepare_distance);
@@ -346,6 +352,13 @@ public:
     }
 
     const auto & object = objects.front();
+
+    if (object.info == ObjectInfo::CLOSE_DISTANCE_AVOIDANCE) {
+      if (parameters_->policy_close_distance_avoidance == "manual") {
+        return std::make_pair(false, true);
+      }
+      return std::make_pair(true, false);
+    }
 
     // if the object is NOT ambiguous, this module doesn't wait operator approval if RTC is running
     // as AUTO mode.

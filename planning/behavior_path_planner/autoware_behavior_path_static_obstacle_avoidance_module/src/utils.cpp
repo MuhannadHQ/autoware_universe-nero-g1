@@ -22,7 +22,10 @@
 #include "autoware/behavior_path_static_obstacle_avoidance_module/utils.hpp"
 
 #include <Eigen/Dense>
+#include <autoware_lanelet2_extension/regulatory_elements/road_marking.hpp>
 #include <autoware_lanelet2_extension/utility/message_conversion.hpp>
+#include <autoware_lanelet2_extension/utility/query.hpp>
+#include <autoware_lanelet2_extension/utility/utilities.hpp>
 
 #include <boost/geometry/algorithms/buffer.hpp>
 #include <boost/geometry/algorithms/convex_hull.hpp>
@@ -33,6 +36,8 @@
 #include <lanelet2_routing/RoutingGraphContainer.h>
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -160,6 +165,165 @@ void pushUniqueVector(T & base_vector, const T & additional_vector)
 }
 
 }  // namespace
+
+// ---- nero (2026-10-22, overtake job): the car decides the overtake of a stopped car itself (no operator approval,
+// avoidance_for_ambiguous_vehicle.policy "auto"); these switches give it the judgement the operator gave.
+// Every switch is read once from the environment; unset = the module as it ran on 10-21.
+//  NERO_SOA_AMBIGUOUS_IN_LANE=1     a stopped car on ego's lane, on the side of the oncoming lane, is an ambiguous
+//                                   vehicle (stopped-time / moved-distance / wait-and-see conditions) instead of
+//                                   "never avoid" (IS_NOT_PARKING_OBJECT): Al Falah's two-way streets have no
+//                                   shoulder, cars stop anywhere across the lane (capture #8)
+//  NERO_SOA_AMBIGUOUS_STOP_LINE_M=d a stopped car that is not parked, on ego's lane, less than d m before a stop line
+//                                   (stop sign / stop-line marking) or before the next junction lanelet is waiting
+//                                   there: never avoided (the stock ignore_area only knows traffic lights and
+//                                   crosswalks; Al Falah has 880 stop signs and no traffic light)
+//  NERO_SOA_AMBIGUOUS_QUEUE_M=q     ... less than q m behind another vehicle in ego's lane that is stopped or slower
+//                                   than 2 m/s is in a queue: never avoided
+//  NERO_SOA_SIDE_BY_SPACE=1         a stopped vehicle target on ego's lane is passed on the side that has room: when
+//                                   the side away from its centroid has no avoid margin (INSUFFICIENT_DRIVABLE_SPACE),
+//                                   the other side is tried (stock: always the side away from the centroid; a car
+//                                   stopped 0.45 m left of centre could only be passed on the right, into the parked
+//                                   cars - capture #8); also for still UNKNOWN targets (debris, a car's rear fragment)
+//  NERO_SOA_UNKNOWN_STABLE_S=s      an UNKNOWN counts as standing still once UNKNOWN objects have been seen at its
+//                                   place (within 1 m) for s seconds, whatever their track ids (stock: the hard-coded
+//                                   3 s of stop time per track id; the tracker re-created the nose clusters of
+//                                   nose-in parked cars every 0.5-1.5 s, so avoidance never planned around them while
+//                                   obstacle_stop stopped for them - capture #1)
+namespace nero_filter
+{
+struct Env
+{
+  bool ambiguous_in_lane{false};
+  double stop_line_m{-1.0};
+  double queue_m{-1.0};
+  bool side_by_space{false};
+  double unknown_stable_s{-1.0};
+};
+
+const Env & env()
+{
+  static const Env e = [] {
+    Env r;
+    if (const char * v = std::getenv("NERO_SOA_AMBIGUOUS_IN_LANE"); v) r.ambiguous_in_lane = std::atoi(v) > 0;
+    if (const char * v = std::getenv("NERO_SOA_AMBIGUOUS_STOP_LINE_M"); v) r.stop_line_m = std::atof(v);
+    if (const char * v = std::getenv("NERO_SOA_AMBIGUOUS_QUEUE_M"); v) r.queue_m = std::atof(v);
+    if (const char * v = std::getenv("NERO_SOA_SIDE_BY_SPACE"); v) r.side_by_space = std::atoi(v) > 0;
+    if (const char * v = std::getenv("NERO_SOA_UNKNOWN_STABLE_S"); v) r.unknown_stable_s = std::atof(v);
+    std::fprintf(
+      stderr,
+      "[NERO_SOA] ambiguous_in_lane=%d ambiguous_stop_line_m=%.1f ambiguous_queue_m=%.1f side_by_space=%d "
+      "unknown_stable_s=%.1f\n",
+      r.ambiguous_in_lane, r.stop_line_m, r.queue_m, r.side_by_space, r.unknown_stable_s);
+    return r;
+  }();
+  return e;
+}
+
+// UNKNOWN objects seen at (about) the same place: true once that place has been occupied for `stable_s` without a gap
+// longer than 1 s, whatever the track ids
+bool isStableByPosition(const geometry_msgs::msg::Point & p, const double now, const double stable_s)
+{
+  struct Spot
+  {
+    double x, y, first, last;
+  };
+  static std::vector<Spot> spots;
+  spots.erase(
+    std::remove_if(spots.begin(), spots.end(), [&](const Spot & s) { return now - s.last > 5.0; }),
+    spots.end());
+  for (auto & s : spots) {
+    if (std::hypot(s.x - p.x, s.y - p.y) > 1.0) continue;
+    if (now - s.last > 1.0) s.first = now;
+    s.last = now;
+    s.x = 0.8 * s.x + 0.2 * p.x;
+    s.y = 0.8 * s.y + 0.2 * p.y;
+    return now - s.first >= stable_s;
+  }
+  spots.push_back(Spot{p.x, p.y, now, now});
+  return false;
+}
+
+// stop lines (stop signs' ref lines, stop-line markings) of a lanelet
+std::vector<lanelet::ConstLineString3d> stopLines(const lanelet::ConstLanelet & llt)
+{
+  std::vector<lanelet::ConstLineString3d> out;
+  for (const auto & ts : llt.regulatoryElementsAs<lanelet::TrafficSign>()) {
+    for (const auto & l : ts->refLines()) out.push_back(l);
+  }
+  for (const auto & rm : llt.regulatoryElementsAs<lanelet::autoware::RoadMarking>()) {
+    const auto l = rm->roadMarking();
+    if (l.attributeOr(lanelet::AttributeName::Type, "") == std::string("stop_line")) out.push_back(l);
+  }
+  return out;
+}
+
+// arc length from the object along the route lanelets to the next stop line or junction lanelet (inf: none)
+double distanceToStopLineOrJunction(const ObjectData & object, const lanelet::ConstLanelets & lanelets)
+{
+  lanelet::ConstLanelet current;
+  if (!lanelet::utils::query::getClosestLanelet(lanelets, object.getPose(), &current)) {
+    return std::numeric_limits<double>::infinity();
+  }
+  const auto centerline = lanelet::utils::to2D(current.centerline());
+  const auto p = lanelet::utils::to2D(lanelet::utils::conversion::toLaneletPoint(object.getPose().position));
+  const double s_obj = lanelet::geometry::toArcCoordinates(centerline, p.basicPoint()).length;
+  for (const auto & l : stopLines(current)) {
+    const double s_line =
+      lanelet::geometry::toArcCoordinates(centerline, lanelet::utils::to2D(l).front().basicPoint()).length;
+    if (s_line > s_obj) return s_line - s_obj;
+  }
+  double dist = lanelet::utils::getLaneletLength2d(current) - s_obj;
+  bool found = false;
+  for (const auto & llt : lanelets) {
+    if (llt.id() == current.id()) {
+      found = true;
+      continue;
+    }
+    if (!found) continue;
+    if (llt.hasAttribute("turn_direction")) return dist;
+    const auto c = lanelet::utils::to2D(llt.centerline());
+    for (const auto & l : stopLines(llt)) {
+      return dist + lanelet::geometry::toArcCoordinates(c, lanelet::utils::to2D(l).front().basicPoint()).length;
+    }
+    dist += lanelet::utils::getLaneletLength2d(llt);
+  }
+  return std::numeric_limits<double>::infinity();
+}
+
+// another vehicle stands (or creeps) in front of the object, in ego's lane, closer than queue_m
+bool isQueued(
+  const ObjectData & object, const AvoidancePlanningData & data,
+  const std::shared_ptr<const PlannerData> & planner_data, const double queue_m)
+{
+  using autoware_perception_msgs::msg::ObjectClassification;
+  const auto & path = data.reference_path_rough.points;
+  if (path.size() < 2 || !planner_data->dynamic_object) return false;
+  const auto & me = object.getPosition();
+  const double my_len = object.object.shape.dimensions.x;
+  for (const auto & o : planner_data->dynamic_object->objects) {
+    if (o.object_id == object.object.object_id) continue;
+    const auto label = utils::getHighestProbLabel(o.classification);
+    if (
+      label != ObjectClassification::CAR && label != ObjectClassification::TRUCK &&
+      label != ObjectClassification::BUS && label != ObjectClassification::TRAILER &&
+      label != ObjectClassification::MOTORCYCLE) {
+      continue;
+    }
+    if (std::hypot(
+          o.kinematics.initial_twist_with_covariance.twist.linear.x,
+          o.kinematics.initial_twist_with_covariance.twist.linear.y) > 2.0) {
+      continue;
+    }
+    const auto & op = o.kinematics.initial_pose_with_covariance.pose.position;
+    const double ds = autoware::motion_utils::calcSignedArcLength(path, me, op);
+    const double gap = ds - 0.5 * my_len - 0.5 * o.shape.dimensions.x;
+    if (ds <= 0.0 || gap > queue_m) continue;
+    if (std::abs(autoware::motion_utils::calcLateralOffset(path, op)) > 1.5) continue;
+    return true;
+  }
+  return false;
+}
+}  // namespace nero_filter
 
 namespace filtering_utils
 {
@@ -671,7 +835,7 @@ bool isNeverAvoidanceTarget(
 
     const auto right_opposite_lanes =
       planner_data->route_handler->getRightOppositeLanelets(object.overhang_lanelet);
-    if (!right_opposite_lanes.empty() && isOnRight(object)) {
+    if (!right_opposite_lanes.empty() && isOnRight(object) && !nero_filter::env().ambiguous_in_lane) {
       object.info = ObjectInfo::IS_NOT_PARKING_OBJECT;
       RCLCPP_DEBUG(
         rclcpp::get_logger(logger_namespace), "object isn't on the edge lane. never avoid it.");
@@ -703,7 +867,7 @@ bool isNeverAvoidanceTarget(
 
     const auto left_opposite_lanes =
       planner_data->route_handler->getLeftOppositeLanelets(object.overhang_lanelet);
-    if (!left_opposite_lanes.empty() && !isOnRight(object)) {
+    if (!left_opposite_lanes.empty() && !isOnRight(object) && !nero_filter::env().ambiguous_in_lane) {
       object.info = ObjectInfo::IS_NOT_PARKING_OBJECT;
       RCLCPP_DEBUG(
         rclcpp::get_logger(logger_namespace), "object isn't on the edge lane. never avoid it.");
@@ -716,6 +880,26 @@ bool isNeverAvoidanceTarget(
       object.info = ObjectInfo::IS_NOT_PARKING_OBJECT;
       RCLCPP_DEBUG(
         rclcpp::get_logger(logger_namespace), "object is close to stop factor. never avoid it.");
+      return true;
+    }
+  }
+
+  if (object.is_on_ego_lane && !object.is_parked) {
+    const auto & ne = nero_filter::env();
+    if (ne.stop_line_m > 0.0) {
+      const double d = nero_filter::distanceToStopLineOrJunction(object, data.extend_lanelets);
+      object.to_stop_factor_distance = std::min(object.to_stop_factor_distance, d);
+      if (d < ne.stop_line_m) {
+        object.info = ObjectInfo::IS_NOT_PARKING_OBJECT;
+        RCLCPP_DEBUG(
+          rclcpp::get_logger(logger_namespace),
+          "[NERO_SOA] waiting before a stop line / junction (%.1f m). never avoid it.", d);
+        return true;
+      }
+    }
+    if (ne.queue_m > 0.0 && nero_filter::isQueued(object, data, planner_data, ne.queue_m)) {
+      object.info = ObjectInfo::IS_NOT_PARKING_OBJECT;
+      RCLCPP_DEBUG(rclcpp::get_logger(logger_namespace), "[NERO_SOA] queued behind a vehicle. never avoid it.");
       return true;
     }
   }
@@ -1978,12 +2162,28 @@ void filterTargetObjects(
 
       // TODO(Satoshi Ota) parametrize stop time threshold if need.
       constexpr double STOP_TIME_THRESHOLD = 3.0;  // [s]
-      if (o.stop_time < STOP_TIME_THRESHOLD) {
+      const bool stable_by_place =
+        nero_filter::env().unknown_stable_s > 0.0 &&
+        nero_filter::isStableByPosition(o.getPosition(), now.seconds(), nero_filter::env().unknown_stable_s);
+      if (o.stop_time < STOP_TIME_THRESHOLD && !stable_by_place) {
         o.info = ObjectInfo::UNSTABLE_OBJECT;
         data.other_objects.push_back(o);
         continue;
       }
       o.avoid_margin = filtering_utils::getAvoidMargin(o, planner_data, parameters);
+      if (nero_filter::env().side_by_space && !o.avoid_margin.has_value()) {
+        o.is_on_ego_lane = filtering_utils::isOnEgoLane(o, planner_data->route_handler);
+        if (o.is_on_ego_lane) {
+          auto flipped = o;
+          flipped.direction = isOnRight(o) ? Direction::LEFT : Direction::RIGHT;
+          flipped.overhang_points =
+            utils::static_obstacle_avoidance::calcEnvelopeOverhangDistance(flipped, data.reference_path);
+          flipped.to_road_shoulder_distance =
+            filtering_utils::getRoadShoulderDistance(flipped, data, planner_data);
+          flipped.avoid_margin = filtering_utils::getAvoidMargin(flipped, planner_data, parameters);
+          if (flipped.avoid_margin.has_value()) o = flipped;
+        }
+      }
     } else if (filtering_utils::isVehicleTypeObject(o)) {
       // TARGET: CAR, TRUCK, BUS, TRAILER, MOTORCYCLE
 
@@ -2001,6 +2201,24 @@ void filterTargetObjects(
       if (!filtering_utils::isSatisfiedWithVehicleCondition(o, data, planner_data, parameters)) {
         data.other_objects.push_back(o);
         continue;
+      }
+
+      if (nero_filter::env().side_by_space && !o.avoid_margin.has_value() && o.is_on_ego_lane) {
+        auto flipped = o;
+        flipped.direction = isOnRight(o) ? Direction::LEFT : Direction::RIGHT;
+        flipped.overhang_points =
+          utils::static_obstacle_avoidance::calcEnvelopeOverhangDistance(flipped, data.reference_path);
+        flipped.to_road_shoulder_distance =
+          filtering_utils::getRoadShoulderDistance(flipped, data, planner_data);
+        flipped.avoid_margin = filtering_utils::getAvoidMargin(flipped, planner_data, parameters);
+        if (flipped.avoid_margin.has_value()) {
+          static rclcpp::Clock steady_clock(RCL_STEADY_TIME);
+          RCLCPP_INFO_THROTTLE(
+            rclcpp::get_logger(logger_namespace), steady_clock, 3000,
+            "[NERO_SOA] no room on the %s of the stopped vehicle: passing it on the %s",
+            isOnRight(o) ? "left" : "right", isOnRight(o) ? "right" : "left");
+          o = flipped;
+        }
       }
     } else {
       // TARGET: PEDESTRIAN, BICYCLE
