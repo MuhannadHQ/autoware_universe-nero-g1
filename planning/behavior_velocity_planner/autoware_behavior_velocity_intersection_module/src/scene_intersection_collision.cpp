@@ -181,6 +181,174 @@ bool nero_is_creeper(const autoware_perception_msgs::msg::PredictedObject & o, d
   return *acc_out <= p.acc_th;
 }
 
+// NERO_IX_PULLAWAY_ACC=<a> (pull-away job, 2026-10-24): a vehicle in an attention lane that was standing (or crawling)
+// and starts to move is also checked as accelerating at <a> m/s^2 from its current speed along its attention lane (up
+// to 13.9 m/s), for up to 4 s after it started while it keeps speeding up (>= 0.25 m/s per 0.5 s), in addition to its
+// predicted paths. Upstream checks only its predicted paths, which run at its current speed (map_based_prediction even
+// keeps a vehicle below 1.0 m/s where it is), so a car waiting ~12 m before the conflict as if letting ego go stayed
+// "safe" until it had sped up (sim: flagged 0.6-0.9 s after it moved; the field tracker's speed lags another 0.4-0.8 s)
+// and ego then stopped in its path. Started = the reported speed is >= 0.5 m/s and >= 0.4 m/s above its lowest speed in
+// the last 1.5 s, which was <= 0.3 m/s, on a track seen for >= 0.5 s (a track that appears moving is not a start).
+// Vehicles and car-sized UNKNOWNs (footprint >= 3 m^2, >= 1 m tall: not the low ghost blobs of 10-20 #12). It only
+// adds paths to the check: nothing upstream checks is dropped, a car that stays put or keeps crawling is judged exactly
+// as before, and a crawler the car's creep rule treats as yielding stays so until it speeds up. Unset = upstream / the
+// car as before.
+double nero_pullaway_acc()
+{
+  static const double a = [] {
+    const char * v = std::getenv("NERO_IX_PULLAWAY_ACC");
+    return v != nullptr ? std::max(0.0, std::atof(v)) : 0.0;
+  }();
+  return a;
+}
+constexpr double kNeroPullawayVGo = 0.5;       // [m/s] started: at least this fast ...
+constexpr double kNeroPullawayVStill = 0.3;    // [m/s] ... after being at most this fast ...
+constexpr double kNeroPullawayDv = 0.4;        // [m/s] ... and this much faster than then ...
+constexpr double kNeroPullawayWindow = 1.5;    // [s] ... within this window
+constexpr double kNeroPullawayMinSeen = 0.5;   // [s] track age needed to call it a start
+constexpr double kNeroPullawayActive = 4.0;    // [s] the model is checked this long after the start ...
+constexpr double kNeroPullawayGainWindow = 0.5;  // [s] ... while its speed keeps rising by at least
+constexpr double kNeroPullawayMinGain = 0.25;    // [m/s] this much within this window
+constexpr double kNeroPullawayVMax = 13.9;     // [m/s] speed cap of the model
+constexpr double kNeroPullawayDt = 0.25;       // [s] model path time step
+constexpr double kNeroPullawayHorizon = 10.0;  // [s] model path length (the check cuts it further)
+struct NeroPullawayHist
+{
+  std::deque<std::pair<double, double>> s;  // (t, v)
+  double last{0.0};
+  double t_start{-1.0};  // steady time of the start, < 0: not started
+  double t_end{-1.0};    // steady time the last start window ended (a new start needs a new standstill after it)
+  bool logged_unsafe{false};
+};
+std::unordered_map<std::string, NeroPullawayHist> & nero_pullaway_hists()
+{
+  static std::unordered_map<std::string, NeroPullawayHist> h;
+  return h;
+}
+std::string nero_uuid_key(const autoware_perception_msgs::msg::PredictedObject & o)
+{
+  return std::string(reinterpret_cast<const char *>(o.object_id.uuid.data()), o.object_id.uuid.size());
+}
+bool nero_pullaway_target(const autoware_perception_msgs::msg::PredictedObject & o)
+{
+  using autoware_perception_msgs::msg::ObjectClassification;
+  if (o.classification.empty()) return false;
+  const auto label = o.classification.at(0).label;
+  if (
+    label == ObjectClassification::CAR || label == ObjectClassification::TRUCK ||
+    label == ObjectClassification::BUS || label == ObjectClassification::TRAILER ||
+    label == ObjectClassification::MOTORCYCLE) {
+    return true;
+  }
+  return label == ObjectClassification::UNKNOWN &&
+         o.shape.type == autoware_perception_msgs::msg::Shape::BOUNDING_BOX &&
+         o.shape.dimensions.x * o.shape.dimensions.y >= 3.0 && o.shape.dimensions.z >= 1.0;
+}
+// records the object's speed (once per planning cycle, whichever module sees it first); keeps its start state
+void nero_pullaway_update(const autoware_perception_msgs::msg::PredictedObject & o)
+{
+  const double t = nero_steady_now();
+  auto & h = nero_pullaway_hists()[nero_uuid_key(o)];
+  const double v = std::hypot(
+    o.kinematics.initial_twist_with_covariance.twist.linear.x,
+    o.kinematics.initial_twist_with_covariance.twist.linear.y);
+  if (!h.s.empty() && t - h.s.back().first <= 0.02) return;  // already recorded this cycle
+  h.s.emplace_back(t, v);
+  h.last = t;
+  while (!h.s.empty() && t - h.s.front().first > 3.0) h.s.pop_front();
+  static double last_prune = 0.0;
+  if (t - last_prune > 5.0) {
+    last_prune = t;
+    for (auto it = nero_pullaway_hists().begin(); it != nero_pullaway_hists().end();) {
+      if (t - it->second.last > 10.0) it = nero_pullaway_hists().erase(it); else ++it;
+    }
+  }
+  if (h.t_start >= 0.0) {
+    // still speeding up? (a car that starts to creep and then keeps its crawl is judged as before again)
+    bool speeding_up = true;
+    if (t - h.t_start >= kNeroPullawayGainWindow) {
+      double v_then = v;
+      for (const auto & [ti, vi] : h.s) {
+        if (t - ti >= kNeroPullawayGainWindow) v_then = vi;
+      }
+      speeding_up = v - v_then >= kNeroPullawayMinGain;
+    }
+    if (t - h.t_start <= kNeroPullawayActive && v >= kNeroPullawayVStill && speeding_up) return;
+    h.t_start = -1.0;  // the window is over, it stopped again, or it no longer speeds up
+    h.t_end = t;
+    h.logged_unsafe = false;
+  }
+  if (v < kNeroPullawayVGo || h.s.size() < 3 || t - h.s.front().first < kNeroPullawayMinSeen) return;
+  double v_min = v;
+  for (const auto & [ti, vi] : h.s) {
+    if (t - ti <= kNeroPullawayWindow && ti > h.t_end) v_min = std::min(v_min, vi);
+  }
+  if (v_min <= kNeroPullawayVStill && v - v_min >= kNeroPullawayDv) h.t_start = t;
+}
+// seconds since the object started from standstill, < 0 if it has not (or the model window is over)
+double nero_pullaway_since(const autoware_perception_msgs::msg::PredictedObject & o)
+{
+  const auto it = nero_pullaway_hists().find(nero_uuid_key(o));
+  if (it == nero_pullaway_hists().end() || it->second.t_start < 0.0) return -1.0;
+  const double since = nero_steady_now() - it->second.t_start;
+  return since <= kNeroPullawayActive ? since : -1.0;
+}
+// distance / speed of the model after t seconds from v0
+double nero_pullaway_dist(const double v0, const double a, const double t)
+{
+  const double t1 = std::max(0.0, (kNeroPullawayVMax - v0) / a);
+  if (t <= t1) return v0 * t + 0.5 * a * t * t;
+  return v0 * t1 + 0.5 * a * t1 * t1 + std::max(v0, kNeroPullawayVMax) * (t - t1);
+}
+double nero_pullaway_speed(const double v0, const double a, const double t)
+{
+  return std::max(v0, std::min(kNeroPullawayVMax, v0 + a * t));
+}
+// the model's paths: along the centre line of every attention lane the object is in and heads along (its direction
+// of motion within the lane-angle threshold), from where it is to the lane's end (the attention lanes end with the
+// conflicting lanelet), timed from its current speed at <a>
+std::vector<autoware_perception_msgs::msg::PredictedPath> nero_pullaway_paths(
+  const autoware_perception_msgs::msg::PredictedObject & o, const lanelet::ConstLanelets & attention_lanelets,
+  const double margin, const double angle_thr)
+{
+  std::vector<autoware_perception_msgs::msg::PredictedPath> out;
+  const auto pose = autoware::behavior_velocity_planner::util::getObjectPoseWithVelocityDirection(o.kinematics);
+  const double pose_yaw = tf2::getYaw(pose.orientation);
+  const double v0 = std::hypot(
+    o.kinematics.initial_twist_with_covariance.twist.linear.x,
+    o.kinematics.initial_twist_with_covariance.twist.linear.y);
+  const double a = nero_pullaway_acc();
+  for (const auto & ll : attention_lanelets) {
+    if (!lanelet::utils::isInLanelet(pose, ll, margin)) continue;
+    const double ll_yaw = lanelet::utils::getLaneletAngle(ll, pose.position);
+    if (std::fabs(autoware_utils::normalize_radian(ll_yaw - pose_yaw)) > angle_thr) continue;
+    const auto centerline = ll.centerline2d();
+    const double length = lanelet::geometry::length(centerline);
+    const double s0 =
+      lanelet::geometry::toArcCoordinates(centerline, lanelet::BasicPoint2d(pose.position.x, pose.position.y))
+        .length;
+    autoware_perception_msgs::msg::PredictedPath path;
+    path.confidence = 1.0;
+    path.time_step = rclcpp::Duration::from_seconds(kNeroPullawayDt);
+    for (double t = 0.0; t <= kNeroPullawayHorizon + 1e-6; t += kNeroPullawayDt) {
+      const double s = s0 + nero_pullaway_dist(v0, a, t);
+      if (s > length) break;
+      const auto p = lanelet::geometry::interpolatedPointAtDistance(centerline, s);
+      const auto p_ahead = lanelet::geometry::interpolatedPointAtDistance(centerline, std::min(length, s + 0.5));
+      const auto p_back = lanelet::geometry::interpolatedPointAtDistance(centerline, std::max(0.0, s - 0.5));
+      geometry_msgs::msg::Pose q;
+      q.position.x = p.x();
+      q.position.y = p.y();
+      q.position.z = pose.position.z;
+      q.orientation = autoware_utils::create_quaternion_from_yaw(
+        std::atan2(p_ahead.y() - p_back.y(), p_ahead.x() - p_back.x()));
+      path.path.push_back(q);
+    }
+    if (path.path.size() >= 2) out.push_back(path);
+  }
+  return out;
+}
+
 }  // namespace
 namespace autoware::behavior_velocity_planner
 {
@@ -415,6 +583,10 @@ void IntersectionModule::updateObjectInfoManagerArea()
     if (!isTargetCollisionVehicleType(predicted_object)) {
       continue;
     }
+    // NERO_IX_PULLAWAY_ACC: every candidate's speed history (also while the creep rule leaves it out)
+    if (nero_pullaway_acc() > 0.0 && nero_pullaway_target(predicted_object)) {
+      nero_pullaway_update(predicted_object);
+    }
 
     // ==========================================================================================
     // NOTE: is_parked_vehicle is used because sometimes slow vehicle direction is
@@ -644,6 +816,25 @@ void IntersectionModule::updateObjectInfoManagerCollision(
     }
     sorted_predicted_paths.sort(
       [](const auto path1, const auto path2) { return path1->confidence > path2->confidence; });
+    // NERO_IX_PULLAWAY_ACC: a vehicle that has just started from standstill is also checked as accelerating along
+    // its attention lane (after its own predicted paths, which are all still checked)
+    std::vector<autoware_perception_msgs::msg::PredictedPath> nero_pullaway;
+    const double nero_pullaway_t =
+      (nero_pullaway_acc() > 0.0 && !is_wrong_way_on_ego_lane && nero_pullaway_target(predicted_object))
+        ? nero_pullaway_since(predicted_object)
+        : -1.0;
+    if (nero_pullaway_t >= 0.0) {
+      nero_pullaway = nero_pullaway_paths(
+        predicted_object, intersection_lanelets.attention(), planner_param_.common.attention_area_margin,
+        planner_param_.common.attention_area_angle_threshold);
+      for (const auto & p : nero_pullaway) {
+        sorted_predicted_paths.push_back(&p);
+      }
+    }
+    const auto nero_is_pullaway_path = [&](const autoware_perception_msgs::msg::PredictedPath * p) {
+      return !nero_pullaway.empty() && p >= nero_pullaway.data() && p < nero_pullaway.data() + nero_pullaway.size();
+    };
+    bool nero_pullaway_unsafe = false;
 
     // ==========================================================================================
     // if all of the predicted path is lower confidence/geometrically does not intersect with ego
@@ -720,8 +911,15 @@ void IntersectionModule::updateObjectInfoManagerCollision(
         if (!has_ego_exit_yaw || std::fabs(dyaw) > M_PI / 4.0) {
           continue;  // crosses where ego has already been: no conflict (as upstream)
         }
-        const double v_obj = std::max(
-          0.0, predicted_object.kinematics.initial_twist_with_covariance.twist.linear.x);
+        // NERO_IX_PULLAWAY_ACC: a model path arrives at the model's speed, not the reported one
+        const double v_obj =
+          nero_is_pullaway_path(predicted_path_ptr)
+            ? nero_pullaway_speed(
+                std::hypot(
+                  predicted_object.kinematics.initial_twist_with_covariance.twist.linear.x,
+                  predicted_object.kinematics.initial_twist_with_covariance.twist.linear.y),
+                nero_pullaway_acc(), object_enter_time)
+            : std::max(0.0, predicted_object.kinematics.initial_twist_with_covariance.twist.linear.x);
         const double headway = std::min(
           nero_merge.max,
           nero_merge.react + std::max(0.0, v_obj - nero_merge.v_ref) / (2.0 * nero_merge.decel));
@@ -815,6 +1013,7 @@ void IntersectionModule::updateObjectInfoManagerCollision(
         safe_interval = std::nullopt;
         unsafe_interval = object_passage_interval;
         object_debug_info = get_object_info();
+        nero_pullaway_unsafe = nero_is_pullaway_path(predicted_path_ptr);
         break;
       }
       if (!safe_interval) {
@@ -827,6 +1026,32 @@ void IntersectionModule::updateObjectInfoManagerCollision(
       }
     }
     object_info->update_safety(unsafe_interval, safe_interval, safe_under_traffic_control);
+    if (nero_pullaway_t >= 0.0) {
+      auto & h = nero_pullaway_hists()[nero_uuid_key(predicted_object)];
+      const auto & pos = predicted_object.kinematics.initial_pose_with_covariance.pose.position;
+      const double v = std::hypot(
+        predicted_object.kinematics.initial_twist_with_covariance.twist.linear.x,
+        predicted_object.kinematics.initial_twist_with_covariance.twist.linear.y);
+      if (nero_pullaway_unsafe && !h.logged_unsafe) {
+        h.logged_unsafe = true;
+        RCLCPP_INFO(
+          logger_,
+          "[NERO_IX] pullaway: lane %ld, object at (%.1f, %.1f) v %.2f started %.2f s ago: collision as it "
+          "accelerates at %.1f m/s2 (enters ego's lane in %.1f s)%s",
+          lane_id_, pos.x, pos.y, v, nero_pullaway_t, nero_pullaway_acc(),
+          unsafe_interval->interval_time.first, safe_under_traffic_control ? ", but it yields (traffic control)" : "");
+      } else {
+        static double last_log = 0.0;
+        const double now = nero_steady_now();
+        if (now - last_log > 1.0) {
+          last_log = now;
+          RCLCPP_INFO(
+            logger_, "[NERO_IX] pullaway: lane %ld, object at (%.1f, %.1f) v %.2f started %.2f s ago: %zu lane path(s), %s",
+            lane_id_, pos.x, pos.y, v, nero_pullaway_t, nero_pullaway.size(),
+            unsafe_interval ? (nero_pullaway_unsafe ? "unsafe (model)" : "unsafe (its own prediction)") : "safe");
+        }
+      }
+    }
     if (passed_1st_judge_line_first_time) {
       object_info->setDecisionAt1stPassJudgeLinePassage(CollisionKnowledge{
         clock_->now(),  // stamp
