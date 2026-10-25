@@ -509,7 +509,127 @@ bool NormalLaneChange::isLaneChangeRequired()
     return false;
   }
 
+  if (nero_keep_right_gate_blocks()) {
+    return false;
+  }
+
   return true;
+}
+
+namespace
+{
+struct NeroKeepRightGate
+{
+  double min_end{-1.0};  // <= 0: off
+  double lead_dv{1.0};
+  double lead_m{50.0};
+  double lead_t{30.0};
+};
+
+const NeroKeepRightGate & nero_keep_right_gate()
+{
+  static const NeroKeepRightGate g = [] {
+    NeroKeepRightGate r;
+    if (const char * e = std::getenv("NERO_LC_KEEP_RIGHT_GATE")) {
+      std::sscanf(e, "%lf,%lf,%lf,%lf", &r.min_end, &r.lead_dv, &r.lead_m, &r.lead_t);
+    }
+    return r;
+  }();
+  return g;
+}
+
+// UN R79 5.6.4.7: the gap a rear vehicle needs to brake at 3 m/s^2 after 0.4 s and keep a 1 s gap
+double nero_scrit(const double v_e, const double v_r)
+{
+  const double dv = std::max(v_r - v_e, 0.0);
+  return dv * 0.4 + dv * dv / 6.0 + v_e * 1.0;
+}
+
+bool nero_kr_log_tick()
+{
+  static double last = 0.0;
+  const double now =
+    std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+  if (now - last < 1.0) return false;
+  last = now;
+  return true;
+}
+}  // namespace
+
+bool NormalLaneChange::nero_keep_right_discretionary() const
+{
+  const auto & g = nero_keep_right_gate();
+  if (
+    g.min_end <= 0.0 || type_ != LaneChangeModuleType::NORMAL || direction_ != Direction::RIGHT || !common_data_ptr_ ||
+    !common_data_ptr_->is_data_available() || !common_data_ptr_->is_lanes_available()) {
+    return false;
+  }
+  return common_data_ptr_->transient_data.dist_to_terminal_end > g.min_end;
+}
+
+bool NormalLaneChange::nero_keep_right_gate_blocks() const
+{
+  if (!nero_keep_right_discretionary()) {
+    return false;
+  }
+  const auto & g = nero_keep_right_gate();
+  const double v_e = std::max(0.0, getEgoVelocity());
+  // the speed ego drives at: the planner's max_vel, or the external limit when lower (the car's 20 km/h cap)
+  double v_max = common_data_ptr_->bpp_param_ptr->max_vel;
+  if (planner_data_ && planner_data_->external_limit_max_velocity) {
+    v_max = std::min(v_max, static_cast<double>(planner_data_->external_limit_max_velocity->max_velocity));
+  }
+  const auto speed = [](const auto & o) { return std::hypot(o.initial_twist.linear.x, o.initial_twist.linear.y); };
+  const auto block = [&](const char * why, const double a, const double b) {
+    if (nero_kr_log_tick()) {
+      RCLCPP_INFO(
+        logger_, "[NERO_LC_KEEP_RIGHT_GATE] keep-right change held (%s %.1f / %.1f), v_e %.1f (max %.1f), end in %.0f m",
+        why, a, b, v_e, v_max, common_data_ptr_->transient_data.dist_to_terminal_end);
+    }
+    return true;
+  };
+  // (a) a slower or standing car ahead in the target lane: stay left and pass it first (a standing one within lead_m, a
+  // moving one also when ego at its maximum would reach it within lead_t: merging behind it means following it)
+  const auto & lead = filtered_objects_.target_lane_leading;
+  for (const auto * set : {&lead.moving, &lead.stopped, &lead.stopped_at_bound}) {
+    for (const auto & o : *set) {
+      const double v = speed(o);
+      if (v >= v_max - g.lead_dv) {
+        continue;
+      }
+      const bool reach = v >= 0.5 && o.dist_from_ego / std::max(v_max - v, 0.1) < g.lead_t;
+      if (o.dist_from_ego < g.lead_m || reach) {
+        return block("slower car ahead in the target lane: m / m/s", o.dist_from_ego, v);
+      }
+    }
+  }
+  // (b) never merge blind: the rear view of the target lane must cover S_crit for an unseen car at the limit + 30 km/h
+  // the rear view of the target lane: 40 m (the 10-19/20 rule). A car following ego does not shorten it: the robot's left /
+  // right / top / front lidars see the next lane past it (Ahmed 10-24; the 10-19 rule's 31.5 m assumed the low rear lidar)
+  const double view = 40.0;
+  // the unseen car comes along the target lane BEHIND ego: the highest speed limit of the target lanelet beside ego and
+  // the preceding target lanelets (a junction piece's own turn limit, e.g. 10 km/h, is not the limit of the road behind
+  // it; run 1024-220631); a lanelet without a tag counts as 50 km/h
+  const auto & target = common_data_ptr_->lanes_ptr->target;
+  double limit_kmh = target.empty() ? 50.0 : target.front().attributeOr("speed_limit", 50.0);
+  for (const auto & seq : common_data_ptr_->lanes_ptr->preceding_target) {
+    for (const auto & ll : seq) {
+      limit_kmh = std::max(limit_kmh, ll.attributeOr("speed_limit", 50.0));
+    }
+  }
+  const double v_phantom = (limit_kmh + 30.0) / 3.6;
+  if (view < nero_scrit(v_e, v_phantom)) {
+    return block("rear view m < S_crit m for an unseen car", view, nero_scrit(v_e, v_phantom));
+  }
+  // every seen car behind in the target lane needs S_crit
+  const double rear = common_data_ptr_->bpp_param_ptr->vehicle_info.rear_overhang_m;
+  for (const auto & o : filtered_objects_.target_lane_trailing) {
+    const double gap = -o.dist_from_ego - rear - 0.5 * o.shape.dimensions.x;
+    if (gap < nero_scrit(v_e, speed(o))) {
+      return block("car behind in the target lane: gap m < S_crit m", gap, nero_scrit(v_e, speed(o)));
+    }
+  }
+  return false;
 }
 
 bool NormalLaneChange::is_near_regulatory_element() const
@@ -1801,6 +1921,7 @@ double NormalLaneChange::nero_yield_cap() const
   const int dir = static_cast<int>(p[2]);
   if (dv <= 0.0 || direction_ == Direction::NONE) return -1.0;
   if ((dir == 1 && direction_ != Direction::LEFT) || (dir == 2 && direction_ != Direction::RIGHT)) return -1.0;
+  if (nero_keep_right_discretionary()) return -1.0;  // NERO_LC_KEEP_RIGHT_GATE: a keep-right change never eases off
   if (status_.is_safe && status_.is_valid_path) return -1.0;  // a gap is there: no easing
   const double ego_v = getEgoVelocity();
   double cap = std::numeric_limits<double>::max();

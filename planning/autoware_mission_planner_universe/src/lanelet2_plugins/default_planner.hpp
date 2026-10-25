@@ -81,6 +81,11 @@ protected:
   lanelet::ConstLanelets nero_early_right_changes(
     const lanelet::ConstLanelets & path,
     std::vector<std::pair<lanelet::Id, lanelet::Id>> * fallback) const;
+  // NERO_KEEP_RIGHT_LANES=<D0>,<D1>: every route section prefers its rightmost lane that continues the route; only within
+  // D0 + D1 x (lane changes) metres before a place that needs an inner lane (a left turn / fork / the goal lane) the
+  // route's own lane stays preferred. At a junction the right lane's parallel piece (same turn) is added to the route
+  // and preferred; the route's own piece stays in the route (non-preferred), so ego that cannot get right keeps going
+  void nero_keep_right_lanes(RouteSections & sections, double d0, double d1) const;
   void map_callback(const LaneletMapBin::ConstSharedPtr msg);
 
   /**

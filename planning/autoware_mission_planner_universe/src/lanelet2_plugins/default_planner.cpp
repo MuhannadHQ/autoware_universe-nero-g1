@@ -42,8 +42,11 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <optional>
+#include <sstream>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -120,6 +123,29 @@ bool nero_parallel(const lanelet::ConstLanelet & a, const lanelet::ConstLanelet 
   const lanelet::BasicPoint2d ma = (ca.front().basicPoint() + ca.back().basicPoint()) / 2.0;
   return lanelet::geometry::distance2d(lanelet::utils::to2D(b.polygon2d()).basicPolygon(), ma) < 4.5;
 }
+
+// NERO_KEEP_RIGHT_LANES=<D0>,<D1> (nero, trips job 2026-10-24, Ahmed: "it should keep right when it can"): the commit
+// zone before a place that needs an inner lane is D0 + D1 x (lane changes) metres. Unset / "0" = upstream behaviour.
+std::optional<std::pair<double, double>> nero_keep_right_lanes_param()
+{
+  const char * v = std::getenv("NERO_KEEP_RIGHT_LANES");
+  if (!v || std::atof(v) <= 0.0) {
+    return std::nullopt;
+  }
+  double d0 = std::atof(v);
+  double d1 = 40.0;
+  if (const char * c = std::strchr(v, ',')) {
+    d1 = std::atof(c + 1);
+  }
+  return std::make_pair(d0, std::max(d1, 0.0));
+}
+
+// untagged lanelets go straight
+std::string nero_turn(const lanelet::ConstLanelet & ll)
+{
+  const std::string t = ll.attributeOr("turn_direction", "straight");
+  return t.empty() ? std::string("straight") : t;
+}
 }  // namespace
 
 lanelet::ConstLanelets DefaultPlanner::nero_early_right_changes(
@@ -174,6 +200,193 @@ lanelet::ConstLanelets DefaultPlanner::nero_early_right_changes(
     out = moved;
   }
   return out;
+}
+
+void DefaultPlanner::nero_keep_right_lanes(RouteSections & sections, double d0, double d1) const
+{
+  const auto rg = route_handler_.getRoutingGraphPtr();
+  const auto tr = route_handler_.getTrafficRulesPtr();
+  const auto n = sections.size();
+  if (n < 2) {
+    return;
+  }
+  const auto get = [&](const lanelet::Id id) { return route_handler_.getLaneletsFromId(id); };
+  const auto has = [](const std::vector<lanelet::Id> & v, const lanelet::Id id) {
+    return std::find(v.begin(), v.end(), id) != v.end();
+  };
+  const auto following_ids = [&](const lanelet::Id id) {
+    std::vector<lanelet::Id> out;
+    for (const auto & f : rg->following(get(id))) {
+      out.push_back(f.id());
+    }
+    return out;
+  };
+  const auto right_id = [&](const lanelet::Id id) -> std::optional<lanelet::Id> {
+    const auto r = rg->right(get(id));
+    return r ? std::optional<lanelet::Id>(r->id()) : std::nullopt;
+  };
+  const auto left_id = [&](const lanelet::Id id) -> std::optional<lanelet::Id> {
+    const auto l = rg->left(get(id));
+    return l ? std::optional<lanelet::Id>(l->id()) : std::nullopt;
+  };
+  std::vector<std::vector<lanelet::Id>> prims(n);
+  std::vector<lanelet::Id> in_route;
+  for (size_t i = 0; i < n; ++i) {
+    for (const auto & p : sections.at(i).primitives) {
+      prims.at(i).push_back(p.id);
+      in_route.push_back(p.id);
+    }
+  }
+  const auto feeds = [&](const lanelet::Id id, const size_t next) {
+    for (const auto f : following_ids(id)) {
+      if (has(prims.at(next), f)) {
+        return true;
+      }
+    }
+    return false;
+  };
+
+  // A. a junction piece (or single lane) of the route: add the parallel pieces that leave the previous section's lanes
+  // with the same turn and lead into the next section (the right lane's straight piece beside the left lane's one)
+  std::vector<std::pair<lanelet::Id, lanelet::Id>> added;
+  for (size_t j = 1; j + 1 < n; ++j) {
+    const auto piece = sections.at(j).preferred_primitive.id;
+    if (prims.at(j).size() != 1 || right_id(piece) || left_id(piece)) {
+      continue;
+    }
+    for (const auto q : std::vector<lanelet::Id>(prims.at(j - 1))) {
+      for (const auto c : following_ids(q)) {
+        if (
+          c == piece || has(in_route, c) || nero_turn(get(c)) != nero_turn(get(piece)) ||
+          !tr->canPass(get(c)) || !feeds(c, j + 1)) {
+          continue;
+        }
+        autoware_planning_msgs::msg::LaneletPrimitive p;
+        p.id = c;
+        p.primitive_type = "lane";
+        sections.at(j).primitives.push_back(p);
+        prims.at(j).push_back(c);
+        in_route.push_back(c);
+        added.emplace_back(piece, c);
+      }
+    }
+  }
+
+  // lanes of each section right -> left: the lane-change chain; parallel pieces in the order of the lanes they leave
+  std::vector<std::vector<lanelet::Id>> order(n);
+  for (size_t i = 0; i < n; ++i) {
+    std::vector<lanelet::Id> best;
+    for (const auto p : prims.at(i)) {
+      const auto r = right_id(p);
+      if (r && has(prims.at(i), *r)) {
+        continue;  // not the rightmost of its chain
+      }
+      std::vector<lanelet::Id> chain{p};
+      for (auto l = left_id(p); l && has(prims.at(i), *l) && !has(chain, *l); l = left_id(*l)) {
+        chain.push_back(*l);
+      }
+      if (chain.size() > best.size()) {
+        best = chain;
+      }
+    }
+    if (best.size() == prims.at(i).size() || i == 0) {
+      order.at(i) = best.size() == prims.at(i).size() ? best : prims.at(i);
+      continue;
+    }
+    auto rank = [&](const lanelet::Id p) {
+      for (size_t k = 0; k < order.at(i - 1).size(); ++k) {
+        if (has(following_ids(order.at(i - 1).at(k)), p)) {
+          return k;
+        }
+      }
+      return order.at(i - 1).size();
+    };
+    order.at(i) = prims.at(i);
+    std::stable_sort(order.at(i).begin(), order.at(i).end(), [&](const auto a, const auto b) {
+      return rank(a) < rank(b);
+    });
+  }
+
+  // B. the rightmost lane of each section that continues the route; C. anchors = sections whose rightmost lane cannot
+  std::vector<lanelet::Id> pref(n);
+  std::vector<lanelet::Id> orig(n);
+  std::vector<std::pair<size_t, std::pair<lanelet::Id, size_t>>> anchors;  // section, (required lane, lanes from right)
+  for (size_t i = 0; i < n; ++i) {
+    orig.at(i) = sections.at(i).preferred_primitive.id;
+    pref.at(i) = orig.at(i);
+    if (i + 1 == n) {
+      const auto it = std::find(order.at(i).begin(), order.at(i).end(), orig.at(i));
+      if (it != order.at(i).begin() && it != order.at(i).end()) {
+        anchors.push_back({i, {orig.at(i), static_cast<size_t>(it - order.at(i).begin())}});
+      }
+      continue;
+    }
+    std::vector<lanelet::Id> cont;
+    for (const auto p : order.at(i)) {
+      if (feeds(p, i + 1)) {
+        cont.push_back(p);
+      }
+    }
+    if (cont.empty()) {
+      continue;
+    }
+    pref.at(i) = cont.front();
+    if (cont.front() != order.at(i).front()) {
+      const auto k = std::find(order.at(i).begin(), order.at(i).end(), cont.front()) - order.at(i).begin();
+      anchors.push_back({i, {cont.front(), static_cast<size_t>(k)}});
+    }
+  }
+  // commit zones: the required lane stays preferred back along its own lane for D0 + D1 x lane changes
+  for (const auto & [a, req] : anchors) {
+    const double zone = d0 + d1 * static_cast<double>(std::max<size_t>(req.second, 1));
+    double dist = 0.0;
+    std::optional<lanelet::Id> cur = req.first;
+    for (size_t k = a + 1; k-- > 0 && cur;) {
+      pref.at(k) = *cur;
+      dist += lanelet::geometry::length2d(get(*cur));
+      if (dist >= zone || k == 0) {
+        break;
+      }
+      std::optional<lanelet::Id> prev;
+      for (const auto p : prims.at(k - 1)) {
+        if (has(following_ids(p), *cur)) {
+          prev = p;
+          break;
+        }
+      }
+      cur = prev;
+    }
+  }
+  pref.back() = orig.back();  // the goal lane (NERO_KEEP_RIGHT already moved the goal right)
+
+  double before = 0.0;
+  double after = 0.0;
+  size_t changed = 0;
+  for (size_t i = 0; i < n; ++i) {
+    if (i + 1 < n && orig.at(i) != order.at(i).front()) {
+      before += lanelet::geometry::length2d(get(orig.at(i)));
+    }
+    if (i + 1 < n && pref.at(i) != order.at(i).front()) {
+      after += lanelet::geometry::length2d(get(pref.at(i)));
+    }
+    if (pref.at(i) != orig.at(i)) {
+      sections.at(i).preferred_primitive.id = pref.at(i);
+      ++changed;
+    }
+  }
+  std::stringstream ss;
+  for (const auto & [piece, par] : added) {
+    ss << " " << piece << "+" << par;
+  }
+  std::stringstream sa;
+  for (const auto & [a, req] : anchors) {
+    sa << " " << req.first << "(" << req.second << ")";
+  }
+  RCLCPP_INFO(
+    node_->get_logger(),
+    "[NERO_KEEP_RIGHT_LANES] %zu sections, %zu preferred lanes moved right, parallel pieces added:%s, kept for a turn / "
+    "fork / goal (lanes from the right):%s; preferred off the right lane %.0f m -> %.0f m (zone %.0f + %.0f m/lane)",
+    n, changed, ss.str().c_str(), sa.str().c_str(), before, after, d0, d1);
 }
 
 std::optional<geometry_msgs::msg::Pose> DefaultPlanner::nero_keep_right_goal(
@@ -548,6 +761,9 @@ PlannerPlugin::LaneletRoute DefaultPlanner::plan(const RoutePoints & points)
         }
       }
     }
+  }
+  if (const auto kr = nero_keep_right_lanes_param()) {
+    nero_keep_right_lanes(route_sections, kr->first, kr->second);
   }
 
   auto goal_pose = checkpoints.back();

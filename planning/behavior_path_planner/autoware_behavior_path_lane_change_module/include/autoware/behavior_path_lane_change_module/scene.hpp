@@ -95,6 +95,15 @@ public:
   // NERO_LC_YIELD_FRONT (session 4): the speed cap while waiting (< 0: none). Non-virtual: no layout change.
   double nero_yield_cap() const;
 
+  // NERO_LC_KEEP_RIGHT_GATE="<min_end_m>,<lead_dv>,<lead_m>,<lead_t>" (trips job 2026-10-24): a change to the RIGHT that
+  // the route does not need soon (ego's current lanes go on > min_end_m: a keep-right change of NERO_KEEP_RIGHT_LANES) is
+  // not requested while (a) a car ahead in the target lane slower than ego's maximum by > lead_dv is within lead_m, or
+  // (moving) would be reached within lead_t s (stay left and pass it), or (b) UN R79 5.6.4.7 / R157 5.2.6.7.2.2 do not hold: a car at the speed limit + 30 km/h at
+  // the edge of the rear view (40 m; a car behind ego does not shorten it: side / top lidars) or any seen car behind in the target
+  // lane closer than S_crit = dv 0.4 + dv^2 / 6 + v_e 1.0. Only blocks; unset = upstream. Non-virtual: no layout change.
+  bool nero_keep_right_discretionary() const;
+  bool nero_keep_right_gate_blocks() const;
+
   PathSafetyStatus evaluateApprovedPathWithUnsafeHysteresis(
     PathSafetyStatus approved_path_safety_status) override;
 
