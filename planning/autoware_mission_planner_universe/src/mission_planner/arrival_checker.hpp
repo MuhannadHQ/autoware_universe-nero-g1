@@ -18,9 +18,13 @@
 #include <autoware/motion_utils/vehicle/vehicle_state_checker.hpp>
 #include <rclcpp/rclcpp.hpp>
 
+#include <autoware_internal_planning_msgs/msg/scenario.hpp>
 #include <autoware_planning_msgs/msg/pose_with_uuid_stamped.hpp>
 #include <geometry_msgs/msg/pose.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>
+#include <std_msgs/msg/bool.hpp>
+
+#include <string>
 
 namespace autoware::mission_planner_universe
 {
@@ -42,6 +46,13 @@ private:
   std::optional<PoseWithUuidStamped> goal_with_uuid_;
   rclcpp::Subscription<PoseWithUuidStamped>::SharedPtr sub_goal_;
   autoware::motion_utils::VehicleStopChecker vehicle_stop_checker_;
+
+  // NERO_MISSION_ARRIVAL_WAIT_PARKING (nero, 2026-10-24; upstream autoware_universe #11170):
+  // created only with the switch set
+  rclcpp::Subscription<autoware_internal_planning_msgs::msg::Scenario>::SharedPtr nero_sub_scenario_;
+  rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr nero_sub_parking_state_;
+  std::string nero_scenario_;
+  bool nero_parking_completed_ = false;
 };
 
 }  // namespace autoware::mission_planner_universe

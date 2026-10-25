@@ -20,6 +20,8 @@
 
 #include <tf2/utils.h>
 
+#include <cstdlib>
+
 namespace autoware::mission_planner_universe
 {
 
@@ -29,6 +31,27 @@ ArrivalChecker::ArrivalChecker(rclcpp::Node * node) : vehicle_stop_checker_(node
   angle_ = autoware_utils::deg2rad(angle_deg);
   distance_ = node->declare_parameter<double>("arrival_check_distance");
   duration_ = node->declare_parameter<double>("arrival_check_duration");
+
+  // NERO_MISSION_ARRIVAL_WAIT_PARKING=1 (nero, 2026-10-24; the arrival part of upstream
+  // autoware_universe #11170): in the Parking scenario the route is ARRIVED only once the
+  // freespace planner reports parking completed. Without it ARRIVED came while the vehicle stood
+  // between two parking segments within 1 m / 45 deg of the goal (a re-park was cut off; parking
+  // sims 2026-10-24). Unset = upstream (no subscriptions).
+  const char * v = std::getenv("NERO_MISSION_ARRIVAL_WAIT_PARKING");
+  if (v && std::atoi(v) == 1) {
+    nero_sub_scenario_ = node->create_subscription<autoware_internal_planning_msgs::msg::Scenario>(
+      "/planning/scenario_planning/scenario", rclcpp::QoS{1},
+      [this](const autoware_internal_planning_msgs::msg::Scenario::ConstSharedPtr msg) {
+        nero_scenario_ = msg->current_scenario;
+      });
+    nero_sub_parking_state_ = node->create_subscription<std_msgs::msg::Bool>(
+      "/planning/scenario_planning/parking/is_completed", rclcpp::QoS{1},
+      [this](const std_msgs::msg::Bool::ConstSharedPtr msg) {
+        nero_parking_completed_ = msg->data;
+      });
+    RCLCPP_INFO(
+      node->get_logger(), "[NERO_MISSION_ARRIVAL_WAIT_PARKING] arrival waits for parking completed");
+  }
 }
 
 void ArrivalChecker::set_goal()
@@ -65,6 +88,13 @@ bool ArrivalChecker::is_arrived(const PoseStamped & pose) const
   const double yaw_goal = tf2::getYaw(goal.pose.orientation);
   const double yaw_diff = autoware_utils::normalize_radian(yaw_pose - yaw_goal);
   if (angle_ < std::fabs(yaw_diff)) {
+    return false;
+  }
+
+  if (
+    nero_sub_parking_state_ &&
+    nero_scenario_ == autoware_internal_planning_msgs::msg::Scenario::PARKING &&
+    !nero_parking_completed_) {
     return false;
   }
 

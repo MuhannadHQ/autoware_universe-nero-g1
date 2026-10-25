@@ -44,11 +44,30 @@
 
 #include "autoware/costmap_generator/utils/points_to_costmap.hpp"
 
+#include <cmath>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
 namespace autoware::costmap_generator
 {
+namespace
+{
+// NERO_COSTMAP_POINTS_FLOOR=1 (nero, 2026-10-24): put each point in the cell it lies in. In
+// grid_map's index order (index 0 = the cell at the largest x / y) cell i spans
+// (L/2 + p - (i + 1) r, L/2 + p - i r], so the index is floor((L/2 + p - x) / r); ceil() puts
+// every point one cell (0.3 m) towards -x and -y. Seen in the parking sims at the real place:
+// every cell holding a lidar point was occupied only after that one-cell shift, and the freespace
+// planner accepted a goal whose rear touched a bin. Unset = upstream.
+bool nero_points_floor()
+{
+  static const bool on = [] {
+    const char * v = std::getenv("NERO_COSTMAP_POINTS_FLOOR");
+    return v && std::atoi(v) == 1;
+  }();
+  return on;
+}
+}  // namespace
 
 void PointsToCostmap::initGridmapParam(const grid_map::GridMap & gridmap)
 {
@@ -82,8 +101,8 @@ grid_map::Index PointsToCostmap::fetchGridIndexFromPoint(const pcl::PointXYZ & p
   double mapped_x = (grid_length_x_ - origin_x_offset - point.x) / grid_resolution_;
   double mapped_y = (grid_length_y_ - origin_y_offset - point.y) / grid_resolution_;
 
-  int mapped_x_ind = std::ceil(mapped_x);
-  int mapped_y_ind = std::ceil(mapped_y);
+  int mapped_x_ind = nero_points_floor() ? std::floor(mapped_x) : std::ceil(mapped_x);
+  int mapped_y_ind = nero_points_floor() ? std::floor(mapped_y) : std::ceil(mapped_y);
   grid_map::Index index(mapped_x_ind, mapped_y_ind);
   return index;
 }

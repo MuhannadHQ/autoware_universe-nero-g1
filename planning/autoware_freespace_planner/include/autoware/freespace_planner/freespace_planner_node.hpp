@@ -41,6 +41,7 @@
 
 #include <autoware_internal_debug_msgs/msg/float64_stamped.hpp>
 #include <autoware_internal_planning_msgs/msg/scenario.hpp>
+#include <autoware_perception_msgs/msg/predicted_objects.hpp>
 #include <autoware_planning_msgs/msg/lanelet_route.hpp>
 #include <autoware_planning_msgs/msg/trajectory.hpp>
 #include <geometry_msgs/msg/twist.hpp>
@@ -125,6 +126,17 @@ private:
 
   rclcpp::TimerBase::SharedPtr timer_;
 
+  // NERO_FREESPACE_PREDICTED_HOLD_S (nero, 2026-10-24): created only with the switch set
+  rclcpp::Subscription<autoware_perception_msgs::msg::PredictedObjects>::SharedPtr nero_objects_sub_;
+  autoware_perception_msgs::msg::PredictedObjects::ConstSharedPtr nero_objects_;
+  bool nero_holding_ = false;
+  // NERO_FREESPACE_STRAIGHT_IN_WAIT_S / NERO_FREESPACE_REPARK_DEG (nero, 2026-10-24)
+  double nero_straight_wait_since_ = -1.0;
+  double nero_straight_wait_try_ = -1.0;
+  int nero_reparks_ = 0;
+  bool nero_repark_now_ = false;
+  bool nero_repark_back_ = true;
+
   std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
   std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
 
@@ -189,6 +201,9 @@ private:
    *          following the trajectory.
    */
   void updateTargetIndex();
+
+  // NERO_FREESPACE_PREDICTED_HOLD_S: true = do not start the current partial trajectory now
+  bool neroPredictedHold();
 
   /**
    * @brief Checks if current trajectory is colliding with an object.
