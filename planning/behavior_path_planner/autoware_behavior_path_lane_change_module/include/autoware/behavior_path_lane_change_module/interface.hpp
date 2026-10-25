@@ -126,6 +126,9 @@ protected:
 
   void updateDebugMarker() const;
 
+  // NERO_LC_ABL_IDLE_GUARD (MRM job 2026-10-25): see interface.cpp. Non-virtual: no layout change.
+  bool nero_abl_idle_skip();
+
   void updateSteeringFactorPtr(const BehaviorModuleOutput & output);
 
   void updateSteeringFactorPtr(

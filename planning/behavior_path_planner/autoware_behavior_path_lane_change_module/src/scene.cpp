@@ -58,6 +58,8 @@
 #include <limits>
 #include <unordered_set>
 #include <memory>
+#include <typeinfo>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <utility>
@@ -1535,6 +1537,86 @@ bool NormalLaneChange::get_lane_change_paths(LaneChangePaths & candidate_paths) 
     prepare_phase_metrics, target_objects, sorted_lane_ids, candidate_paths);
 }
 
+namespace
+{
+// NERO_LC_FRENET_CACHE=1 (MRM job 2026-10-25): reuse the frenet candidates of the previous cycle when everything they
+// are generated from is exactly the same (ego pose and speed, lanes, transient data, the previous module's path, the
+// prepare metrics, the generation parameters): the robot standing at the lane end waiting for a gap. The candidates
+// are then identical; the safety check against the objects still runs on them every cycle (time_limit as before).
+// At the lane end generate_frenet_candidates() ran before the time_limit check: 57 prepare metrics -> 90-118 ms per
+// cycle and per module under the car's CPU load, behavior_path_planner under 5 Hz -> MRM (car 10-25 12:43).
+// One slot per module type and direction (the field re-created the module every cycle). Unset = upstream.
+bool nero_frenet_cache_on()
+{
+  static const bool on = [] {
+    const char * v = std::getenv("NERO_LC_FRENET_CACHE");
+    const bool b = v != nullptr && std::atoi(v) > 0;
+    if (b) {
+      RCLCPP_INFO(
+        rclcpp::get_logger("lane_change"),
+        "[NERO_LC_FRENET_CACHE] 1: frenet candidates reused while their inputs are unchanged");
+    }
+    return b;
+  }();
+  return on;
+}
+
+std::vector<int64_t> nero_frenet_key(
+  const lane_change::CommonDataPtr & cd, const PathWithLaneId & prev,
+  const std::vector<LaneChangePhaseMetrics> & metrics)
+{
+  std::vector<int64_t> k;
+  k.reserve(64 + prev.points.size() * 8 + metrics.size() * 6);
+  const auto q = [&k](const double v, const double res) {
+    k.push_back(
+      std::isfinite(v) ? static_cast<int64_t>(std::llround(v / res))
+                       : (v > 0 ? std::numeric_limits<int64_t>::max() : std::numeric_limits<int64_t>::min()));
+  };
+  const auto ids = [&k](const lanelet::ConstLanelets & lls) {
+    k.push_back(-1);
+    for (const auto & ll : lls) k.push_back(ll.id());
+  };
+  const auto & ego = cd->get_ego_pose();
+  q(ego.position.x, 1e-4); q(ego.position.y, 1e-4); q(ego.position.z, 1e-3);
+  q(ego.orientation.x, 1e-7); q(ego.orientation.y, 1e-7); q(ego.orientation.z, 1e-7); q(ego.orientation.w, 1e-7);
+  q(cd->get_ego_speed(), 1e-4);
+  k.push_back(static_cast<int64_t>(cd->direction));
+  ids(cd->lanes_ptr->current); ids(cd->lanes_ptr->target); ids(cd->lanes_ptr->target_neighbor);
+  k.push_back(cd->lanes_ptr->current_lane_in_goal_section); k.push_back(cd->lanes_ptr->target_lane_in_goal_section);
+  const auto & t = cd->transient_data;
+  q(t.lane_changing_length.min, 1e-6); q(t.lane_changing_length.max, 1e-6);
+  q(t.current_dist_buffer.min, 1e-6); q(t.current_dist_buffer.max, 1e-6);
+  q(t.next_dist_buffer.min, 1e-6); q(t.next_dist_buffer.max, 1e-6);
+  q(t.dist_to_terminal_end, 1e-6); q(t.dist_to_terminal_start, 1e-6); q(t.max_prepare_length, 1e-6);
+  q(t.dist_from_prev_intersection, 1e-6); q(t.target_lane_length, 1e-6); q(t.dist_to_target_end, 1e-6);
+  q(t.current_path_velocity, 1e-6); q(t.lane_change_prepare_duration, 1e-6);
+  k.push_back(static_cast<int64_t>(t.current_path_seg_idx));
+  k.push_back(t.is_ego_near_current_terminal_start); k.push_back(t.is_ego_stuck);
+  k.push_back(t.in_turn_direction_lane); k.push_back(t.in_intersection);
+  const auto & lp = *cd->lc_param_ptr;
+  q(lp.lane_change_finish_judge_buffer, 1e-9); q(lp.trajectory.th_lane_changing_length_diff, 1e-9);
+  q(lp.trajectory.lateral_jerk, 1e-9); q(lp.trajectory.min_lane_changing_velocity, 1e-9);
+  k.push_back(lp.trajectory.lat_acc_sampling_num); k.push_back(lp.trajectory.lon_acc_sampling_num);
+  q(lp.frenet.th_yaw_diff_deg, 1e-9); q(lp.frenet.th_curvature_smoothing, 1e-9);
+  k.push_back(reinterpret_cast<int64_t>(cd->route_handler_ptr.get()));
+  k.push_back(-2);
+  for (const auto & m : metrics) {
+    q(m.duration, 1e-9); q(m.length, 1e-9); q(m.velocity, 1e-9);
+    q(m.sampled_lon_accel, 1e-9); q(m.actual_lon_accel, 1e-9); q(m.lat_accel, 1e-9);
+  }
+  k.push_back(-3);
+  for (const auto & pt : prev.points) {
+    const auto & ps = pt.point.pose;
+    q(ps.position.x, 1e-4); q(ps.position.y, 1e-4); q(ps.position.z, 1e-3);
+    q(ps.orientation.z, 1e-7); q(ps.orientation.w, 1e-7);
+    q(pt.point.longitudinal_velocity_mps, 1e-4);
+    k.push_back(-4);
+    for (const auto id : pt.lane_ids) k.push_back(id);
+  }
+  return k;
+}
+}  // namespace
+
 bool NormalLaneChange::get_path_using_frenet(
   const std::vector<LaneChangePhaseMetrics> & prepare_metrics,
   const lane_change::TargetObjects & target_objects,
@@ -1543,8 +1625,38 @@ bool NormalLaneChange::get_path_using_frenet(
 {
   stop_watch_.tic(__func__);
   constexpr auto found_safe_path = true;
-  const auto frenet_candidates = utils::lane_change::generate_frenet_candidates(
-    common_data_ptr_, prev_module_output_.path, prepare_metrics);
+  const auto frenet_candidates = std::invoke([&]() {
+    if (!nero_frenet_cache_on()) {
+      return utils::lane_change::generate_frenet_candidates(
+        common_data_ptr_, prev_module_output_.path, prepare_metrics);
+    }
+    struct Slot
+    {
+      std::vector<int64_t> key;
+      std::vector<lane_change::TrajectoryGroup> candidates;
+      size_t hits{0};
+      size_t misses{0};
+    };
+    static std::mutex mtx;
+    static std::unordered_map<std::string, Slot> slots;
+    auto key = nero_frenet_key(common_data_ptr_, prev_module_output_.path, prepare_metrics);
+    const std::lock_guard<std::mutex> lock(mtx);
+    auto & slot = slots[std::string(typeid(*this).name()) + (direction_ == Direction::LEFT ? "L" : "R")];
+    if (slot.key == key) {
+      ++slot.hits;
+    } else {
+      ++slot.misses;
+      slot.candidates = utils::lane_change::generate_frenet_candidates(
+        common_data_ptr_, prev_module_output_.path, prepare_metrics);
+      slot.key = std::move(key);
+    }
+    if (nero_lc_debug_tick("frenet_cache")) {
+      RCLCPP_INFO(
+        logger_, "[NERO_LC_FRENET_CACHE] %zu candidates, hits %zu misses %zu", slot.candidates.size(),
+        slot.hits, slot.misses);
+    }
+    return slot.candidates;
+  });
   if (nero_lc_debug_tick("frenet")) {
     RCLCPP_INFO(logger_, "[NERO_LC] frenet candidates %zu from %zu prepare metrics",
       frenet_candidates.size(), prepare_metrics.size());

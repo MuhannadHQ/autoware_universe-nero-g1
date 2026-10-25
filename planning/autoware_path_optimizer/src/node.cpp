@@ -23,6 +23,7 @@
 #include "rclcpp/time.hpp"
 
 #include <chrono>
+#include <cstdlib>
 #include <iostream>
 #include <limits>
 #include <memory>
@@ -382,6 +383,33 @@ std::vector<TrajectoryPoint> PathOptimizer::optimizeTrajectory(const PlannerData
   // 2. make trajectory kinematically-feasible and collision-free (= inside the drivable area)
   //    with model predictive trajectory
   const auto mpt_traj = mpt_optimizer_ptr_->optimizeTrajectory(planner_data);
+
+  // NERO_PO_FIX_10726=1 (MRM job 2026-10-25): port of upstream autoware_universe #10726 "fix(path_optimizer): undefined
+  // behavior when optimizer failure" (+ #11874). Below, a failed MPT (nullopt) within the first 3 s of failing was
+  // dereferenced (std::move(*mpt_traj)): in the sim of the 10-25 12:43 place it threw std::bad_alloc and the motion
+  // planning container died (no trajectory -> MRM). Upstream: the previous optimized trajectory is used then.
+  static const bool nero_fix_10726 = [] {
+    const char * v = std::getenv("NERO_PO_FIX_10726");
+    return v != nullptr && std::atoi(v) > 0;
+  }();
+  if (nero_fix_10726) {
+    const double elapsed_time = conditional_timer_->getElapsedTime().count();
+    const bool elapsed_time_over_three_seconds = (elapsed_time > 3.0);
+    auto optimized_traj_points = [&]() {
+      if (mpt_traj) {
+        return *mpt_traj;
+      }
+      if (elapsed_time_over_three_seconds) {
+        return p.traj_points;
+      }
+      return getPrevOptimizedTrajectory(p.traj_points);
+    }();
+    const bool optimized_traj_failed = !static_cast<bool>(mpt_traj);
+    conditional_timer_->update(optimized_traj_failed);
+    is_optimization_failed_ = optimized_traj_failed && elapsed_time_over_three_seconds;
+    applyInputVelocity(optimized_traj_points, p.traj_points, planner_data.ego_pose);
+    return optimized_traj_points;
+  }
 
   const bool optimized_traj_failed = !static_cast<bool>(mpt_traj);
 

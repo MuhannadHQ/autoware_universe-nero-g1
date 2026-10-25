@@ -28,6 +28,7 @@
 #include <visualization_msgs/msg/detail/marker_array__struct.hpp>
 
 #include <fmt/format.h>
+#include <rclcpp/logging.hpp>
 
 #include <algorithm>
 #include <cstdint>
@@ -305,12 +306,29 @@ MarkerArray createDebugMarkerArray(
   add(ShowLaneChangeMetricsInfo(scene_debug_data, ego_pose));
 
   // lanes
-  add(laneletsAsTriangleMarkerArray(
-    "current_lanes", scene_debug_data.current_lanes, colors::light_yellow(0.2)));
-  add(laneletsAsTriangleMarkerArray(
-    "target_lanes", scene_debug_data.target_lanes, colors::aqua(0.2)));
-  add(laneletsAsTriangleMarkerArray(
-    "target_backward_lanes", scene_debug_data.target_backward_lanes, colors::blue(0.2)));
+  // NERO_LC_DEBUG_LANES=0 (MRM job 2026-10-25): no lane triangles in the debug markers. They are built up to 4 times a
+  // cycle by every lane-change module (also the idle ones: lane change left / right, avoidance by lane change) with the
+  // lanelet2_extension ear clipping, O(n^2..n^3) in a lanelet's polygon points. On map c7850d93 lanelet 93795 (336
+  // points, clustered nodes) took ~400k point tests and printed 15 warnings per call; behavior_path_planner fell under
+  // 5 Hz before the lane change and the trajectory monitor triggered the MRM (car 10-25 12:43). RViz only; every other
+  // lane-change marker stays. Unset = upstream.
+  static const bool nero_no_lane_triangles = [] {
+    const char * v = std::getenv("NERO_LC_DEBUG_LANES");
+    const bool off = v != nullptr && std::string(v) == "0";
+    if (off) {
+      RCLCPP_INFO(
+        rclcpp::get_logger("lane_change"), "[NERO_LC_DEBUG_LANES] 0: no lane triangles in the debug markers");
+    }
+    return off;
+  }();
+  if (!nero_no_lane_triangles) {
+    add(laneletsAsTriangleMarkerArray(
+      "current_lanes", scene_debug_data.current_lanes, colors::light_yellow(0.2)));
+    add(laneletsAsTriangleMarkerArray(
+      "target_lanes", scene_debug_data.target_lanes, colors::aqua(0.2)));
+    add(laneletsAsTriangleMarkerArray(
+      "target_backward_lanes", scene_debug_data.target_backward_lanes, colors::blue(0.2)));
+  }
 
   add(showAllValidLaneChangePath(debug_valid_paths, "lane_change_valid_paths"));
   add(showFilteredObjects(debug_filtered_objects, "object_filtered"));

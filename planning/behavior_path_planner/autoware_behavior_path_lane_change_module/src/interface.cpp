@@ -92,11 +92,39 @@ void LaneChangeInterface::updateData()
   module_type_->updateSpecialData();
 
   if (isWaitingApproval() || module_type_->isAbortState()) {
-    module_type_->updateLaneChangeStatus();
+    if (!nero_abl_idle_skip()) {
+      module_type_->updateLaneChangeStatus();
+    }
   }
 
   module_type_->resetStopPose();
   updateDebugMarker();
+}
+
+// NERO_LC_ABL_IDLE_GUARD=1 (MRM job 2026-10-25): the idle avoidance_by_lane_change module is always "waiting approval"
+// (its processOnEntry calls waitApproval, and the manager enters the idle instance every cycle), so updateData ran the
+// full lane change path search (frenet candidates near the lane end) every cycle only for isExecutionRequested() =
+// isLaneChangeRequired() && specialRequiredCheck() && isValidPath() to come out false on one of the first two terms.
+// At the 10-25 12:43 lane end that search cost 90-130 ms per cycle on top of the lane change's own -> MRM. Skip it
+// while one of those two terms is false (the request is the same: false); a registered module is not affected.
+// Its safe-cycle count (NERO_LC_MIN_SAFE_CYCLES) then starts when it has a target. Unset = upstream.
+bool LaneChangeInterface::nero_abl_idle_skip()
+{
+  static const bool on = [this] {
+    const char * v = std::getenv("NERO_LC_ABL_IDLE_GUARD");
+    const bool b = v != nullptr && std::atoi(v) > 0;
+    if (b) {
+      RCLCPP_INFO(getLogger(), "[NERO_LC_ABL_IDLE_GUARD] 1: no path search in the idle avoidance_by_lane_change");
+    }
+    return b;
+  }();
+  if (!on || name() != "avoidance_by_lane_change" || getCurrentStatus() != ModuleStatus::IDLE) {
+    return false;
+  }
+  if (module_type_->isAbortState()) {
+    return false;
+  }
+  return !module_type_->isLaneChangeRequired() || !module_type_->specialRequiredCheck();
 }
 
 void LaneChangeInterface::postProcess()
