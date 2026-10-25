@@ -134,6 +134,8 @@ private:
   double nero_straight_wait_since_ = -1.0;
   double nero_straight_wait_try_ = -1.0;
   int nero_reparks_ = 0;
+  int nero_short_replans_ = 0;  // NERO_FREESPACE_STRAIGHT_FWD_MIN_M: re-plans for a segment too short to start
+  double nero_failed_search_t_ = -1e9;  // NERO_FREESPACE_PREDICTED_HOLD_MOVING: when a full A* search last failed
   bool nero_repark_now_ = false;
   bool nero_repark_back_ = true;
 

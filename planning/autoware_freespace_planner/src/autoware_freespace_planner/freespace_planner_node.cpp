@@ -94,6 +94,35 @@ bool nero_straight_in_stop()
   return on;
 }
 
+// NERO_FREESPACE_STRAIGHT_FWD_MIN_M=<m> (nero, pull-out 2026-10-24, with NERO_FREESPACE_STRAIGHT_IN_STOP): a
+// forward straight segment starts early enough to be at least <m> long. The MPC treats a standing vehicle with a
+// zero target speed within 1 m ahead as stopped and then never reports the steering converged, and the PID waits
+// for that before it departs: a forward straight segment of <= 1 m never started (pull-out sim at the real place:
+// 0.92 m, the robot stood 1.2 m short of the step-out pose for good; upstream main has the same MPC check). A
+// reversing segment is not affected (the MPC takes the minimum of its negative speeds). Unset = the cut 2 points
+// into the straight piece in both directions.
+double nero_straight_fwd_min_m()
+{
+  static const double m = [] {
+    const char * v = std::getenv("NERO_FREESPACE_STRAIGHT_FWD_MIN_M");
+    return v ? std::max(0.0, std::atof(v)) : 0.0;
+  }();
+  return m;
+}
+
+// where the straight piece's own segment begins: 2 points into it, earlier for a short forward one (above)
+size_t nero_straight_cut(const autoware_planning_msgs::msg::Trajectory & traj, const size_t straight_from)
+{
+  size_t cut = straight_from + 2;
+  if (nero_straight_fwd_min_m() <= 0.0 || cut >= traj.points.size()) return cut;
+  if (traj.points.at(straight_from).longitudinal_velocity_mps <= 0.0) return cut;
+  while (cut > 1 && autoware::motion_utils::calcSignedArcLength(traj.points, cut, traj.points.size() - 1) <
+                      nero_straight_fwd_min_m()) {
+    --cut;
+  }
+  return cut;
+}
+
 // NERO_FREESPACE_STRAIGHT_IN_WAIT_S=<s> (nero, 2026-10-24, with NERO_FREESPACE_STRAIGHT_IN): when
 // the straight approach is only blocked (a pose before the goal or the straight piece is occupied,
 // e.g. by a person still walking off) and not impossible, wait and re-plan up to <s> seconds
@@ -128,6 +157,20 @@ double nero_predicted_hold_s()
 {
   const char * v = std::getenv("NERO_FREESPACE_PREDICTED_HOLD_S");
   return v ? std::clamp(std::atof(v), 0.0, 10.0) : 0.0;
+}
+
+// NERO_FREESPACE_PREDICTED_HOLD_MOVING=1 (nero, pull-out 2026-10-24, with NERO_FREESPACE_PREDICTED_HOLD_S): the hold
+// also while moving: the vehicle stops before its footprint enters a moving road user's way (not in it yet) and waits
+// as when standing; once in that way it goes on. Pulling out of the parking spot the view up the lane opens only
+// after the move started (a parked car beside the spot): a car on the lane first seen 29 m away at 3.4 s, the robot
+// went on into its way (sim: a never-slowing driver hit it at 9.2 s). Unset = the check only before a segment.
+bool nero_predicted_hold_moving()
+{
+  static const bool on = [] {
+    const char * v = std::getenv("NERO_FREESPACE_PREDICTED_HOLD_MOVING");
+    return v && std::atoi(v) == 1;
+  }();
+  return on;
 }
 
 using NeroQuad = std::array<std::array<double, 2>, 4>;
@@ -169,6 +212,41 @@ bool nero_overlap(const NeroQuad & a, const NeroQuad & b)
     }
   }
   return true;
+}
+
+bool nero_inside(const NeroQuad & q, const double x, const double y)
+{
+  bool pos = false;
+  bool neg = false;
+  for (int i = 0; i < 4; ++i) {
+    const auto & a = q[i];
+    const auto & b = q[(i + 1) % 4];
+    const double cross = (b[0] - a[0]) * (y - a[1]) - (b[1] - a[1]) * (x - a[0]);
+    pos = pos || cross > 0.0;
+    neg = neg || cross < 0.0;
+  }
+  return !(pos && neg);
+}
+
+// how deep the vehicle at p is in a road user's way: its footprint's sample points (9 x 5) inside any of the quads
+int nero_depth(
+  const geometry_msgs::msg::Pose & p, const double front, const double rear, const double half_w,
+  const std::vector<NeroQuad> & way)
+{
+  const double yaw = tf2::getYaw(p.orientation);
+  const double c = std::cos(yaw);
+  const double s = std::sin(yaw);
+  int n = 0;
+  for (int i = 0; i < 9; ++i) {
+    const double u = -rear + (front + rear) * i / 8.0;
+    for (int j = 0; j < 5; ++j) {
+      const double v = -half_w + 2.0 * half_w * j / 4.0;
+      const double x = p.position.x + c * u - s * v;
+      const double y = p.position.y + s * u + c * v;
+      n += std::any_of(way.begin(), way.end(), [&](const NeroQuad & q) { return nero_inside(q, x, y); });
+    }
+  }
+  return n;
 }
 
 // NERO_FREESPACE_HALF_CELL=1 (nero, 2026-10-24): A* takes cell i of its map as centred at i * res
@@ -314,7 +392,11 @@ bool FreespacePlannerNode::isPlanRequired()
     return true;
   }
 
-  if (node_param_.replan_when_obstacle_found && checkCurrentTrajectoryCollision()) {
+  // NERO_FREESPACE_PREDICTED_HOLD_MOVING: no re-plan while holding (standing) for a moving road user crossing the
+  // path: the plan is still valid when it has passed (sim: a re-plan from the held pose, 2 gear changes, +13 s)
+  if (
+    node_param_.replan_when_obstacle_found && !(nero_predicted_hold_moving() && nero_holding_) &&
+    checkCurrentTrajectoryCollision()) {
     RCLCPP_DEBUG(get_logger(), "Found obstacle");
     return true;
   }
@@ -411,7 +493,12 @@ bool FreespacePlannerNode::neroPredictedHold()
   };
   if (!nero_objects_ || partial_trajectory_.points.size() < 2) return release();
   // only before a partial trajectory starts (standing); once moving the vehicle finishes it
-  if (!utils::is_stopped(odom_buffer_, node_param_.th_stopped_velocity_mps)) return release();
+  // (NERO_FREESPACE_PREDICTED_HOLD_MOVING: also while moving)
+  if (
+    !nero_predicted_hold_moving() &&
+    !utils::is_stopped(odom_buffer_, node_param_.th_stopped_velocity_mps)) {
+    return release();
+  }
   if (nero_objects_->header.frame_id != partial_trajectory_.header.frame_id) return release();
 
   const double horizon = nero_predicted_hold_s();
@@ -449,8 +536,10 @@ bool FreespacePlannerNode::neroPredictedHold()
     bool in_path = false;
     bool in_now = false;
     double t_hit = 0.0;
+    std::vector<NeroQuad> way;
     for (const auto & [t, pose] : poses) {
       const auto oq = nero_quad(pose, ol, ol, ow);
+      way.push_back(oq);
       if (nero_overlap(oq, now_fp)) in_now = true;
       if (!in_path) {
         for (const auto & q : path_fp) {
@@ -462,7 +551,37 @@ bool FreespacePlannerNode::neroPredictedHold()
         }
       }
     }
-    if (in_path && !in_now) {
+    // NERO_FREESPACE_PREDICTED_HOLD_MOVING: already in its way, the vehicle goes on only when that does not take it
+    // deeper in (along its lane in front of a car behind: the same depth); nosing further into the way of a car it saw
+    // late, it stops (sim, cars parked on both sides: a car first seen 16 m away, the robot went on 0.4 m deeper)
+    bool deeper = false;
+    if (in_path && in_now && nero_predicted_hold_moving()) {
+      double ahead = 0.0;
+      size_t k = nearest;
+      while (k + 1 < partial_trajectory_.points.size() && ahead < 0.5) {
+        ahead += autoware_utils::calc_distance2d(
+          partial_trajectory_.points.at(k).pose, partial_trajectory_.points.at(k + 1).pose);
+        ++k;
+      }
+      const int d_now = nero_depth(current_pose_.pose, front, rear, half_w, way);
+      const int d_next = nero_depth(partial_trajectory_.points.at(k).pose, front, rear, half_w, way);
+      deeper = d_next > d_now;
+      // nor while it is beside or in front of the vehicle: its body (now) on the next 2 m of the path
+      double s_ahead = 0.0;
+      for (size_t i = nearest; i < partial_trajectory_.points.size() && s_ahead <= 2.0 && !deeper; ++i) {
+        if (i > nearest) {
+          s_ahead += autoware_utils::calc_distance2d(
+            partial_trajectory_.points.at(i - 1).pose, partial_trajectory_.points.at(i).pose);
+        }
+        deeper = nero_overlap(way.front(), path_fp.at(i - nearest));
+      }
+      RCLCPP_INFO_THROTTLE(
+        get_logger(), *get_clock(), 1000,
+        "[NERO_FREESPACE_PREDICTED_HOLD_MOVING] in the way of a road user (%.1f m/s): depth %d now, %d %.1f m on "
+        "(%zu -> %zu of %zu): %s",
+        v, d_now, d_next, ahead, nearest, k, partial_trajectory_.points.size(), deeper ? "holding" : "going on");
+    }
+    if (in_path && (!in_now || deeper)) {
       if (!nero_holding_) {
         RCLCPP_INFO(
           get_logger(),
@@ -488,6 +607,7 @@ void FreespacePlannerNode::onRoute(const LaneletRoute::ConstSharedPtr msg)
 
   is_new_parking_cycle_ = true;
   nero_reparks_ = 0;
+  nero_short_replans_ = 0;
   nero_straight_wait_since_ = -1.0;
 
   reset();
@@ -628,6 +748,33 @@ void FreespacePlannerNode::onTimer()
   partial_trajectory_ =
     utils::get_partial_trajectory(trajectory_, prev_target_index_, target_index_, get_clock());
 
+  // NERO_FREESPACE_STRAIGHT_FWD_MIN_M: a segment (not the last) the vehicle cannot start from standstill - forward
+  // shorter than the MPC/PID need, reversing under the velocity smoother's 0.5 m engage distance - is planned again
+  // from where the vehicle stands (sim: a 0.5 m reverse after a re-plan round a passing car: the robot stood for
+  // good), at most 3 times per goal
+  if (
+    nero_straight_fwd_min_m() > 0.0 && nero_short_replans_ < 3 && target_index_ + 1 < trajectory_.points.size() &&
+    partial_trajectory_.points.size() > 1 &&
+    utils::is_stopped(odom_buffer_, node_param_.th_stopped_velocity_mps)) {
+    const size_t i0 =
+      autoware::motion_utils::findNearestIndex(partial_trajectory_.points, current_pose_.pose.position);
+    const double len = std::abs(autoware::motion_utils::calcSignedArcLength(
+      partial_trajectory_.points, i0, partial_trajectory_.points.size() - 1));
+    const bool fwd = partial_trajectory_.points.front().longitudinal_velocity_mps > 0.0;
+    if (len < (fwd ? nero_straight_fwd_min_m() : 0.6)) {
+      ++nero_short_replans_;
+      RCLCPP_INFO(
+        get_logger(),
+        "[NERO_FREESPACE_STRAIGHT_FWD_MIN_M] the next %s segment is %.2f m from here, too short to start: "
+        "planning again from here (%d/3)",
+        fwd ? "forward" : "reversing", len, nero_short_replans_);
+      trajectory_pub_->publish(utils::create_stop_trajectory(partial_trajectory_));
+      reset();
+      reset_in_progress_ = true;
+      return;
+    }
+  }
+
   if (nero_predicted_hold_s() > 0.0 && neroPredictedHold()) {
     const auto hold = utils::create_stop_trajectory(partial_trajectory_);
     trajectory_pub_->publish(hold);
@@ -654,6 +801,14 @@ void FreespacePlannerNode::onTimer()
 void FreespacePlannerNode::planTrajectory()
 {
   if (occupancy_grid_ == nullptr) {
+    return;
+  }
+
+  if (nero_predicted_hold_moving() && get_clock()->now().seconds() - nero_failed_search_t_ < 1.0) {
+    // NERO_FREESPACE_PREDICTED_HOLD_MOVING: a full A* search that found nothing used its whole time limit inside this
+    // timer; the next one waits 1 s so the hold keeps being published (sim: after a hold for a person standing on the
+    // path, 9 failing searches back to back dropped the trajectory rate -> emergency stop)
+    reset();
     return;
   }
 
@@ -731,6 +886,9 @@ void FreespacePlannerNode::planTrajectory()
     }
   }
   const rclcpp::Time end = get_clock()->now();
+  if (!result && !nero_repark_now_ && (end - start).seconds() > 0.1) {
+    nero_failed_search_t_ = end.seconds();
+  }
 
   RCLCPP_DEBUG(get_logger(), "Freespace planning: %f [s]", (end - start).seconds());
 
@@ -749,6 +907,10 @@ void FreespacePlannerNode::planTrajectory()
       const double sgn = back ? 1.0 : -1.0;  // the side of the goal the vehicle comes from
       std::string why;
       bool only_blocked = true;  // every failure was an occupied pose (not geometry)
+      // NERO_FREESPACE_STRAIGHT_FWD_MIN_M: a forward straight piece long enough to start even after the vehicle
+      // stopped 0.2-0.3 m early at the end of a reverse before it (the MPC/PID deadlock, see there)
+      const double fwd_min = back ? 0.0 : nero_straight_fwd_min_m();
+      const double dd = fwd_min > 0.0 ? std::max(d, fwd_min + 0.35) : d;
       for (const double f : {1.0, 0.75, 0.5, 0.33}) {
         // a time budget for the extra A* calls: the timer must publish at least every second
         // (topic_state_monitor on the trajectory: 1 s -> MRM). Over budget = try again later.
@@ -756,15 +918,16 @@ void FreespacePlannerNode::planTrajectory()
           why += "time budget (0.4 s) used up; ";
           break;
         }
-        if (nero_straight_in_stop() && f * d < 0.8) {
+        if (fwd_min > 0.0 && f * dd < fwd_min + 0.35) continue;
+        if (nero_straight_in_stop() && f * dd < 0.8) {
           // with its own segment the straight piece must be long enough to cut (0.3 m) and still
           // drive straight; shorter ones keep the +-1.5 m curvature feed-forward: skip, then wait
           // (blocked) or the plan without it and NERO_FREESPACE_REPARK_DEG
           continue;
         }
         auto pre = goal;
-        pre.position.x += sgn * f * d * ux;
-        pre.position.y += sgn * f * d * uy;
+        pre.position.x += sgn * f * dd * ux;
+        pre.position.y += sgn * f * dd * uy;
         bool pre_found = false;
         std::string astar_err;
         try {
@@ -775,7 +938,7 @@ void FreespacePlannerNode::planTrajectory()
           pre_found = false;
           astar_err = e.what();
         }
-        const std::string dtxt = std::to_string(f * d).substr(0, 4) + " m: ";
+        const std::string dtxt = std::to_string(f * dd).substr(0, 4) + " m: ";
         if (!pre_found) {
           why += dtxt + "no plan to the pose before the goal (" + astar_err + "); ";
           only_blocked = only_blocked && astar_err.find("Invalid") != std::string::npos;
@@ -864,7 +1027,7 @@ void FreespacePlannerNode::planTrajectory()
       straight_from > 0 && std::find(
                              reversing_indices_.begin(), reversing_indices_.end(),
                              straight_from - 1) != reversing_indices_.end();
-    if (const size_t cut = straight_from + 2;
+    if (const size_t cut = nero_straight_cut(trajectory_, straight_from);
         nero_straight_in_stop() && straight_from > 0 && !straight_own_segment &&
         cut + 5 < trajectory_.points.size() &&
         (reversing_indices_.empty() || cut > reversing_indices_.back())) {

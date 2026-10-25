@@ -684,6 +684,81 @@ bool DefaultPlanner::is_goal_valid(
   return is_in_parking_lot(parking_lots, goal_lanelet_pt);
 }
 
+namespace
+{
+// NERO_MISSION_PARKING_START_M=<m> (nero): a robot that starts inside a parking lot and on no road lanelet (parked
+// in its spot) may leave onto every road lanelet within <m> metres of the closest one: the route is planned from the
+// pose on each one's centre line (its driving direction) and the shortest route wins. Upstream takes only the closest
+// road lanelet and refuses it when the robot's heading is more than 90 deg off the lane's, so a robot parked nose to
+// the street (90 deg to it) got no route at all about half the time. The route keeps the robot's real start pose (the
+// freespace planner plans from it). Unset = upstream.
+std::optional<double> nero_parking_start_margin()
+{
+  const char * v = std::getenv("NERO_MISSION_PARKING_START_M");
+  if (!v || !*v) return std::nullopt;
+  char * end = nullptr;
+  const double m = std::strtod(v, &end);
+  if (end == v || !std::isfinite(m) || m < 0.0) return std::nullopt;
+  return m;
+}
+
+// false = not a start in a parking lot off the lanes, or no route from any lane next to it (the caller plans as upstream)
+bool nero_plan_from_parking_lot(
+  const route_handler::RouteHandler & route_handler, const geometry_msgs::msg::Pose & start,
+  const geometry_msgs::msg::Pose & goal, const bool consider_no_drivable_lanes, const rclcpp::Logger & logger,
+  lanelet::ConstLanelets * path)
+{
+  const auto margin = nero_parking_start_margin();
+  if (!margin || !route_handler.getRoadLaneletsAtPose(start).empty()) return false;
+  const auto map = route_handler.getLaneletMapPtr();
+  const auto start_pt = lanelet::utils::conversion::toLaneletPoint(start.position);
+  if (!is_in_parking_lot(lanelet::utils::query::getAllParkingLots(map), start_pt)) return false;
+
+  constexpr double search_m = 20.0;  // upstream's search range for a start off the lanes
+  const lanelet::BasicPoint2d p(start.position.x, start.position.y);
+  const lanelet::BoundingBox2d box(
+    lanelet::BasicPoint2d(p.x() - search_m, p.y() - search_m),
+    lanelet::BasicPoint2d(p.x() + search_m, p.y() + search_m));
+  std::vector<std::pair<double, lanelet::ConstLanelet>> near;
+  for (const auto & llt : std::as_const(*map).laneletLayer.search(box)) {
+    if (route_handler.isRoadLanelet(llt)) {
+      near.emplace_back(boost::geometry::distance(llt.polygon2d().basicPolygon(), p), llt);
+    }
+  }
+  if (near.empty()) return false;
+  const double closest =
+    std::min_element(near.begin(), near.end(), [](const auto & a, const auto & b) { return a.first < b.first; })
+      ->first;
+
+  double best_m = std::numeric_limits<double>::max();
+  for (const auto & [dist, llt] : near) {
+    if (dist > closest + *margin) continue;
+    const auto on_lane = lanelet::utils::getClosestCenterPose(llt, start.position);
+    lanelet::ConstLanelets candidate;
+    if (
+      !route_handler.planPathLaneletsBetweenCheckpoints(on_lane, goal, &candidate, consider_no_drivable_lanes) ||
+      candidate.empty()) {
+      continue;
+    }
+    const double length_m = lanelet::utils::getLaneletLength2d(candidate) -
+                             lanelet::utils::getArcCoordinates({candidate.front()}, on_lane).length -
+                             lanelet::utils::getLaneletLength2d(candidate.back()) +
+                             lanelet::utils::getArcCoordinates({candidate.back()}, goal).length;
+    RCLCPP_INFO(
+      logger, "[NERO_MISSION_PARKING_START_M] way out onto lanelet %ld (%.1f m from the robot): route %.1f m",
+      candidate.front().id(), dist, length_m);
+    if (length_m < best_m) {
+      best_m = length_m;
+      *path = candidate;
+    }
+  }
+  if (best_m == std::numeric_limits<double>::max()) return false;
+  RCLCPP_INFO(
+    logger, "[NERO_MISSION_PARKING_START_M] start in the parking lot: leaving onto lanelet %ld", path->front().id());
+  return true;
+}
+}  // namespace
+
 PlannerPlugin::LaneletRoute DefaultPlanner::plan(const RoutePoints & points)
 {
   const auto logger = node_->get_logger();
@@ -699,6 +774,12 @@ PlannerPlugin::LaneletRoute DefaultPlanner::plan(const RoutePoints & points)
   LaneletRoute route_msg;
   RouteSections route_sections;
 
+  // NERO_MISSION_PARKING_START_M: a start in a parking lot may leave onto any lane next to it
+  const auto plan_between = [&](const Pose & a, const Pose & b, lanelet::ConstLanelets * path) {
+    return nero_plan_from_parking_lot(route_handler_, a, b, param_.consider_no_drivable_lanes, logger, path) ||
+           route_handler_.planPathLaneletsBetweenCheckpoints(a, b, path, param_.consider_no_drivable_lanes);
+  };
+
   // NERO_KEEP_RIGHT: plan to the rightmost lane of the goal's road; the operator's goal if that fails
   auto checkpoints = points;
   std::optional<Pose> keep_right_goal;
@@ -706,9 +787,7 @@ PlannerPlugin::LaneletRoute DefaultPlanner::plan(const RoutePoints & points)
     keep_right_goal = nero_keep_right_goal(points.back());
     if (keep_right_goal) {
       lanelet::ConstLanelets probe;
-      if (route_handler_.planPathLaneletsBetweenCheckpoints(
-            points.at(points.size() - 2), *keep_right_goal, &probe,
-            param_.consider_no_drivable_lanes)) {
+      if (plan_between(points.at(points.size() - 2), *keep_right_goal, &probe)) {
         checkpoints.back() = *keep_right_goal;
       } else {
         RCLCPP_WARN(logger, "[NERO_KEEP_RIGHT] no route to the rightmost lane; keeping the goal");
@@ -722,8 +801,7 @@ PlannerPlugin::LaneletRoute DefaultPlanner::plan(const RoutePoints & points)
     const auto start_check_point = checkpoints.at(i - 1);
     const auto goal_check_point = checkpoints.at(i);
     lanelet::ConstLanelets path_lanelets;
-    if (!route_handler_.planPathLaneletsBetweenCheckpoints(
-          start_check_point, goal_check_point, &path_lanelets, param_.consider_no_drivable_lanes)) {
+    if (!plan_between(start_check_point, goal_check_point, &path_lanelets)) {
       RCLCPP_WARN(logger, "Failed to plan route.");
       return route_msg;
     }
