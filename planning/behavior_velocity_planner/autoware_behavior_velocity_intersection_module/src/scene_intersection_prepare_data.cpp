@@ -58,6 +58,32 @@ namespace
 {
 namespace bg = boost::geometry;
 
+// NERO_IX_NO_CENTERLINE_KEEP_CHECK=1 (silentjunction job 2026-10-24): where the footprint along the path never touches
+// the FIRST attention lane's centre line on the assigned lanelet, upstream returns nullopt from
+// generateIntersectionStopLines and the module returns InternalError("failed to generate intersection_stoplines") before
+// any collision check: no stop, no factor, every cycle (48 junction lanelets on map d296af79: the first attention lane
+// is one the robot only brushes, e.g. an opposite lane drawn over its own approach (42735 at 59065), or a lane it
+// merges with). The centre-line touch only feeds the occlusion-without-traffic-light pass judge line and, by default,
+// the 2nd pass judge line (upstream #11445 removed this early return). With 1:
+// - the check runs: the centre-line reference becomes the first attention lane centre line that the footprint on the
+//   lanelet does touch (the lanes the robot crosses), else the lanelet's end. Every attention lane stays watched,
+//   the brushed one too;
+// - ego commits (permanent GO) only past the 2nd pass judge line = the later of (that reference - braking distance)
+//   and the first footprint touch of the last attention lane on the path (no braking distance taken off; the brushed
+//   lane is touched from before the lanelet, so upstream's 1st pass judge line is behind ego at the stop line);
+// - where the footprint at the default stop line already touches the first attention lane (the IXM early return
+//   "occlusion stop line is null" would follow), the peeking line falls back to the default stop line and collision /
+//   stuck stops go to the first touch if that is earlier (as the minor-road switch of 10-24 does for its lanes).
+// Stops only move earlier and the commit only later. Unset / 0 = upstream.
+bool nero_no_centerline_keep_check()
+{
+  static const bool on = [] {
+    const char * v = std::getenv("NERO_IX_NO_CENTERLINE_KEEP_CHECK");
+    return v != nullptr && std::atoi(v) > 0;
+  }();
+  return on;
+}
+
 lanelet::ConstLanelets getPrevLanelets(
   const lanelet::ConstLanelets & lanelets_on_path, const std::set<lanelet::Id> & associative_ids)
 {
@@ -423,6 +449,44 @@ std::optional<IntersectionStopLines> IntersectionModule::generateIntersectionSto
       break;
     }
   }
+  // NERO_IX_NO_CENTERLINE_KEEP_CHECK (see nero_no_centerline_keep_check). At every junction the touch also goes missing
+  // once ego is past it (the path behind ego is trimmed; on a major road the module often never commits there): so the
+  // switch acts only on lanelets where the touch is missing while the lanelet's start is still on the path (latched
+  // per lanelet), and only before the commit; upstream's silence after a junction is kept as is
+  bool nero_ncl = false;
+  if (!first_footprint_attention_centerline_ip_opt && nero_no_centerline_keep_check() && !is_permanent_go_) {
+    static std::set<lanelet::Id> nero_ncl_lanes;
+    if (std::get<0>(lane_interval_ip) > 0) {
+      nero_ncl_lanes.insert(lane_id_);
+    }
+    nero_ncl = nero_ncl_lanes.count(lane_id_) > 0;
+  }
+  size_t nero_ncl_last_touch_ip = first_footprint_inside_1st_attention_ip;
+  lanelet::Id nero_ncl_ref_lane = lanelet::InvalId;
+  if (nero_ncl) {
+    const auto & attention_lanes = intersection_lanelets_.value().attention_non_preceding();
+    for (auto i = std::get<0>(lane_interval_ip);
+         i < std::get<1>(lane_interval_ip) && !first_footprint_attention_centerline_ip_opt; ++i) {
+      const auto path_footprint = autoware_utils::transform_vector(
+        local_footprint, autoware_utils::pose2transform(path_ip.points.at(i).point.pose));
+      for (const auto & attention_lane : attention_lanes) {
+        if (bg::intersects(path_footprint, attention_lane.centerline2d().basicLineString())) {
+          first_footprint_attention_centerline_ip_opt = i;
+          nero_ncl_ref_lane = attention_lane.id();
+          break;
+        }
+      }
+    }
+    if (!first_footprint_attention_centerline_ip_opt) {
+      first_footprint_attention_centerline_ip_opt = std::get<1>(lane_interval_ip);
+    }
+    for (const auto & attention_lane : attention_lanes) {
+      if (const auto touch_ip = util::getFirstPointInsidePolygonByFootprint(
+            attention_lane.polygon3d(), interpolated_path_info, local_footprint, baselink2front)) {
+        nero_ncl_last_touch_ip = std::max(nero_ncl_last_touch_ip, touch_ip.value());
+      }
+    }
+  }
   if (!first_footprint_attention_centerline_ip_opt) {
     return std::nullopt;
   }
@@ -437,11 +501,18 @@ std::optional<IntersectionStopLines> IntersectionModule::generateIntersectionSto
       map_stop_idx_ip) {
     stop_idx_ip_int = static_cast<int>(map_stop_idx_ip.value()) - base2front_idx_dist;
   }
+  const bool nero_ncl_map_stopline = stop_idx_ip_int >= 0;  // NERO_IX_NO_CENTERLINE_KEEP_CHECK (below)
   if (stop_idx_ip_int < 0) {
     stop_idx_ip_int = first_footprint_inside_1st_attention_ip - stopline_margin_idx_dist;
   }
   if (stop_idx_ip_int < 0) {
     default_stopline_valid = false;
+  }
+  if (nero_ncl) {
+    // NERO_IX_NO_CENTERLINE_KEEP_CHECK: ego commits only past the 2nd pass judge line (later than upstream's), so the
+    // default stop line must not go null ("default stop line is null": the check stops) once it is behind the trimmed
+    // path: it stays at the path start, i.e. collision stops are made where ego is
+    default_stopline_valid = true;
   }
   const auto default_stopline_ip = stop_idx_ip_int >= 0 ? static_cast<size_t>(stop_idx_ip_int) : 0;
 
@@ -468,6 +539,43 @@ std::optional<IntersectionStopLines> IntersectionModule::generateIntersectionSto
     occlusion_peeking_line_ip_int =
       first_footprint_inside_1st_attention_ip + std::ceil(peeking_offset / ds);
   }
+  // NERO_IX_NO_CENTERLINE_KEEP_CHECK: the peeking line stays at the default stop line instead of null, and collision /
+  // stuck stops go to the first footprint touch of the first attention lane if that is earlier (minus upstream's
+  // default_stopline_margin where the lanelet has no map stop line, as upstream's own default stop line). Upstream
+  // searches that touch only from baselink2front before the lanelet; a lane drawn across ego's approach (the opposite
+  // left turn 37167 at 147776: real first touch 7.7 m before the lanelet) put the waiting robot in that lane's path
+  // (sim: hit while standing, also with its nose at the touch), so the touch is searched back up to nero_ncl_back_m; a
+  // lane drawn over the whole approach (42735 at 59065) leaves no point outside it there, and the upstream touch is kept
+  const bool nero_ncl_peek = nero_ncl && !occlusion_peeking_line_valid && default_stopline_valid;
+  if (nero_ncl_peek) {
+    occlusion_peeking_line_valid = true;
+  }
+  size_t nero_ncl_first_touch_ip = first_footprint_inside_1st_attention_ip;
+  if (nero_ncl_peek) {
+    constexpr double nero_ncl_back_m = 10.0;
+    const auto lane_start_ip = std::get<0>(lane_interval_ip);
+    const size_t back_limit_ip = lane_start_ip - std::min<size_t>(
+                                                   lane_start_ip, static_cast<size_t>(std::ceil(nero_ncl_back_m / ds)));
+    const auto first_attention_area_2d = lanelet::utils::to2D(first_attention_area).basicPolygon();
+    size_t i = first_footprint_inside_1st_attention_ip;
+    while (i > back_limit_ip &&
+           bg::intersects(
+             autoware_utils::transform_vector(
+               local_footprint, autoware_utils::pose2transform(path_ip.points.at(i - 1).point.pose)),
+             first_attention_area_2d)) {
+      --i;
+    }
+    if (i > back_limit_ip) {
+      nero_ncl_first_touch_ip = i;
+    }
+  }
+  const size_t nero_ncl_default_stopline_ip =
+    !nero_ncl_peek        ? default_stopline_ip
+    : nero_ncl_map_stopline ? std::min<size_t>(default_stopline_ip, nero_ncl_first_touch_ip)
+                            : std::min<size_t>(
+                                default_stopline_ip,
+                                nero_ncl_first_touch_ip -
+                                  std::min<size_t>(nero_ncl_first_touch_ip, stopline_margin_idx_dist));
   const auto occlusion_peeking_line_ip = static_cast<size_t>(
     std::clamp<int>(occlusion_peeking_line_ip_int, 0, static_cast<int>(path_ip.points.size()) - 1));
 
@@ -584,12 +692,30 @@ std::optional<IntersectionStopLines> IntersectionModule::generateIntersectionSto
     size_t second_pass_judge_line{0};
     size_t occlusion_wo_tl_pass_judge_line{0};
   };
+  // NERO_IX_NO_CENTERLINE_KEEP_CHECK: commit only once ego enters the last attention lane on its path, and not before
+  // the centre-line reference minus the braking distance (= second_pass_judge_line_ip here)
+  if (nero_ncl) {
+    second_pass_judge_line_ip = std::max(second_pass_judge_line_ip, nero_ncl_last_touch_ip);
+    const auto from_lane_start = [&](const size_t ip) {
+      return (static_cast<double>(ip) - static_cast<double>(std::get<0>(lane_interval_ip))) * ds;
+    };
+    RCLCPP_INFO_THROTTLE(
+      logger_, *clock_, 5000,
+      "[NERO_IX] no_centerline_keep_check lane %ld: footprint never touches first attention lane %ld's centre line "
+      "(first touch %.1f m from the lanelet start): collision check kept, centre-line reference %s %ld at %.1f m, "
+      "default stop line %.1f m%s, commit only past the 2nd pass judge line %.1f m (last attention lane touch %.1f m)",
+      lane_id_, first_attention_lane.id(), from_lane_start(first_footprint_inside_1st_attention_ip),
+      nero_ncl_ref_lane != lanelet::InvalId ? "lane" : "(none crossed: lanelet end)", nero_ncl_ref_lane,
+      from_lane_start(first_footprint_attention_centerline_ip), from_lane_start(nero_ncl_default_stopline_ip),
+      nero_ncl_peek ? " (peeking line kept there)" : "", from_lane_start(second_pass_judge_line_ip),
+      from_lane_start(nero_ncl_last_touch_ip));
+  }
 
   IntersectionStopLinesTemp intersection_stoplines_temp;
   std::list<std::pair<const size_t *, size_t *>> stoplines = {
     {&closest_idx_ip, &intersection_stoplines_temp.closest_idx},
     {&stuck_stopline_ip, &intersection_stoplines_temp.stuck_stopline},
-    {&default_stopline_ip, &intersection_stoplines_temp.default_stopline},
+    {&nero_ncl_default_stopline_ip, &intersection_stoplines_temp.default_stopline},
     {&first_attention_stopline_ip, &intersection_stoplines_temp.first_attention_stopline},
     {&second_attention_stopline_ip, &intersection_stoplines_temp.second_attention_stopline},
     {&occlusion_peeking_line_ip, &intersection_stoplines_temp.occlusion_peeking_stopline},
@@ -639,7 +765,7 @@ std::optional<IntersectionStopLines> IntersectionModule::generateIntersectionSto
     intersection_stoplines.occlusion_peeking_stopline =
       intersection_stoplines_temp.occlusion_peeking_stopline;
   }
-  if (second_pass_judge_line_valid) {
+  if (second_pass_judge_line_valid || nero_ncl) {  // NERO: the commit point (see above)
     intersection_stoplines.second_pass_judge_line =
       intersection_stoplines_temp.second_pass_judge_line;
   }
