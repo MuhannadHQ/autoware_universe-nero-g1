@@ -14,6 +14,7 @@
 
 #include "scene_intersection.hpp"
 
+#include <cstdio>
 #include <cstdlib>
 
 #include "util.hpp"
@@ -1507,6 +1508,54 @@ IntersectionModule::PassJudgeStatus IntersectionModule::isOverPassJudgeLinesStat
     is_over_default_stopline || planner_param_.common.enable_pass_judge_before_default_stopline;
   const bool over_pass_judge_line_overall =
     is_over_2nd_pass_judge_line ? is_over_2nd_pass_judge_line.value() : is_over_1st_pass_judge_line;
+  // NERO_IX_STANDSTILL_REJUDGE=<zone_m>[,<creep_m>] (overrunyield, 2026-10-26): the permanent GO is upstream's "ego can
+  // no longer stop before the attention area, so it must not stop inside it". A robot that STANDS still has not passed
+  // that point: it can simply stay. After an overrun of the stop line (10-25 #11: stop line 100199 at 62907, 0.9 m
+  // over, the nose in the priority lane 63049) the module had latched the GO while the decision was still "safe"
+  // (upstream main: the same latch, never reset) and, although it detected the priority car on 63049 every cycle
+  // after that ("collision is detected after 2~6 seconds on the first attention lanelet"), it let the robot pull out
+  // in front of it. With the switch, while ego stands still less than zone_m past the default stop line the latch is
+  // cleared and not set, so every car is judged every cycle and a collision holds ego where it stands (upstream's
+  // collision stop at ego's own position past the default stop line); after such a standstill the latch waits until
+  // ego has crept creep_m (default 0.5) from where it stood, so a car first seen as ego starts off still stops it, as
+  // it would a robot that had stopped at its line (there upstream commits ~0.3-0.4 m after moving off). Apollo's
+  // stop-sign scenario does the same (the conflict check runs after the standstill and during the creep). A robot
+  // that crosses moving without having stood keeps upstream's commit. Unset = the car as before.
+  bool nero_defer_commit_standstill = false;
+  {
+    static const std::pair<double, double> sr = [] {
+      const char * e = std::getenv("NERO_IX_STANDSTILL_REJUDGE");
+      double zone = -1.0, creep = 0.5;
+      if (e != nullptr) std::sscanf(e, "%lf,%lf", &zone, &creep);
+      return std::make_pair(zone, creep);
+    }();
+    const auto & [zone_m, creep_m] = sr;
+    if (zone_m > 0.0) {
+      const double past =
+        autoware::motion_utils::calcSignedArcLength(path.points, default_stopline_idx, closest_idx);
+      // (from 1 m short of the line: a standstill further back, e.g. in a queue, is followed by the one at the line)
+      const bool standing_in_zone = past > -1.0 && past < zone_m && planner_data_->isVehicleStopped();
+      if (standing_in_zone) {
+        if (!nero_standing_in_zone_) {
+          RCLCPP_INFO(
+            logger_,
+            "[NERO_IX] standstill_rejudge lane %ld: ego stands %.2f m past the default stop line (zone %.1f m): %s",
+            lane_id_, past, zone_m,
+            is_permanent_go_ ? "permanent GO cleared, every car judged again"
+                             : "no commit while standing, every car judged");
+        }
+        is_permanent_go_ = false;
+        nero_stand_point_ = current_pose.position;
+        nero_defer_commit_standstill = true;
+      } else if (nero_stand_point_ && !is_permanent_go_) {
+        nero_defer_commit_standstill =
+          autoware::motion_utils::calcSignedArcLength(
+            path.points, nero_stand_point_.value(), current_pose.position) < creep_m;
+      }
+      nero_standing_in_zone_ = standing_in_zone;
+    }
+  }
+  const bool nero_was_permanent_go = is_permanent_go_;  // NERO_IX_STANDSTILL_REJUDGE (the deferred commit below)
   // NERO_IX_CREEP_COMMIT_M=<m> (session 4): while a creeper is being treated as yielding (NERO_IX_CREEP, within the
   // last second), ego does not commit (permanent GO) until it is <m> past the default stop line: during the slow
   // launch the module keeps checking every cycle, so a creeper that goes the moment ego goes stops ego at 1-3 km/h
@@ -1549,6 +1598,19 @@ IntersectionModule::PassJudgeStatus IntersectionModule::isOverPassJudgeLinesStat
     // - previously unsafe
     // ==========================================================================================
     is_permanent_go_ = true;
+  }
+  // NERO_IX_STANDSTILL_REJUDGE: after a standstill in the zone the commit waits until ego has crept creep_m from there
+  if (is_permanent_go_ && !nero_was_permanent_go && nero_stand_point_) {
+    if (nero_defer_commit_standstill) {
+      is_permanent_go_ = false;
+    } else {
+      RCLCPP_INFO(
+        logger_,
+        "[NERO_IX] standstill_rejudge lane %ld: commit %.2f m past the default stop line, %.2f m from the standstill",
+        lane_id_, autoware::motion_utils::calcSignedArcLength(path.points, default_stopline_idx, closest_idx),
+        autoware::motion_utils::calcSignedArcLength(
+          path.points, nero_stand_point_.value(), current_pose.position));
+    }
   }
   return {
     is_over_1st_pass_judge_line, is_over_2nd_pass_judge_line,

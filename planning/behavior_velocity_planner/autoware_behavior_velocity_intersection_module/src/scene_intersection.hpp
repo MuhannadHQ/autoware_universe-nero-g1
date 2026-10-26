@@ -433,6 +433,12 @@ private:
   //! if true, this module never commands to STOP anymore
   bool is_permanent_go_{false};
 
+  //! NERO_IX_STANDSTILL_REJUDGE: where ego last stood still within the re-judge zone past the default stop line (the
+  //! commit then waits until ego has crept the creep distance from there)
+  std::optional<geometry_msgs::msg::Point> nero_stand_point_{std::nullopt};
+  //! NERO_IX_STANDSTILL_REJUDGE: ego stands in the zone this cycle (log on change only)
+  bool nero_standing_in_zone_{false};
+
   //! for checking if ego is over the pass judge lines because previously the situation was SAFE
   DecisionResult prev_decision_result_{InternalError{""}};
 

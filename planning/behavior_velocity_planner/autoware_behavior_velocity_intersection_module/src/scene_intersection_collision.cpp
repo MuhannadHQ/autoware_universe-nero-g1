@@ -2211,6 +2211,30 @@ IntersectionModule::TimeDistanceArray IntersectionModule::calcIntersectionPassin
   if (!assigned_lane_found) {
     return {{0.0, 0.0}};  // has already passed the intersection.
   }
+  // NERO_IX_STANDSTILL_REJUDGE (overrunyield, 2026-10-26): a standing ego past its first attention stop line (after a
+  // stop-line overrun) has the path points behind it set to its own speed, 0, above; those are not a stop line of an
+  // upstream module, but they were taken as one, so ego was predicted to crawl through the intersection at
+  // minimum_upstream_velocity (0.7 m/s: 5.7 m in 9 s instead of ~5 s) and a car 30 m away held it for 11 s where a
+  // robot standing at its line goes at once. With the switch the search starts at ego, as it does for an ego before
+  // that line (the only case that changes: standing past it, which upstream never re-judges).
+  {
+    static const bool nero_sr = [] {
+      const char * e = std::getenv("NERO_IX_STANDSTILL_REJUDGE");
+      return e != nullptr && std::atof(e) > 0.0;
+    }();
+    if (nero_sr && upstream_stopline && upstream_stopline.value() < closest_idx) {
+      upstream_stopline = std::nullopt;
+      for (size_t i = std::max(closest_idx, last_intersection_stopline_candidate_idx + 1);
+           i < reference_path.points.size(); ++i) {
+        if (
+          std::fabs(reference_path.points.at(i).point.longitudinal_velocity_mps) <
+          std::numeric_limits<double>::epsilon()) {
+          upstream_stopline = i;
+          break;
+        }
+      }
+    }
+  }
 
   // apply smoother to reference velocity
   // NERO: with NERO_IX_EGO_ACC=<a> the smoother is skipped and ego is modelled as accelerating from its
