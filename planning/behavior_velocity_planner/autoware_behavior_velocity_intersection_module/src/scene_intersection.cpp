@@ -1469,6 +1469,9 @@ IntersectionModule::PassJudgeStatus IntersectionModule::isOverPassJudgeLinesStat
 
   const bool is_over_1st_pass_judge_line =
     util::isOverTargetIndex(path, closest_idx, current_pose, pass_judge_line_idx);
+  nero_over_1st_pass_judge_ = is_over_1st_pass_judge_line;  // NERO_IX_PRIORITY_FROM_SIGNS
+  nero_dist_to_1st_pass_judge_ = autoware::motion_utils::calcSignedArcLength(
+    path.points, current_pose.position, pass_judge_line_idx);  // NERO_IX_PRIORITY_CAN_STOP
   bool safely_passed_1st_judge_line_first_time = false;
   if (is_over_1st_pass_judge_line && was_safe && !safely_passed_1st_judge_line_time_) {
     safely_passed_1st_judge_line_time_ = std::make_pair(clock_->now(), current_pose);
@@ -1519,9 +1522,13 @@ IntersectionModule::PassJudgeStatus IntersectionModule::isOverPassJudgeLinesStat
       autoware::motion_utils::calcSignedArcLength(path.points, default_stopline_idx, closest_idx);
     return past < d;
   }();
+  // NERO_IX_PRIORITY_FROM_SIGNS: while a car that has to yield to ego (and has not committed) is near (exempted within
+  // the last second), ego does not commit either, so one that turns across after all is still checked and stops ego
+  const bool nero_defer_commit_priority =
+    !is_permanent_go_ && nero_creep_steady_now() - nero_priority_last_yield_ < 1.0;
   if (
     (over_default_stopline_for_pass_judge && over_pass_judge_line_overall && was_safe &&
-     !nero_defer_commit) ||
+     !nero_defer_commit && !nero_defer_commit_priority) ||
     is_permanent_go_) {
     // ==========================================================================================
     // this body is active if ego is
