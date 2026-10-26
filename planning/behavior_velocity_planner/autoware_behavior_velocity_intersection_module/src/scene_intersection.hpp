@@ -478,59 +478,6 @@ private:
 
   //! Nero c3 (wrong_way_watch): stop point latched when the wrong-way stop was first decided
   std::optional<geometry_msgs::msg::Point> wrong_way_stop_point_{std::nullopt};
-
-  //! NERO_IX_PRIORITY_FROM_SIGNS (T junctions, 2026-10-23): lanes around a straight assigned lanelet that has
-  //! no traffic light and no stop line / stop sign of its own, classified by the map's stop lines. Built once;
-  //! empty = this intersection is not in scope.
-  struct NeroPriorityLane
-  {
-    enum class Kind {
-      NORMAL,               // conflicting lane without a stop line: watched as upstream
-      YIELD_MINOR,          // conflicting lane with a stop line, entered from a minor road: watched as upstream
-      YIELD_PRIORITY_ROAD,  // conflicting turn with a stop line off the priority road (oncoming left turn)
-      PARALLEL,             // conflicting lane heading against ego that does not cross ego's centre line
-      APPROACH_PRIORITY,    // upstream lane whose traffic may go on without crossing ego, else only into
-                            // YIELD_* / PARALLEL lanes (the oncoming lane of the priority road)
-      APPROACH_OTHER,       // any other upstream lane of the attention area: watched as upstream
-      SIBLING               // non-conflicting continuation (the straight on) next to a YIELD_PRIORITY_ROAD
-    };
-    lanelet::ConstLanelet lanelet;
-    Kind kind{Kind::NORMAL};
-    double stop_s{0.0};  //! YIELD_*: arc length of its stop line on the lanelet
-    double v_turn_max{0.0};  //! YIELD_PRIORITY_ROAD: fastest speed at which the turn can be taken (6 m/s2 sideways)
-    //! APPROACH_PRIORITY: (index of a YIELD_PRIORITY_ROAD lane ahead, distance from this lane's end to its stop line)
-    std::vector<std::pair<size_t, double>> to_line;
-  };
-  std::optional<std::vector<NeroPriorityLane>> nero_priority_lanes_{std::nullopt};
-  //! uuidKey() of attention objects treated as yielding to ego this cycle (NERO_IX_PRIORITY_FROM_SIGNS)
-  std::set<std::string> nero_priority_yield_uuids_;
-  //! potential violators this cycle: uuidKey() -> the turns (indices into nero_priority_lanes_) they could still take
-  //! without being able to stop at their stop line; checked on those turn paths until ego passes its pass judge line
-  std::map<std::string, std::vector<size_t>> nero_priority_pv_;
-  //! steady time of the last such exemption: ego does not commit (permanent GO) while one is near
-  double nero_priority_last_yield_{-1e9};
-  //! ego is over the 1st pass judge line (set by isOverPassJudgeLinesStatus, read by the collision check)
-  bool nero_over_1st_pass_judge_{false};
-  //! NERO_IX_PRIORITY_CAN_STOP (2026-10-24): ego's distance to its 1st pass judge line (negative past it; set by
-  //! isOverPassJudgeLinesStatus, read in the next cycle's verdicts)
-  double nero_dist_to_1st_pass_judge_{0.0};
-  //! NERO_IX_PRIORITY_CAN_STOP: speed history of the cars that get a priority verdict, uuidKey() -> (objects stamp, v)
-  std::map<std::string, std::vector<std::pair<double, double>>> nero_priority_v_hist_;
-  //! NERO_IX_PRIORITY_CAN_STOP: observed deceleration (> 0 slowing) of the car being judged (read by the verdict)
-  double nero_priority_a_obs_{0.0};
-  //! NERO_IX_PRIORITY_CAN_STOP: its acceleration since it left standstill (0 if it did not stand in the last 1.5 s)
-  double nero_priority_a_launch_{0.0};
-  //! NERO_IX_PRIORITY_CAN_STOP: cars seen braking (on at >= 1 m/s2, off below 0.5 m/s2); the judged car is one of them
-  std::set<std::string> nero_priority_braking_;
-  bool nero_priority_braking_now_{false};
-  //! NERO_IX_PRIORITY_CAN_STOP: potential violators braking harder than a car that yields (> 3 m/s2 needed, braking
-  //! >= 3 m/s2) or speeding up toward their line: checked on their turn paths also after ego passed its 1st pass
-  //! judge line (set by the verdict)
-  std::set<std::string> nero_priority_pv_late_;
-  mutable bool nero_priority_hard_{false};
-  //! NERO_IX_PRIORITY_DEBUG (log only): the last verdict's numbers, uuidKey() -> text
-  mutable std::string nero_priority_dbg_;
-  std::map<std::string, std::string> nero_priority_dbg_text_;
   /** @} */
 
 private:
@@ -868,23 +815,6 @@ private:
   std::optional<size_t> findWrongWayWatchStopIndex(
     const autoware_internal_planning_msgs::msg::PathWithLaneId & path,
     const PathLanelets & path_lanelets, const size_t closest_idx);
-
-  /**
-   * @brief NERO_IX_PRIORITY_FROM_SIGNS: fill nero_priority_lanes_ (empty if not in scope)
-   * @attention this function has access to value() of intersection_lanelets_
-   */
-  void neroBuildPriorityLanes();
-
-  /**
-   * @brief NERO_IX_PRIORITY_FROM_SIGNS: 0 = watched as upstream; 1 = yielding (on a lane whose traffic must yield
-   * to ego or does not cross ego, heading the lane's way, not turning off it, not past the stop line of its turn
-   * unless driving on along the straight-on lane); 2 = potential violator (yielding so far, but too fast to stop
-   * at the stop line of a turn it could still take: those turns go to *pv_turns)
-   */
-  int neroPriorityVerdict(
-    const autoware_perception_msgs::msg::PredictedObject & object,
-    const geometry_msgs::msg::Pose & object_direction, const bool is_parked_vehicle,
-    std::vector<size_t> * pv_turns) const;
 
   /**
    * @brief find the objects on attention_area/intersection_area and update positional information
