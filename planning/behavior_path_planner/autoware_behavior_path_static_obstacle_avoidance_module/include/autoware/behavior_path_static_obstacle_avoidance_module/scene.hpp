@@ -393,11 +393,26 @@ private:
   // structs are shared with avoidance_by_lane_change, so their layout stays stock.
   // ego's predicted motion: from the current speed toward v_hold (decel / accel limited) until s_hold metres along
   // the path, then back up to max_vel; never above max_vel (stock: +0.5 m/s² uncapped)
+  // NERO_SOA_GAP_FAST: what every check of one cycle's gap search shares (none of it depends on the speed tried)
+  struct NeroGapCtx
+  {
+    bool has_left_shift{false};
+    bool has_right_shift{false};
+    std::vector<utils::path_safety_checker::ExtendedPredictedObject> targets;
+    std::vector<std::pair<double, double>> bumps;  // [start, end] arc length from ego
+  };
   std::vector<utils::path_safety_checker::PoseWithVelocityStamped> neroEgoPredictedPath(
-    const ShiftedPath & shifted_path, bool for_front_object, double v_hold, double s_hold) const;
+    const ShiftedPath & shifted_path, bool for_front_object, double v_hold, double s_hold,
+    const std::vector<std::pair<double, double>> * bumps = nullptr) const;
+  // NERO_SOA_BUMP_V: the speed bumps on the path, [start, end] arc length from ego
+  std::vector<std::pair<double, double>> neroBumpsOnPath(const ShiftedPath & shifted_path) const;
+  // NERO_SOA_GAP_FAST: the lowest speed neroEgoPredictedPath's braking toward v_hold reaches before s_hold
+  double neroGapFloor(
+    const ShiftedPath & shifted_path, double s_hold, const std::vector<std::pair<double, double>> & bumps) const;
   // the stock collision test of isSafePath with that prediction, no hysteresis counters touched
   bool neroIsSafeRaw(
-    const ShiftedPath & shifted_path, double v_hold, double s_hold, DebugData & debug) const;
+    const ShiftedPath & shifted_path, double v_hold, double s_hold, DebugData & debug,
+    const NeroGapCtx * ctx = nullptr) const;
   // distance from ego to where the candidate path starts to move sideways (< 0: already moving / no shift)
   double neroShiftStartDistance(const ShiftedPath & shifted_path) const;
   // gap timing: when the move is unsafe at the current speed, the highest approach speed at which it is safe
@@ -489,7 +504,9 @@ private:
 
   // ---- nero (2026-10-25, passstart job): an object ahead makes the pass unsafe in the last metres before the shift
   // starts (scene.cpp, NERO_SOA_ONCOMING_START_YIELD). The unsafe object ahead in this cycle's safety check, or "".
-  std::string neroStartYieldObject() const;
+  std::string neroStartYieldObject(bool front, bool rear) const;
+  // NERO_SOA_RETURN_AWAY: the new shift lines only return ego toward its lane centre, away from every unsafe object
+  bool neroReturnAwayOnly(const AvoidancePlanningData & data) const;
 
   auto getTurnSignal(const ShiftedPath & spline_shift_path, const ShiftedPath & linear_shift_path)
     -> TurnSignalInfo;

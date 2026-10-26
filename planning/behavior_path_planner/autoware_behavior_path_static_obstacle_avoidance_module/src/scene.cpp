@@ -120,6 +120,8 @@ struct Env
   int start_safe_cycles{0};
   double still_sharp_s{0.0};
   double bump_v{0.0};
+  bool gap_fast{false};
+  bool return_away{false};
 };
 
 const Env & env()
@@ -153,6 +155,14 @@ const Env & env()
       r.gap_up_cycles = std::max(1, static_cast<int>(up));
       r.gap_safe_cycles = std::max(1, static_cast<int>(sc));
       r.ego_pred = true;
+    }
+    r.gap_fast = on("NERO_SOA_GAP_FAST");
+    if (r.gap_fast) {
+      std::fprintf(stderr, "[NERO_SOA] gap_fast=1\n");
+    }
+    r.return_away = on("NERO_SOA_RETURN_AWAY");
+    if (r.return_away) {
+      std::fprintf(stderr, "[NERO_SOA] return_away=1\n");
     }
     std::fprintf(
       stderr,
@@ -209,6 +219,25 @@ const Env & env()
 //                              0.2 s before the shift start, ego 5 m before the parked car at 0.7 m/s -> contact).
 //                              Ego has not moved sideways, so dropping the shift is no sudden steering. Objects behind
 //                              ego are left to NERO_SOA_HOLD_IN_LANE / NERO_SOA_GAP
+//  NERO_SOA_REAR_START_YIELD=1  (2026-10-26, yieldmrm job) the same yield for an object behind / beside ego (a car
+//                              coming up the lane next to ego, the shift side): stock yields for it when it is seen a
+//                              moment earlier (prepare distance enough), but within the prepare distance it refuses,
+//                              NERO_SOA_HOLD_IN_LANE then holds nothing when the shift stays inside the lane (the stop
+//                              before the line is the path end) and ego moves sideways toward the car (field 10-25
+//                              20:47:50, lanelet 41746: "hold before the line" at 15 km/h, b627 9.4 m behind-left).
+//                              Ego has not moved sideways: it waits in its lane behind the target, as in the stock yield
+//  NERO_SOA_RETURN_AWAY=1      (2026-10-26, yieldmrm job) NERO_SOA_HOLD_IN_LANE's hold lets a return through: while
+//                              ego is shifted and the pass is unsafe only for objects on the side ego is shifted to,
+//                              new shift lines that only bring it back toward its lane centre go ahead (stock overwrites
+//                              the verdict with safe there anyway; the hold kept the return waiting while the car came
+//                              alongside: sim k15c, the car passed 0.23 m from a robot still shifted toward it)
+//  NERO_SOA_GAP_FAST=1         (2026-10-26, yieldmrm job) NERO_SOA_GAP's speed search without the repeated work:
+//                              the safety-check targets and the speed bumps of the cycle once (stock: per speed tried),
+//                              and the descending search stops at the first unsafe speed below the lowest speed ego's
+//                              predicted braking reaches before the shift (every lower speed gives the same predicted
+//                              path, so the same verdict). Same decisions; at 15-20 km/h 4-5 checks instead of up to
+//                              16 per cycle (field 10-25 20:29:20 / 20:47:51: the search ran while the pass was unsafe,
+//                              the trajectory fell under 5 Hz -> MRM; sim at the car's load: 92-105 ms of 100-126)
 //  NERO_SOA_ONCOMING_SIGHT_M=R[,V]  commit check: ego's body leaves its lane only if a car unseen beyond R m, coming
 //                              at V m/s (default 5.56), could not reach ego before its body is back in its lane (the
 //                              pass's remaining length at ego's speed, accelerating at 0.5 m/s2 up to 4.17 m/s); else it
@@ -227,6 +256,7 @@ struct Env
   double sight_v{5.56};
   bool corridor{false};
   bool start_yield{false};
+  bool rear_start_yield{false};
 };
 
 const Env & env()
@@ -244,6 +274,7 @@ const Env & env()
     }
     if (const char * v = std::getenv("NERO_SOA_ONCOMING_CORRIDOR"); v) r.corridor = std::atoi(v) > 0;
     if (const char * v = std::getenv("NERO_SOA_ONCOMING_START_YIELD"); v) r.start_yield = std::atoi(v) > 0;
+    if (const char * v = std::getenv("NERO_SOA_REAR_START_YIELD"); v) r.rear_start_yield = std::atoi(v) > 0;
     if (const char * v = std::getenv("NERO_SOA_ONCOMING_SIGHT_M"); v && *v && std::string(v) != "0") {
       double m = -1.0, vv = 5.56;
       std::sscanf(v, "%lf,%lf", &m, &vv);
@@ -256,6 +287,9 @@ const Env & env()
       "sight_m=%.1f (unseen car %.2f m/s) start_yield=%d\n",
       r.debug, r.pause_margin, r.committed, r.driver_reaction_s, r.driver_decel, r.corridor, r.sight_m, r.sight_v,
       r.start_yield);
+    if (r.rear_start_yield) {
+      std::fprintf(stderr, "[NERO_SOA_OVL] rear_start_yield=1\n");
+    }
     return r;
   }();
   return e;
@@ -671,7 +705,9 @@ bool StaticObstacleAvoidanceModule::canYieldManeuver(const AvoidancePlanningData
     if (!helper_->isEnoughPrepareDistance(prepare_distance)) {
       // NERO_SOA_ONCOMING_START_YIELD: ego has not moved sideways yet (isShifted() above), so dropping the shift is no
       // sudden steering: an object ahead that makes the pass unsafe is waited for in the lane
-      const auto who = nero_ovl::env().start_yield ? neroStartYieldObject() : std::string{};
+      const auto who = nero_ovl::env().start_yield || nero_ovl::env().rear_start_yield
+                         ? neroStartYieldObject(nero_ovl::env().start_yield, nero_ovl::env().rear_start_yield)
+                         : std::string{};
       if (who.empty()) {
         if (nero_ovl::env().debug) {  // NERO_SOA_ONCOMING_DEBUG (log only)
           RCLCPP_INFO_THROTTLE(
@@ -978,6 +1014,15 @@ void StaticObstacleAvoidanceModule::fillEgoStatus(
       nero_hold_now_ = nero_slow;
       data.yield_required = false;
       data.safe_shift_line = data.new_shift_line;
+      if (nero_soa::env().return_away && neroReturnAwayOnly(data)) {
+        // NERO_SOA_RETURN_AWAY: back toward the lane centre, away from the car that makes the pass unsafe
+        nero_hold_now_ = false;
+        data.safe = true;
+        RCLCPP_WARN_THROTTLE(
+          getLogger(), *clock_, 1000,
+          "[NERO_SOA] unsafe for a car on the side ego is shifted to: the return to the lane centre goes ahead");
+        return;
+      }
       RCLCPP_WARN_THROTTLE(
         getLogger(), *clock_, 1000, "[NERO_SOA] unsafe while still in the lane: hold before the line");
       return;
@@ -1173,18 +1218,62 @@ double StaticObstacleAvoidanceModule::neroBodyOverLaneBound() const
   return std::abs(helper_->getEgoShift()) + 0.5 * planner_data_->parameters.vehicle_width - half;
 }
 
-std::string StaticObstacleAvoidanceModule::neroStartYieldObject() const
+bool StaticObstacleAvoidanceModule::neroReturnAwayOnly(const AvoidancePlanningData & data) const
+{
+  // NERO_SOA_RETURN_AWAY: ego is at its widest (nowhere ahead does the candidate path shift further out than ego is
+  // now: the outward move is over, a hold before a lane line is not skipped), every new line only brings ego back
+  // toward its lane centre (it ends between the centre and ego's shift now), and every object this cycle's safety check
+  // found unsafe is on the side ego is shifted to
+  if (data.new_shift_line.empty()) {
+    return false;
+  }
+  const double ego_shift = helper_->getEgoShift();
+  if (std::abs(ego_shift) <= parameters_->lateral_execution_threshold) {
+    return false;
+  }
+  const double sign = ego_shift > 0.0 ? 1.0 : -1.0;
+  const auto & cp = data.candidate_path;
+  if (!cp.path.points.empty() && cp.shift_length.size() == cp.path.points.size()) {
+    for (size_t i = planner_data_->findEgoIndex(cp.path.points); i < cp.shift_length.size(); ++i) {
+      if (sign * cp.shift_length.at(i) > sign * ego_shift + 0.05) {
+        return false;
+      }
+    }
+  }
+  for (const auto & l : data.new_shift_line) {
+    const double end = sign * l.end_shift_length;
+    if (end > sign * ego_shift + 0.05 || end < -0.05) {
+      return false;
+    }
+  }
+  bool any_unsafe = false;
+  for (const auto & [id, c] : debug_data_.collision_check) {
+    if (c.is_safe) {
+      continue;
+    }
+    any_unsafe = true;
+    const double lat =
+      autoware::motion_utils::calcLateralOffset(data.reference_path.points, c.current_obj_pose.position);
+    if (sign * lat <= 0.0) {
+      return false;
+    }
+  }
+  return any_unsafe;
+}
+
+std::string StaticObstacleAvoidanceModule::neroStartYieldObject(const bool front, const bool rear) const
 {
   // this cycle's safety check (isSafePath stops at its first unsafe object)
   for (const auto & [id, c] : debug_data_.collision_check) {
-    if (c.is_safe || !c.is_front) {
+    if (c.is_safe || (c.is_front && !front) || (!c.is_front && !rear)) {
       continue;
     }
     const auto & q = c.current_obj_pose.position;
     const auto & e = getEgoPosition();
     char buf[96];
     std::snprintf(
-      buf, sizeof(buf), "object %.1f m ahead (%.1f m/s, %s)", std::hypot(q.x - e.x, q.y - e.y),
+      buf, sizeof(buf), "object %.1f m %s (%.1f m/s, %s)", std::hypot(q.x - e.x, q.y - e.y),
+      c.is_front ? "ahead" : "behind",
       std::hypot(c.current_twist.linear.x, c.current_twist.linear.y), c.unsafe_reason.c_str());
     return buf;
   }
@@ -1936,28 +2025,18 @@ bool StaticObstacleAvoidanceModule::isSafePath(
   return safe_ || safe_count_ > parameters_->hysteresis_factor_safe_count;
 }
 
-std::vector<utils::path_safety_checker::PoseWithVelocityStamped>
-StaticObstacleAvoidanceModule::neroEgoPredictedPath(
-  const ShiftedPath & shifted_path, const bool for_front_object, const double v_hold,
-  const double s_hold) const
+std::vector<std::pair<double, double>> StaticObstacleAvoidanceModule::neroBumpsOnPath(
+  const ShiftedPath & shifted_path) const
 {
-  std::vector<utils::path_safety_checker::PoseWithVelocityStamped> out;
   const auto & points = shifted_path.path.points;
+  std::vector<std::pair<double, double>> bumps;  // [start, end] arc length from ego
   if (points.empty()) {
-    return out;
+    return bumps;
   }
-  const auto & pp = parameters_->ego_predicted_path_params;
-  const double horizon =
-    for_front_object ? pp.time_horizon_for_front_object : pp.time_horizon_for_rear_object;
-  const double dt = std::max(0.1, pp.time_resolution);
-  const double v_cap = planner_data_->parameters.max_vel;
-  const double a_acc = std::max(0.1, pp.acceleration);
-  const double a_dec = nero_soa::env().gap_a_dec;
   const double s0 = autoware::motion_utils::calcSignedArcLength(points, 0, getEgoPosition());
   // speed bumps on the path (the vehicle crosses them at ~1 m/s, behavior_velocity_planner's speed_bump): ego is
   // predicted that slow there and braking toward it — a move that ends on a bump keeps ego beside the line longer
   // (av_x_two_field:1: back over the bump at 2.4 km/h while straddling, the car behind braked 7 m/s²)
-  std::vector<std::pair<double, double>> bumps;  // [start, end] arc length from ego
   if (nero_soa::env().bump_v > 0.0) {
     std::set<lanelet::Id> seen_ids;
     for (const auto & pt : points) {
@@ -1985,6 +2064,33 @@ StaticObstacleAvoidanceModule::neroEgoPredictedPath(
       }
     }
   }
+  return bumps;
+}
+
+std::vector<utils::path_safety_checker::PoseWithVelocityStamped>
+StaticObstacleAvoidanceModule::neroEgoPredictedPath(
+  const ShiftedPath & shifted_path, const bool for_front_object, const double v_hold,
+  const double s_hold, const std::vector<std::pair<double, double>> * bumps_in) const
+{
+  std::vector<utils::path_safety_checker::PoseWithVelocityStamped> out;
+  const auto & points = shifted_path.path.points;
+  if (points.empty()) {
+    return out;
+  }
+  const auto & pp = parameters_->ego_predicted_path_params;
+  const double horizon =
+    for_front_object ? pp.time_horizon_for_front_object : pp.time_horizon_for_rear_object;
+  const double dt = std::max(0.1, pp.time_resolution);
+  const double v_cap = planner_data_->parameters.max_vel;
+  const double a_acc = std::max(0.1, pp.acceleration);
+  const double a_dec = nero_soa::env().gap_a_dec;
+  const double s0 = autoware::motion_utils::calcSignedArcLength(points, 0, getEgoPosition());
+  // NERO_SOA_GAP_FAST: the caller's bumps (the same path within one cycle)
+  std::vector<std::pair<double, double>> own_bumps;
+  if (!bumps_in) {
+    own_bumps = neroBumpsOnPath(shifted_path);
+  }
+  const auto & bumps = bumps_in ? *bumps_in : own_bumps;
   const auto bump_cap = [&](const double sq) {
     double c = std::numeric_limits<double>::max();
     for (const auto & [lo, hi] : bumps) {
@@ -2012,28 +2118,39 @@ StaticObstacleAvoidanceModule::neroEgoPredictedPath(
 }
 
 bool StaticObstacleAvoidanceModule::neroIsSafeRaw(
-  const ShiftedPath & shifted_path, const double v_hold, const double s_hold, DebugData & debug) const
+  const ShiftedPath & shifted_path, const double v_hold, const double s_hold, DebugData & debug,
+  const NeroGapCtx * ctx) const
 {
   const auto & p = planner_data_->parameters;
-  const auto ego_idx = planner_data_->findEgoIndex(shifted_path.path.points);
   bool has_left_shift = false;
   bool has_right_shift = false;
-  for (size_t i = ego_idx; i < shifted_path.shift_length.size(); i++) {
-    const auto length = shifted_path.shift_length.at(i);
-    has_left_shift |= parameters_->lateral_execution_threshold < length;
-    has_right_shift |= parameters_->lateral_execution_threshold < -1.0 * length;
+  if (ctx) {  // NERO_SOA_GAP_FAST: shift sides, targets and bumps of this cycle's candidate path, computed once
+    has_left_shift = ctx->has_left_shift;
+    has_right_shift = ctx->has_right_shift;
+  } else {
+    const auto ego_idx = planner_data_->findEgoIndex(shifted_path.path.points);
+    for (size_t i = ego_idx; i < shifted_path.shift_length.size(); i++) {
+      const auto length = shifted_path.shift_length.at(i);
+      has_left_shift |= parameters_->lateral_execution_threshold < length;
+      has_right_shift |= parameters_->lateral_execution_threshold < -1.0 * length;
+    }
   }
   if (!has_left_shift && !has_right_shift) {
     return true;
   }
   const auto hysteresis_factor = safe_ ? 1.0 : parameters_->hysteresis_factor_expand_rate;
-  const auto targets = utils::static_obstacle_avoidance::getSafetyCheckTargetObjects(
-    avoid_data_, planner_data_, parameters_, has_left_shift, has_right_shift, debug);
+  std::vector<utils::path_safety_checker::ExtendedPredictedObject> own_targets;
+  if (!ctx) {
+    own_targets = utils::static_obstacle_avoidance::getSafetyCheckTargetObjects(
+      avoid_data_, planner_data_, parameters_, has_left_shift, has_right_shift, debug);
+  }
+  const auto & targets = ctx ? ctx->targets : own_targets;
   if (targets.empty()) {
     return true;
   }
-  const auto ego_front = neroEgoPredictedPath(shifted_path, true, v_hold, s_hold);
-  const auto ego_rear = neroEgoPredictedPath(shifted_path, false, v_hold, s_hold);
+  const auto * bumps = ctx ? &ctx->bumps : nullptr;
+  const auto ego_front = neroEgoPredictedPath(shifted_path, true, v_hold, s_hold, bumps);
+  const auto ego_rear = neroEgoPredictedPath(shifted_path, false, v_hold, s_hold, bumps);
   for (const auto & object : targets) {
     auto dbg = utils::path_safety_checker::createObjectDebug(object);
     const auto obj_polygon = autoware_utils::to_polygon2d(object.initial_pose, object.shape);
@@ -2056,6 +2173,47 @@ bool StaticObstacleAvoidanceModule::neroIsSafeRaw(
     }
   }
   return true;
+}
+
+double StaticObstacleAvoidanceModule::neroGapFloor(
+  const ShiftedPath & shifted_path, const double s_hold,
+  const std::vector<std::pair<double, double>> & bumps) const
+{
+  // NERO_SOA_GAP_FAST: neroEgoPredictedPath brakes toward v_hold at a_dec while s < s_hold. A v_hold below every speed
+  // this braking (with the bump caps) reaches before s_hold is never reached there: the braking never stops at it, the
+  // predicted path is the same for every such v_hold, and so is the verdict. The lowest of those speeds = the floor
+  // (the longer of the two horizons: the front object's path is a prefix of it)
+  const auto & points = shifted_path.path.points;
+  if (points.empty()) {
+    return 0.0;
+  }
+  const auto & pp = parameters_->ego_predicted_path_params;
+  const double horizon = std::max(pp.time_horizon_for_front_object, pp.time_horizon_for_rear_object);
+  const double dt = std::max(0.1, pp.time_resolution);
+  const double a_dec = nero_soa::env().gap_a_dec;
+  const double vb = nero_soa::env().bump_v;
+  const auto bump_cap = [&](const double sq) {  // as in neroEgoPredictedPath
+    double c = std::numeric_limits<double>::max();
+    for (const auto & [lo, hi] : bumps) {
+      if (sq >= lo && sq <= hi) {
+        c = std::min(c, vb);
+      } else if (sq < lo) {
+        c = std::min(c, std::sqrt(vb * vb + 2.0 * 0.8 * (lo - sq)));
+      }
+    }
+    return c;
+  };
+  double v = getEgoSpeed();
+  double s = 0.0;
+  double floor_v = v;
+  for (double t = 0.0; t < horizon && s < s_hold; t += dt) {
+    double v_next = std::max(0.0, v - a_dec * dt);
+    v_next = std::min(v_next, std::max(bump_cap(s), 0.0));
+    floor_v = std::min(floor_v, v_next);
+    s += 0.5 * (v + v_next) * dt;
+    v = v_next;
+  }
+  return floor_v;
 }
 
 double StaticObstacleAvoidanceModule::neroShiftStartDistance(const ShiftedPath & shifted_path) const
@@ -2124,10 +2282,30 @@ void StaticObstacleAvoidanceModule::neroGapTiming(
     nero_cruise_safe_n_ = 0;
   }
   DebugData tmp;
-  if (nero_gap_v_ >= 0.0 && neroIsSafeRaw(data.candidate_path, nero_gap_v_, s_hold, tmp)) {
+  // NERO_SOA_GAP_FAST: what every check below shares, once (none of it depends on the speed tried)
+  std::optional<NeroGapCtx> ctx;
+  double floor_v = -1.0;
+  if (E.gap_fast) {
+    const auto & sp = data.candidate_path;
+    ctx.emplace();
+    const auto ego_idx = planner_data_->findEgoIndex(sp.path.points);
+    for (size_t i = ego_idx; i < sp.shift_length.size(); i++) {
+      const auto length = sp.shift_length.at(i);
+      ctx->has_left_shift |= parameters_->lateral_execution_threshold < length;
+      ctx->has_right_shift |= parameters_->lateral_execution_threshold < -1.0 * length;
+    }
+    if (ctx->has_left_shift || ctx->has_right_shift) {
+      ctx->targets = utils::static_obstacle_avoidance::getSafetyCheckTargetObjects(
+        avoid_data_, planner_data_, parameters_, ctx->has_left_shift, ctx->has_right_shift, tmp);
+    }
+    ctx->bumps = neroBumpsOnPath(sp);
+    floor_v = neroGapFloor(sp, s_hold, ctx->bumps);
+  }
+  const NeroGapCtx * c = ctx ? &ctx.value() : nullptr;
+  if (nero_gap_v_ >= 0.0 && neroIsSafeRaw(data.candidate_path, nero_gap_v_, s_hold, tmp, c)) {
     // the plan still works; one step up after up_cycles cycles in which that step also worked
     const double up = std::min(v_cap, nero_gap_v_ + E.gap_dv);
-    if (up > nero_gap_v_ + 1e-3 && neroIsSafeRaw(data.candidate_path, up, s_hold, tmp)) {
+    if (up > nero_gap_v_ + 1e-3 && neroIsSafeRaw(data.candidate_path, up, s_hold, tmp, c)) {
       if (++nero_gap_up_n_ >= E.gap_up_cycles) {
         nero_gap_v_ = up;
         nero_gap_up_n_ = 0;
@@ -2142,9 +2320,12 @@ void StaticObstacleAvoidanceModule::neroGapTiming(
       (nero_gap_v_ >= 0.0 ? nero_gap_v_ : std::min(v_ego, v_cap)) - E.gap_dv;
     for (double v = start; v > E.gap_v_min - E.gap_dv + 1e-6; v -= E.gap_dv) {
       const double vv = std::max(v, E.gap_v_min);
-      if (neroIsSafeRaw(data.candidate_path, vv, s_hold, tmp)) {
+      if (neroIsSafeRaw(data.candidate_path, vv, s_hold, tmp, c)) {
         found = vv;
         break;
+      }
+      if (c && vv < floor_v - 1e-9) {
+        break;  // NERO_SOA_GAP_FAST: every lower speed gives this same predicted path (below the floor): unsafe too
       }
     }
     if (found < 0.0) {
