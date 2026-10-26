@@ -23,6 +23,8 @@
 #include <tf2/LinearMath/Transform.h>
 #include <tf2/utils.h>
 
+#include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <memory>
 #include <queue>
@@ -40,6 +42,65 @@
 namespace autoware::freespace_planning_algorithms
 {
 using autoware_utils::calc_distance2d;
+
+namespace
+{
+// NERO_FREESPACE_MIN_SEGMENT=<fwd>,<rev>[,<extra>,<penalty>] (nero, parkfix 2026-10-25; Apollo hybrid A*'s
+// traj_expected_shortest_length / traj_short_length_penalty): a segment the controller cannot start is not planned.
+// A standing vehicle starts a forward segment only with its stop point more than ~1 m ahead (mpc_lateral_controller's
+// stopped state, upstream #9690, holds the PID in STOPPED) and any segment only beyond 0.5 m (pid
+// drive_state_stop_dist, velocity smoother stop_dist_to_prohibit_engage). With this robot every A* step is 0.5 m
+// (wheelbase 0.85: max expansion < min expansion) and the direction change cost barely depends on the length, so a
+// 0.5 m first move was planned (car 2026-10-25 12:58:13: it stood 18 s with a plan that said move). The first segment
+// from the start: forward >= <fwd>, reverse >= <rev> (no direction change before; nor a goal reached by a shorter
+// one). A later segment (the vehicle stops 0.2-0.4 m before a reversing point) shorter than <fwd|rev> + <extra> costs
+// <penalty> more at its direction change. Unset = upstream.
+struct NeroMinSegment
+{
+  bool on = false;
+  double fwd = 1.5;
+  double rev = 1.0;
+  double extra = 0.5;
+  double penalty = 20.0;
+};
+
+const NeroMinSegment & nero_min_segment()
+{
+  static const NeroMinSegment m = [] {
+    NeroMinSegment s;
+    const char * v = std::getenv("NERO_FREESPACE_MIN_SEGMENT");
+    if (!v || !*v) return s;
+    double a[4] = {s.fwd, s.rev, s.extra, s.penalty};
+    int n = std::sscanf(v, "%lf,%lf,%lf,%lf", &a[0], &a[1], &a[2], &a[3]);
+    if (n < 2) return s;
+    s.on = true;
+    s.fwd = std::max(0.0, a[0]);
+    s.rev = std::max(0.0, a[1]);
+    s.extra = std::max(0.0, a[2]);
+    s.penalty = std::max(0.0, a[3]);
+    return s;
+  }();
+  return m;
+}
+
+// no direction change between the start and this node (the start node itself has no direction)
+bool nero_on_first_segment(const AstarNode & node)
+{
+  int depth = 0;
+  for (const AstarNode * n = &node; n->parent != nullptr && depth < 100000; n = n->parent, ++depth) {
+    if (n->parent->parent != nullptr && n->is_back != n->parent->is_back) return false;
+  }
+  return true;
+}
+
+// NERO_FREESPACE_MIN_SEGMENT: the first segment ends here (direction change or goal) shorter than it may be
+bool nero_first_too_short(const AstarNode & node)
+{
+  const auto & m = nero_min_segment();
+  if (!m.on || node.parent == nullptr) return false;
+  return nero_on_first_segment(node) && node.dir_distance < (node.is_back ? m.rev : m.fwd) - 1e-6;
+}
+}  // namespace
 
 double calcReedsSheppDistance(const Pose & p1, const Pose & p2, double radius)
 {
@@ -306,7 +367,8 @@ bool AstarSearch::search()
     if (current_node->status == NodeStatus::Closed) continue;
     current_node->status = NodeStatus::Closed;
 
-    if (isGoal(*current_node)) {
+    // NERO_FREESPACE_MIN_SEGMENT: a goal reached by a first move too short to start is no goal (search on)
+    if (isGoal(*current_node) && (is_backward_search_ || !nero_first_too_short(*current_node))) {
       goal_node_ = current_node;
       setPath(*current_node);
       return true;
@@ -325,6 +387,19 @@ void AstarSearch::expandNodes(AstarNode & current_node, const bool is_back)
   const auto current_pose = node2pose(current_node);
   const double direction = (is_back == is_backward_search_) ? 1.0 : -1.0;
   const double distance = getExpansionDistance(current_node) * direction;
+
+  // NERO_FREESPACE_MIN_SEGMENT: no direction change after a first segment too short to start; a later short one
+  // costs the penalty
+  double nero_short_cost = 0.0;
+  if (
+    nero_min_segment().on && !is_backward_search_ && current_node.parent != nullptr &&
+    is_back != current_node.is_back) {
+    if (nero_first_too_short(current_node)) return;
+    const auto & m = nero_min_segment();
+    if (current_node.dir_distance < (current_node.is_back ? m.rev : m.fwd) + m.extra - 1e-6) {
+      nero_short_cost = m.penalty;
+    }
+  }
   int steering_index = -1 * planner_common_param_.turning_steps;
   for (; steering_index <= planner_common_param_.turning_steps; ++steering_index) {
     // skip expansion back to parent
@@ -374,6 +449,7 @@ void AstarSearch::expandNodes(AstarNode & current_node, const bool is_back)
     move_cost += getObsDistanceCost(next_index, obs_edt);
     move_cost += getLatDistanceCost(next_pose);
     if (is_direction_switch) move_cost += getDirectionChangeCost(current_node.dir_distance);
+    move_cost += nero_short_cost;
 
     double total_cost = move_cost + estimateCost(next_pose, next_index);
     // Compare cost

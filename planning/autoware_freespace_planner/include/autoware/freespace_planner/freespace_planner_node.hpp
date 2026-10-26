@@ -39,6 +39,8 @@
 #include <autoware_vehicle_info_utils/vehicle_info_utils.hpp>
 #include <rclcpp/rclcpp.hpp>
 
+#include <autoware_adapi_v1_msgs/msg/operation_mode_state.hpp>
+#include <autoware_control_msgs/msg/control.hpp>
 #include <autoware_internal_debug_msgs/msg/float64_stamped.hpp>
 #include <autoware_internal_planning_msgs/msg/scenario.hpp>
 #include <autoware_perception_msgs/msg/predicted_objects.hpp>
@@ -138,6 +140,19 @@ private:
   double nero_failed_search_t_ = -1e9;  // NERO_FREESPACE_PREDICTED_HOLD_MOVING: when a full A* search last failed
   bool nero_repark_now_ = false;
   bool nero_repark_back_ = true;
+  // NERO_FREESPACE_STALL_S (nero, parkfix 2026-10-25): created only with the switch set
+  rclcpp::Subscription<autoware_adapi_v1_msgs::msg::OperationModeState>::SharedPtr nero_op_sub_;
+  rclcpp::Subscription<autoware_control_msgs::msg::Control>::SharedPtr nero_cmd_sub_;
+  autoware_adapi_v1_msgs::msg::OperationModeState::ConstSharedPtr nero_op_;
+  autoware_control_msgs::msg::Control::ConstSharedPtr nero_cmd_;
+  double nero_stall_since_ = -1.0;  // standing with a moving partial trajectory since (s)
+  double nero_stall_last_t_ = -1.0;  // when the guard last saw a moving partial trajectory published (s)
+  int nero_stall_recoveries_ = 0;   // since the last move
+  bool nero_lead_in_now_ = false;   // the next plan starts with a straight move the vehicle can start
+  double nero_start_blocked_since_ = -1.0;  // NERO_FREESPACE_START_ESCAPE hold: since when the start is blocked (s)
+  int nero_lead_end_ = -1;          // index in trajectory_ where that straight move ends (-1: none)
+  bool nero_lead_back_ = false;     // its direction
+  int nero_unstartable_replans_ = 0;  // NERO_FREESPACE_MIN_SEGMENT: re-plans for a segment too short to start
 
   std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
   std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
@@ -206,6 +221,19 @@ private:
 
   // NERO_FREESPACE_PREDICTED_HOLD_S: true = do not start the current partial trajectory now
   bool neroPredictedHold();
+  // NERO_FREESPACE_PARKED_BOX: the vehicle's footprint at `pose` lies within the box around `ref` (the planned end)
+  bool neroParkedEnough(const geometry_msgs::msg::Pose & pose, const geometry_msgs::msg::Pose & ref, std::string & why);
+  // NERO_FREESPACE_STALL_S / NERO_FREESPACE_START_ESCAPE: a straight move of `len` from `start` sweeps nothing new: the
+  // real footprint's new area (cell centres) and the margin beyond it (grown half a cell) are free
+  bool neroStraightFree(const geometry_msgs::msg::Pose & start, const bool back, const double len);
+  // NERO_FREESPACE_STALL_S / NERO_FREESPACE_START_ESCAPE: a straight move from `start` the vehicle can start (forward
+  // or reverse) whose swept area beyond the current footprint and end pose are free; false = none
+  bool neroLeadIn(
+    const geometry_msgs::msg::Pose & start, const bool start_blocked,
+    std::vector<autoware::freespace_planning_algorithms::PlannerWaypoint> & lead, std::string & why);
+  // NERO_FREESPACE_STALL_S: standing with a plan that says move -> recover (parked: done; else a lead-in plan);
+  // true = recovered now (the caller publishes a stop this cycle)
+  bool neroStallGuard();
 
   /**
    * @brief Checks if current trajectory is colliding with an object.

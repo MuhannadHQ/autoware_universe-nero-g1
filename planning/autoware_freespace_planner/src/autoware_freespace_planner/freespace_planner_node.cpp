@@ -44,6 +44,7 @@
 #include <array>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <deque>
 #include <memory>
 #include <string>
@@ -286,6 +287,98 @@ double nero_goal_slide_m()
   const char * v = std::getenv("NERO_FREESPACE_GOAL_SLIDE_M");
   return v ? std::clamp(std::atof(v), 0.0, 1.0) : 0.0;
 }
+
+// NERO_FREESPACE_MIN_SEGMENT=<fwd>,<rev>[,<extra>,<penalty>] (nero, parkfix 2026-10-25): A* (its library reads the
+// same switch) plans no first segment the controller cannot start. Here, before a partial trajectory starts from
+// standstill: one too short to start from where the vehicle stands (it stops 0.2-0.4 m before a reversing point) -
+// forward < 1.2 m (mpc_lateral_controller's stopped state looks 1 m ahead), reversing < 0.6 m (the PID's and the
+// velocity smoother's 0.5 m) - is not published: the last one ends the parking when the vehicle is parked
+// (NERO_FREESPACE_PARKED_BOX), any other is planned again from here (then with a straight move it can start first,
+// NERO_FREESPACE_STALL_S's lead-in). Car 2026-10-25: 0.50 m and 1.0 m forward moves, 18 s and 23 s standing. Replaces
+// NERO_FREESPACE_STRAIGHT_FWD_MIN_M's 3 re-plans (A* is deterministic: the same plan 3 times). Unset = upstream.
+bool nero_min_segment_on()
+{
+  static const bool on = [] {
+    const char * v = std::getenv("NERO_FREESPACE_MIN_SEGMENT");
+    return v && *v;
+  }();
+  return on;
+}
+constexpr double kNeroStartFwdM = 1.2;
+constexpr double kNeroStartRevM = 0.6;
+
+// NERO_FREESPACE_STALL_S=<s> (nero, parkfix 2026-10-25): in Parking, standing (autonomous, the controller commanding
+// 0 m/s) for <s> seconds while the planner publishes a partial trajectory that says move always recovers: parked
+// (NERO_FREESPACE_PARKED_BOX) = done; else plan again from here, starting with a straight move the vehicle can start
+// (forward >= 1.5 m or reversing >= 1.0 m, its swept area and end pose free). Holds for traffic, a blocked plan, the
+// operator's stop or a downstream stop (AEB, gate) never count: the planner then publishes a stop, or the controller
+// commands motion. Car 2026-10-25: both stalls ended only when a passing road user forced a re-plan. Unset = upstream.
+double nero_stall_s()
+{
+  static const double s = [] {
+    const char * v = std::getenv("NERO_FREESPACE_STALL_S");
+    return v ? std::clamp(std::atof(v), 0.0, 60.0) : 0.0;
+  }();
+  return s;
+}
+
+// NERO_FREESPACE_PARKED_BOX=<front_m>,<side_m>,<deg> (nero, parkfix 2026-10-25): the vehicle counts as parked when its
+// footprint reaches at most <front_m> further out (or deeper) than at the planned end pose, no corner is more than
+// <side_m> to either side of the planned axis, and it stands within <deg> of the planned heading. NERO_FREESPACE_REPARK_DEG
+// then parks once more only outside this box (car 2026-10-25: 0.34 m short, 0.20 m to the side, 9.4 deg - "this
+// position is good enough" - re-parked at 3 deg and stood 23 s). Unset = NERO_FREESPACE_REPARK_DEG's degrees alone.
+struct NeroBox
+{
+  bool on = false;
+  double front = 0.6;
+  double side = 0.9;
+  double deg = 15.0;
+};
+
+const NeroBox & nero_parked_box()
+{
+  static const NeroBox b = [] {
+    NeroBox r;
+    const char * v = std::getenv("NERO_FREESPACE_PARKED_BOX");
+    if (!v || !*v) return r;
+    double a[3] = {r.front, r.side, r.deg};
+    if (std::sscanf(v, "%lf,%lf,%lf", &a[0], &a[1], &a[2]) < 3) return r;
+    r.on = true;
+    r.front = std::max(0.0, a[0]);
+    r.side = std::max(0.0, a[1]);
+    r.deg = std::clamp(a[2], 0.0, 90.0);
+    return r;
+  }();
+  return b;
+}
+
+// NERO_FREESPACE_START_ESCAPE=1 (nero, parkfix 2026-10-25): a start pose whose footprint + vehicle_shape_margin_m
+// touches an occupied cell (A* "Invalid start or goal pose" every 0.1 s) begins with a straight move away from it the
+// vehicle can start: forward >= 1.5 m or reversing >= 1.0 m whose swept area is free (the real footprint, and the
+// margin ahead of it) and whose end pose is free with the margin; A* plans on from there. Car 2026-10-25 12:23: parked by
+// hand 0.43 m deeper than the spot, its rear 0.28 m from the step / wall behind; it never left. Unset = upstream.
+// NERO_FREESPACE_START_ESCAPE=1,<s> (pull-out e2e 2026-10-25): only once the start has been inside the margin <s>
+// seconds in a row; a shorter block is waited out as upstream does ("Invalid start or goal pose", plan again next
+// cycle). The e2e home run with the field's perception replayed: a blob made the end of the forward swing invalid for
+// ~0.2 s; escaping at once reversed 1.0 m straight and the park ended 10 deg crooked after 3 gear changes. Plain 1 = 0 s.
+bool nero_start_escape()
+{
+  static const bool on = [] {
+    const char * v = std::getenv("NERO_FREESPACE_START_ESCAPE");
+    return v && std::atoi(v) == 1;
+  }();
+  return on;
+}
+
+double nero_start_escape_hold_s()
+{
+  static const double s = [] {
+    const char * v = std::getenv("NERO_FREESPACE_START_ESCAPE");
+    const char * c = v ? std::strchr(v, ',') : nullptr;
+    return c ? std::max(0.0, std::atof(c + 1)) : 0.0;
+  }();
+  return s;
+}
 }  // namespace
 
 FreespacePlannerNode::FreespacePlannerNode(const rclcpp::NodeOptions & node_options)
@@ -330,6 +423,14 @@ FreespacePlannerNode::FreespacePlannerNode(const rclcpp::NodeOptions & node_opti
       [this](const autoware_perception_msgs::msg::PredictedObjects::ConstSharedPtr msg) {
         nero_objects_ = msg;
       });
+  }
+  if (nero_stall_s() > 0.0) {
+    nero_op_sub_ = create_subscription<autoware_adapi_v1_msgs::msg::OperationModeState>(
+      "/system/operation_mode/state", rclcpp::QoS{1},
+      [this](const autoware_adapi_v1_msgs::msg::OperationModeState::ConstSharedPtr msg) { nero_op_ = msg; });
+    nero_cmd_sub_ = create_subscription<autoware_control_msgs::msg::Control>(
+      "/control/trajectory_follower/control_cmd", rclcpp::QoS{1},
+      [this](const autoware_control_msgs::msg::Control::ConstSharedPtr msg) { nero_cmd_ = msg; });
   }
   route_sub_ = create_subscription<LaneletRoute>(
     "~/input/route", rclcpp::QoS{1}.transient_local(),
@@ -415,6 +516,10 @@ bool FreespacePlannerNode::isPlanRequired()
 
 bool FreespacePlannerNode::checkCurrentTrajectoryCollision()
 {
+  // NERO_FREESPACE_MIN_SEGMENT: no partial trajectory (a plan of one point) is no collision; findNearestIndex() would
+  // throw out of the timer and the parking container dies (sim 2026-10-25 182513 -> MRM)
+  if (nero_min_segment_on() && partial_trajectory_.points.empty()) return false;
+
   algo_->setMap(nero_half_cell() ? nero_half_cell_grid(*occupancy_grid_) : *occupancy_grid_);
 
   const size_t nearest_index_partial = autoware::motion_utils::findNearestIndex(
@@ -423,8 +528,26 @@ bool FreespacePlannerNode::checkCurrentTrajectoryCollision()
   const auto forward_trajectory = utils::get_partial_trajectory(
     partial_trajectory_, nearest_index_partial, end_index_partial, get_clock());
 
-  const bool is_obs_found =
-    algo_->hasObstacleOnTrajectory(utils::trajectory_to_pose_array(forward_trajectory));
+  bool is_obs_found = false;
+  const size_t lead_end = nero_lead_end_ < 0 ? 0 : static_cast<size_t>(nero_lead_end_);
+  if (nero_lead_end_ >= 0 && prev_target_index_ + nearest_index_partial <= lead_end) {
+    // NERO_FREESPACE_START_ESCAPE / NERO_FREESPACE_STALL_S: the straight move first is checked as it was planned (what
+    // it moves away from never counts, anything new on its way does); the rest of this partial trajectory as usual
+    const auto & e = trajectory_.points.at(lead_end).pose;
+    const double yaw = tf2::getYaw(current_pose_.pose.orientation);
+    const double left = std::abs(
+      (e.position.x - current_pose_.pose.position.x) * std::cos(yaw) +
+      (e.position.y - current_pose_.pose.position.y) * std::sin(yaw));
+    is_obs_found = !neroStraightFree(current_pose_.pose, nero_lead_back_, left);
+    PoseArray rest;
+    rest.header = forward_trajectory.header;
+    for (size_t k = lead_end + 1; k <= prev_target_index_ + end_index_partial; ++k) {
+      rest.poses.push_back(trajectory_.points.at(k).pose);
+    }
+    if (!is_obs_found && !rest.poses.empty()) is_obs_found = algo_->hasObstacleOnTrajectory(rest);
+  } else {
+    is_obs_found = algo_->hasObstacleOnTrajectory(utils::trajectory_to_pose_array(forward_trajectory));
+  }
 
   if (!is_obs_found) {
     obs_found_time_ = {};
@@ -456,7 +579,15 @@ void FreespacePlannerNode::updateTargetIndex()
       const auto & end_pose = trajectory_.points.back().pose;
       const double dyaw = std::abs(autoware_utils::normalize_radian(
         tf2::getYaw(end_pose.orientation) - tf2::getYaw(current_pose_.pose.orientation)));
-      if (dyaw > nero_repark_deg() * M_PI / 180.0) {
+      // NERO_FREESPACE_PARKED_BOX: once more only when the footprint is outside the box, not for degrees alone
+      std::string box_why;
+      const bool parked = nero_parked_box().on && neroParkedEnough(current_pose_.pose, end_pose, box_why);
+      if (nero_parked_box().on) {
+        RCLCPP_INFO(
+          get_logger(), "[NERO_FREESPACE_PARKED_BOX] finished %.1f deg off the planned heading: %s: %s",
+          dyaw * 180.0 / M_PI, box_why.c_str(), parked ? "parked" : "parking once more");
+      }
+      if (nero_parked_box().on ? !parked : dyaw > nero_repark_deg() * M_PI / 180.0) {
         ++nero_reparks_;
         nero_repark_back_ = trajectory_.points.back().longitudinal_velocity_mps < 0.0;
         RCLCPP_INFO(
@@ -598,6 +729,172 @@ bool FreespacePlannerNode::neroPredictedHold()
   return release();
 }
 
+bool FreespacePlannerNode::neroParkedEnough(
+  const geometry_msgs::msg::Pose & pose, const geometry_msgs::msg::Pose & ref, std::string & why)
+{
+  const auto & b = nero_parked_box();
+  const double front = vehicle_shape_.length - vehicle_shape_.base2back;
+  const double rear = vehicle_shape_.base2back;
+  const double half_w = vehicle_shape_.width / 2.0;
+  const double ryaw = tf2::getYaw(ref.orientation);
+  const double dyaw = autoware_utils::normalize_radian(tf2::getYaw(pose.orientation) - ryaw);
+  // the real footprint's corners in the planned end pose's frame (u along its heading, v to its left)
+  const auto q = nero_quad(pose, front, rear, half_w);
+  double u_max = -1e9, u_min = 1e9, v_abs = 0.0;
+  for (const auto & c : q) {
+    const double dx = c[0] - ref.position.x;
+    const double dy = c[1] - ref.position.y;
+    const double u = std::cos(ryaw) * dx + std::sin(ryaw) * dy;
+    const double v = -std::sin(ryaw) * dx + std::cos(ryaw) * dy;
+    u_max = std::max(u_max, u);
+    u_min = std::min(u_min, u);
+    v_abs = std::max(v_abs, std::abs(v));
+  }
+  const double out = u_max - front;    // > 0: reaches further out than planned
+  const double deep = -rear - u_min;   // > 0: deeper than planned
+  char buf[200];
+  std::snprintf(
+    buf, sizeof(buf), "footprint %.2f m out / %.2f m deep of the planned one, corners within %.2f m of its axis, %.1f deg",
+    out, deep, v_abs, std::abs(dyaw) * 180.0 / M_PI);
+  why = buf;
+  return out <= b.front && deep <= b.front && v_abs <= b.side && std::abs(dyaw) <= b.deg * M_PI / 180.0;
+}
+
+bool FreespacePlannerNode::neroStraightFree(
+  const geometry_msgs::msg::Pose & start, const bool back, const double len)
+{
+  if (!occupancy_grid_) return false;
+  const auto & g = *occupancy_grid_;
+  const double res = g.info.resolution;
+  const int threshold = static_cast<int>(get_parameter("obstacle_threshold").as_int());
+  const double m = node_param_.vehicle_shape_margin_m / 2.0;
+  const double front = vehicle_shape_.length - vehicle_shape_.base2back;
+  const double rear = vehicle_shape_.base2back;
+  const double half_w = vehicle_shape_.width / 2.0;
+  const double yaw = tf2::getYaw(start.orientation);
+  const double c = std::cos(yaw);
+  const double s = std::sin(yaw);
+  const double gyaw = tf2::getYaw(g.info.origin.orientation);
+  const double gc = std::cos(gyaw);
+  const double gs = std::sin(gyaw);
+  // the area the move adds to the footprint (forward: ahead of the front; reversing: behind the rear), for the real
+  // footprint (cell centres inside) and its margin (cells reaching into it); what the start already stands next to
+  // (the wall the vehicle moves away from) is left behind and never counts
+  const double r0 = back ? -rear - len : front;
+  const double r1 = back ? -rear : front + len;
+  const double m0 = back ? -rear - len - m : front;
+  const double m1 = back ? -rear : front + len + m;
+  for (unsigned j = 0; j < g.info.height; ++j) {
+    for (unsigned i = 0; i < g.info.width; ++i) {
+      const int8_t val = g.data[j * g.info.width + i];
+      if (val >= 0 && val < threshold) continue;
+      const double lx = (i + 0.5) * res;
+      const double ly = (j + 0.5) * res;
+      const double x = g.info.origin.position.x + gc * lx - gs * ly - start.position.x;
+      const double y = g.info.origin.position.y + gs * lx + gc * ly - start.position.y;
+      const double u = c * x + s * y;
+      const double v = -s * x + c * y;
+      if (u >= r0 && u <= r1 && std::abs(v) <= half_w) return false;
+      const double h = res / 2.0;
+      if (u >= m0 - h && u <= m1 + h && std::abs(v) <= half_w + m + h) return false;
+    }
+  }
+  return true;
+}
+
+bool FreespacePlannerNode::neroLeadIn(
+  const geometry_msgs::msg::Pose & start, const bool start_blocked,
+  std::vector<autoware::freespace_planning_algorithms::PlannerWaypoint> & lead, std::string & why)
+{
+  lead.clear();
+  if (!occupancy_grid_) return false;
+  const double yaw = tf2::getYaw(start.orientation);
+  const double c = std::cos(yaw);
+  const double s = std::sin(yaw);
+  // forward >= 1.5 m / reversing >= 1.0 m first (MPC 1 m / PID 0.5 m from standstill), longer ones after
+  const std::array<std::pair<bool, double>, 6> cands{
+    {{false, 1.5}, {true, 1.0}, {false, 2.0}, {true, 1.5}, {false, 2.5}, {true, 2.0}}};
+  for (const auto & [back, len] : cands) {
+    if (!neroStraightFree(start, back, len)) {
+      why += std::string(back ? "rev " : "fwd ") + std::to_string(len).substr(0, 3) + " m blocked; ";
+      continue;
+    }
+    geometry_msgs::msg::Pose end = start;
+    const double d = back ? -len : len;
+    end.position.x += c * d;
+    end.position.y += s * d;
+    geometry_msgs::msg::PoseArray a;
+    a.poses.push_back(end);
+    if (algo_->hasObstacleOnTrajectory(a)) {
+      why += std::string(back ? "rev " : "fwd ") + std::to_string(len).substr(0, 3) + " m ends inside the margin; ";
+      continue;
+    }
+    const int n = static_cast<int>(std::ceil(len / 0.25));
+    for (int k = 0; k <= n; ++k) {
+      autoware::freespace_planning_algorithms::PlannerWaypoint wp;
+      wp.pose.header.frame_id = occupancy_grid_->header.frame_id;
+      wp.pose.pose = start;
+      wp.pose.pose.position.x += c * d * k / n;
+      wp.pose.pose.position.y += s * d * k / n;
+      wp.is_back = back;
+      lead.push_back(wp);
+    }
+    why = std::string(back ? "reversing " : "forward ") + std::to_string(len).substr(0, 3) + " m straight" +
+          (start_blocked ? " away from it" : "");
+    return true;
+  }
+  return false;
+}
+
+bool FreespacePlannerNode::neroStallGuard()
+{
+  const double now = get_clock()->now().seconds();
+  // only consecutive cycles of a published moving partial trajectory count (a hold in between restarts the clock)
+  const bool gap = nero_stall_last_t_ < 0.0 || now - nero_stall_last_t_ > 0.5;
+  nero_stall_last_t_ = now;
+  const bool autonomous =
+    nero_op_ && nero_op_->mode == autoware_adapi_v1_msgs::msg::OperationModeState::AUTONOMOUS &&
+    nero_op_->is_autoware_control_enabled;
+  // the controller itself commands 0 m/s (its STOPPED state): a downstream stop (AEB, the gate) leaves it commanding
+  // motion and never counts
+  const bool cmd_zero = nero_cmd_ && std::abs(nero_cmd_->longitudinal.velocity) < 1e-3;
+  const bool stopped = utils::is_stopped(odom_buffer_, node_param_.th_stopped_velocity_mps);
+  const bool standing = autonomous && cmd_zero && stopped;
+  if (gap || !standing) {
+    nero_stall_since_ = standing ? now : -1.0;
+    return false;
+  }
+  if (nero_stall_since_ < 0.0) nero_stall_since_ = now;
+  if (now - nero_stall_since_ < nero_stall_s()) return false;
+  const double stood = now - nero_stall_since_;
+  nero_stall_since_ = -1.0;
+  ++nero_stall_recoveries_;
+  const size_t i0 =
+    autoware::motion_utils::findNearestIndex(partial_trajectory_.points, current_pose_.pose.position);
+  const double len = std::abs(autoware::motion_utils::calcSignedArcLength(
+    partial_trajectory_.points, i0, partial_trajectory_.points.size() - 1));
+  std::string why;
+  if (nero_parked_box().on && neroParkedEnough(current_pose_.pose, trajectory_.points.back().pose, why)) {
+    RCLCPP_INFO(
+      get_logger(), "[NERO_FREESPACE_STALL_S] standing %.1f s with a plan that says move (%.2f m left); %s: parked",
+      stood, len, why.c_str());
+    is_completed_ = true;
+    std_msgs::msg::Bool is_completed_msg;
+    is_completed_msg.data = true;
+    parking_state_pub_->publish(is_completed_msg);
+    return true;
+  }
+  RCLCPP_INFO(
+    get_logger(),
+    "[NERO_FREESPACE_STALL_S] standing %.1f s with a plan that says move (%.2f m left): planning again from here, a "
+    "straight move first (%d)",
+    stood, len, nero_stall_recoveries_);
+  reset();
+  reset_in_progress_ = true;
+  nero_lead_in_now_ = true;
+  return true;
+}
+
 void FreespacePlannerNode::onRoute(const LaneletRoute::ConstSharedPtr msg)
 {
   route_ = msg;
@@ -609,6 +906,10 @@ void FreespacePlannerNode::onRoute(const LaneletRoute::ConstSharedPtr msg)
   nero_reparks_ = 0;
   nero_short_replans_ = 0;
   nero_straight_wait_since_ = -1.0;
+  nero_stall_since_ = -1.0;
+  nero_stall_recoveries_ = 0;
+  nero_unstartable_replans_ = 0;
+  nero_lead_in_now_ = false;
 
   reset();
 }
@@ -723,6 +1024,10 @@ void FreespacePlannerNode::onTimer()
       // Plan new trajectory
       planTrajectory();
       reset_in_progress_ = false;
+      if (is_completed_) {  // NERO_FREESPACE_PARKED_BOX: already parked at the goal
+        trajectory_pub_->publish(utils::create_stop_trajectory(partial_trajectory_));
+        return;
+      }
     } else {
       // Will keep current stop trajectory
       RCLCPP_WARN_THROTTLE(
@@ -752,10 +1057,14 @@ void FreespacePlannerNode::onTimer()
   // shorter than the MPC/PID need, reversing under the velocity smoother's 0.5 m engage distance - is planned again
   // from where the vehicle stands (sim: a 0.5 m reverse after a re-plan round a passing car: the robot stood for
   // good), at most 3 times per goal
+  const bool nero_stopped = utils::is_stopped(odom_buffer_, node_param_.th_stopped_velocity_mps);
+  if (!nero_stopped) {
+    nero_unstartable_replans_ = 0;
+    nero_stall_recoveries_ = 0;
+  }
   if (
-    nero_straight_fwd_min_m() > 0.0 && nero_short_replans_ < 3 && target_index_ + 1 < trajectory_.points.size() &&
-    partial_trajectory_.points.size() > 1 &&
-    utils::is_stopped(odom_buffer_, node_param_.th_stopped_velocity_mps)) {
+    !nero_min_segment_on() && nero_straight_fwd_min_m() > 0.0 && nero_short_replans_ < 3 &&
+    target_index_ + 1 < trajectory_.points.size() && partial_trajectory_.points.size() > 1 && nero_stopped) {
     const size_t i0 =
       autoware::motion_utils::findNearestIndex(partial_trajectory_.points, current_pose_.pose.position);
     const double len = std::abs(autoware::motion_utils::calcSignedArcLength(
@@ -775,12 +1084,56 @@ void FreespacePlannerNode::onTimer()
     }
   }
 
+  // NERO_FREESPACE_MIN_SEGMENT: never publish a move the vehicle cannot start from where it stands (not once the
+  // planner has finished: updateTargetIndex() just completed it)
+  if (nero_min_segment_on() && !is_completed_ && nero_stopped && partial_trajectory_.points.size() > 1) {
+    const size_t i0 =
+      autoware::motion_utils::findNearestIndex(partial_trajectory_.points, current_pose_.pose.position);
+    const double len = std::abs(autoware::motion_utils::calcSignedArcLength(
+      partial_trajectory_.points, i0, partial_trajectory_.points.size() - 1));
+    const bool fwd = partial_trajectory_.points.front().longitudinal_velocity_mps > 0.0;
+    if (len < (fwd ? kNeroStartFwdM : kNeroStartRevM)) {
+      const bool last = target_index_ + 1 >= trajectory_.points.size();
+      std::string why;
+      if (last && nero_parked_box().on && neroParkedEnough(current_pose_.pose, trajectory_.points.back().pose, why)) {
+        RCLCPP_INFO(
+          get_logger(), "[NERO_FREESPACE_MIN_SEGMENT] the last %s segment is %.2f m from here, too short to start; %s: parked",
+          fwd ? "forward" : "reversing", len, why.c_str());
+        is_completed_ = true;
+        std_msgs::msg::Bool is_completed_msg;
+        is_completed_msg.data = true;
+        parking_state_pub_->publish(is_completed_msg);
+        trajectory_pub_->publish(utils::create_stop_trajectory(partial_trajectory_));
+        return;
+      }
+      ++nero_unstartable_replans_;
+      // the 1st time a plain re-plan (A*'s first segment can be started), then with a straight move first
+      nero_lead_in_now_ = nero_unstartable_replans_ > 1;
+      RCLCPP_INFO(
+        get_logger(),
+        "[NERO_FREESPACE_MIN_SEGMENT] the next %s segment is %.2f m from here, too short to start: planning again from "
+        "here%s (%d)",
+        fwd ? "forward" : "reversing", len, nero_lead_in_now_ ? ", a straight move first" : "",
+        nero_unstartable_replans_);
+      trajectory_pub_->publish(utils::create_stop_trajectory(partial_trajectory_));
+      reset();
+      reset_in_progress_ = true;
+      return;
+    }
+  }
+
   if (nero_predicted_hold_s() > 0.0 && neroPredictedHold()) {
     const auto hold = utils::create_stop_trajectory(partial_trajectory_);
     trajectory_pub_->publish(hold);
     debug_pose_array_pub_->publish(utils::trajectory_to_pose_array(trajectory_));
     debug_partial_pose_array_pub_->publish(utils::trajectory_to_pose_array(hold));
     is_new_parking_cycle_ = false;
+    return;
+  }
+
+  // NERO_FREESPACE_STALL_S: standing too long with this plan -> recovered (done or planning again): stop for now
+  if (nero_stall_s() > 0.0 && !is_completed_ && neroStallGuard()) {
+    trajectory_pub_->publish(utils::create_stop_trajectory(partial_trajectory_));
     return;
   }
 
@@ -870,6 +1223,67 @@ void FreespacePlannerNode::planTrajectory()
     }
   }
 
+  // NERO_FREESPACE_PARKED_BOX: a vehicle already standing parked at the goal (a route sent again at home) is done
+  if (nero_parked_box().on && !nero_repark_now_) {
+    std::string why;
+    if (neroParkedEnough(current_pose_.pose, goal_pose_.pose, why)) {
+      RCLCPP_INFO(get_logger(), "[NERO_FREESPACE_PARKED_BOX] already parked at the goal (%s): done", why.c_str());
+      trajectory_ = utils::create_stop_trajectory(current_pose_, get_clock());
+      partial_trajectory_ = trajectory_;
+      reversing_indices_.clear();
+      prev_target_index_ = 0;
+      target_index_ = trajectory_.points.size() - 1;
+      is_completed_ = true;
+      std_msgs::msg::Bool is_completed_msg;
+      is_completed_msg.data = true;
+      parking_state_pub_->publish(is_completed_msg);
+      return;
+    }
+  }
+
+  // NERO_FREESPACE_START_ESCAPE (a start inside the margin) / NERO_FREESPACE_STALL_S, NERO_FREESPACE_MIN_SEGMENT (stood
+  // with a plan that says move): begin with a straight move the vehicle can start; A* plans on from its end
+  std::vector<autoware::freespace_planning_algorithms::PlannerWaypoint> nero_lead;
+  auto plan_start = current_pose_in_costmap_frame;
+  {
+    bool start_blocked = false;
+    if (nero_start_escape()) {
+      geometry_msgs::msg::PoseArray a;
+      a.poses.push_back(current_pose_in_costmap_frame);
+      start_blocked = algo_->hasObstacleOnTrajectory(a);
+      const double now_s = get_clock()->now().seconds();
+      if (!start_blocked) {
+        nero_start_blocked_since_ = -1.0;
+      } else {
+        if (nero_start_blocked_since_ < 0.0) nero_start_blocked_since_ = now_s;
+        const double held = now_s - nero_start_blocked_since_;
+        if (held < nero_start_escape_hold_s()) {
+          RCLCPP_INFO_THROTTLE(
+            get_logger(), *get_clock(), 1000,
+            "[NERO_FREESPACE_START_ESCAPE] the start is inside the margin since %.1f s: waiting %.1f s before "
+            "escaping",
+            held, nero_start_escape_hold_s());
+          start_blocked = false;  // A* below says "Invalid start or goal pose" as upstream; planned again next cycle
+        }
+      }
+    }
+    if (start_blocked || nero_lead_in_now_) {
+      std::string why;
+      if (neroLeadIn(current_pose_in_costmap_frame, start_blocked, nero_lead, why)) {
+        plan_start = nero_lead.back().pose.pose;
+        RCLCPP_INFO(
+          get_logger(), "[%s] %s: %s, then A* from there",
+          start_blocked ? "NERO_FREESPACE_START_ESCAPE" : "NERO_FREESPACE_STALL_S",
+          start_blocked ? "the start is inside the margin" : "planning again", why.c_str());
+      } else {
+        RCLCPP_INFO_THROTTLE(
+          get_logger(), *get_clock(), 2000, "[%s] no straight move it can start from here: %s",
+          start_blocked ? "NERO_FREESPACE_START_ESCAPE" : "NERO_FREESPACE_STALL_S", why.c_str());
+      }
+    }
+    nero_lead_in_now_ = false;
+  }
+
   // execute planning
   const rclcpp::Time start = get_clock()->now();
   std::string error_msg;
@@ -880,7 +1294,7 @@ void FreespacePlannerNode::planTrajectory()
     result = true;
   } else {
     try {
-      result = algo_->makePlan(current_pose_in_costmap_frame, goal_pose_in_costmap_frame);
+      result = algo_->makePlan(plan_start, goal_pose_in_costmap_frame);
     } catch (const std::exception & e) {
       error_msg = e.what();
     }
@@ -933,7 +1347,7 @@ void FreespacePlannerNode::planTrajectory()
         try {
           // A* throws when the pose is blocked or unreachable: that is "no plan" here, never an
           // exception out of the timer (it would stop the planner)
-          pre_found = algo_->makePlan(current_pose_in_costmap_frame, pre);
+          pre_found = algo_->makePlan(plan_start, pre);
         } catch (const std::exception & e) {
           pre_found = false;
           astar_err = e.what();
@@ -1018,8 +1432,32 @@ void FreespacePlannerNode::planTrajectory()
           get_logger(), "[NERO_FREESPACE_STRAIGHT_IN] upstream plan kept: %s", why.c_str());
       }
     }
+    if (!nero_lead.empty() && !waypoints.waypoints.empty()) {
+      // the straight move first: its last point is A*'s start (dropped), a reversing point when A* starts the other way
+      waypoints.waypoints.erase(waypoints.waypoints.begin());
+      waypoints.waypoints.insert(waypoints.waypoints.begin(), nero_lead.begin(), nero_lead.end());
+      if (straight_from > 0) straight_from += nero_lead.size() - 1;
+    }
+    nero_lead_end_ = nero_lead.empty() ? -1 : static_cast<int>(nero_lead.size()) - 1;
+    nero_lead_back_ = !nero_lead.empty() && nero_lead.front().is_back;
     trajectory_ =
       utils::create_trajectory(current_pose_, waypoints, node_param_.waypoints_velocity);
+    if (nero_min_segment_on() && trajectory_.points.size() <= 1) {
+      // NERO_FREESPACE_MIN_SEGMENT: A*'s plan is its start alone: the vehicle already stands at the goal (within
+      // A*'s goal ranges); done (upstream holds with an empty partial trajectory and the next collision check throws)
+      RCLCPP_INFO(get_logger(), "[NERO_FREESPACE_MIN_SEGMENT] already at the goal (A* plans no move): done");
+      trajectory_ = utils::create_stop_trajectory(current_pose_, get_clock());
+      partial_trajectory_ = trajectory_;
+      reversing_indices_.clear();
+      prev_target_index_ = 0;
+      target_index_ = trajectory_.points.size() - 1;
+      nero_lead_end_ = -1;
+      is_completed_ = true;
+      std_msgs::msg::Bool is_completed_msg;
+      is_completed_msg.data = true;
+      parking_state_pub_->publish(is_completed_msg);
+      return;
+    }
     reversing_indices_ = utils::get_reversing_indices(trajectory_);
     // NERO_FREESPACE_STRAIGHT_IN_STOP=1: the straight piece as its own partial trajectory, cut 0.3 m
     // into it (the vehicle stops 0.2-0.3 m short of a segment end, i.e. where the straight begins).
@@ -1047,6 +1485,7 @@ void FreespacePlannerNode::planTrajectory()
 
 void FreespacePlannerNode::reset()
 {
+  nero_lead_end_ = -1;
   trajectory_ = Trajectory();
   partial_trajectory_ = Trajectory();
   is_completed_ = false;
