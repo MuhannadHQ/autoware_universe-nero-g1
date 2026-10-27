@@ -20,6 +20,7 @@
 #include "autoware_utils/system/stop_watch.hpp"
 #include "autoware_utils/system/time_keeper.hpp"
 #include "cruise_planner_interface.hpp"
+#include "nero_cutin.hpp"
 #include "optimization_based_planner/optimization_based_planner.hpp"
 #include "parameters.hpp"
 #include "pid_based_planner/pid_based_planner.hpp"
@@ -77,6 +78,7 @@ private:
   mutable std::shared_ptr<DebugData> debug_data_ptr_;
   bool need_to_clear_velocity_limit_{false};
   mutable std::shared_ptr<autoware_utils::TimeKeeper> time_keeper_;
+  mutable NeroCutinState nero_cutin_state_;  // NERO_CRUISE_CUTIN_YIELD
 
   std::unique_ptr<CruisePlannerInterface> create_cruise_planner(rclcpp::Node & node) const;
   std::vector<CruiseObstacle> filter_cruise_obstacle_for_predicted_object(
@@ -129,6 +131,10 @@ private:
   bool is_obstacle_crossing(
     const std::vector<TrajectoryPoint> & traj_points,
     const std::shared_ptr<PlannerData::Object> object) const;
+  // NERO_CRUISE_CUTIN_YIELD (nero_cutin.hpp)
+  void nero_cutin_yield(
+    const std::vector<TrajectoryPoint> & traj_points,
+    const std::shared_ptr<const PlannerData> planner_data, VelocityPlanningResult & result) const;
 };
 }  // namespace autoware::motion_velocity_planner
 
