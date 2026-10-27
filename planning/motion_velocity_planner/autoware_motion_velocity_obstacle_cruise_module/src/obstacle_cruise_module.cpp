@@ -25,6 +25,9 @@
 #include <autoware_utils/ros/parameter.hpp>
 #include <autoware_utils/ros/update_param.hpp>
 
+#include <lanelet2_core/LaneletMap.h>
+#include <lanelet2_core/geometry/LaneletMap.h>
+
 #include <algorithm>
 #include <limits>
 #include <map>
@@ -48,6 +51,82 @@ double calc_diff_angle_against_trajectory(
 
   const double diff_yaw = autoware_utils::normalize_radian(target_yaw - traj_yaw);
   return diff_yaw;
+}
+
+// NERO_CRUISE_CUTIN_EARLY: how far a car moved sideways toward `toward` (+1 left, -1 right) from (x0, y0) to (x1, y1),
+// measured against the centre line of the road lanelet it was in at (x0, y0) (heading within 45 deg of `yaw`) and its
+// successors; 0 when no such lane is found. Against ego's path, a lane change or a bend of ego's own looks like the car
+// moving in.
+double nero_polyline_lat(const std::vector<std::pair<double, double>> & line, const double x, const double y)
+{
+  double best = std::numeric_limits<double>::max(), lat = 0.0;
+  for (size_t i = 1; i < line.size(); ++i) {
+    const double ax = line[i - 1].first, ay = line[i - 1].second;
+    const double dx = line[i].first - ax, dy = line[i].second - ay;
+    const double l2 = dx * dx + dy * dy;
+    if (l2 < 1e-9) {
+      continue;
+    }
+    const double u = std::clamp(((x - ax) * dx + (y - ay) * dy) / l2, 0.0, 1.0);
+    const double d = std::hypot(x - ax - u * dx, y - ay - u * dy);
+    if (d < best) {
+      best = d;
+      lat = (dx * (y - ay) - dy * (x - ax)) / std::sqrt(l2);
+    }
+  }
+  return lat;
+}
+
+double nero_lane_moved_toward(
+  const autoware::route_handler::RouteHandler & route_handler, const double x0, const double y0,
+  const double yaw, const double x1, const double y1, const int toward)
+{
+  const auto map = route_handler.getLaneletMapPtr();
+  if (!map) {
+    return 0.0;
+  }
+  const lanelet::BasicPoint2d p0(x0, y0);
+  for (const auto & [dist, ll] : lanelet::geometry::findNearest(map->laneletLayer, p0, 6)) {
+    if (0.5 < dist) {
+      break;
+    }
+    if (ll.attributeOr(lanelet::AttributeName::Subtype, "") != std::string("road")) {
+      continue;
+    }
+    std::vector<std::pair<double, double>> line;
+    lanelet::ConstLanelet cur = ll;
+    for (int k = 0; k < 4; ++k) {
+      for (const auto & q : cur.centerline2d()) {
+        if (line.empty() || std::hypot(q.x() - line.back().first, q.y() - line.back().second) > 1e-3) {
+          line.emplace_back(q.x(), q.y());
+        }
+      }
+      const auto next = route_handler.getNextLanelets(cur);
+      if (next.empty()) {
+        break;
+      }
+      cur = next.front();
+    }
+    if (line.size() < 2) {
+      continue;
+    }
+    // the lane runs along the car (the segment nearest it within 45 deg of its heading)
+    double best = std::numeric_limits<double>::max(), seg_yaw = 0.0;
+    for (size_t i = 1; i < line.size(); ++i) {
+      const double mx = 0.5 * (line[i - 1].first + line[i].first);
+      const double my = 0.5 * (line[i - 1].second + line[i].second);
+      const double d = std::hypot(x0 - mx, y0 - my);
+      if (d < best) {
+        best = d;
+        seg_yaw = std::atan2(line[i].second - line[i - 1].second, line[i].first - line[i - 1].first);
+      }
+    }
+    if (std::abs(autoware_utils::normalize_radian(yaw - seg_yaw)) > M_PI / 4.0) {
+      continue;
+    }
+    return (nero_polyline_lat(line, x1, y1) - nero_polyline_lat(line, x0, y0)) * toward;
+  }
+  return 0.0;
 }
 
 std::vector<PredictedPath> resample_highest_confidence_predicted_paths(
@@ -886,9 +965,31 @@ void ObstacleCruiseModule::nero_cutin_yield(
     // NERO_CRUISE_CUTIN_STEEP: a car turning in / crossing from the side, ahead of ego's nose
     const bool steep = np.steep_min_deg <= angle_deg && angle_deg <= np.steep_max_deg &&
                        vehicle_info.max_longitudinal_offset_m < lon_dist;
+    // NERO_CRUISE_CUTIN_EARLY: a car whose front is still up to early_behind_m behind ego's base_link (beside / just
+    // behind) is checked too, if it is faster and really moving in (below); its offset is recorded from 10 m behind
+    const double front = lon_dist + predicted_object.shape.dimensions.x * 0.5;
+    const bool early_on = 0.0 <= np.early_behind_m;
+    const bool behind = front < 0.0;
     if (
-      lon_dist + predicted_object.shape.dimensions.x * 0.5 < 0.0 || 30.0 < lon_dist ||
+      (behind && (!early_on || front < -10.0)) || 30.0 < lon_dist ||
       (np.yield_max_deg < angle_deg && !steep)) {
+      nero_cutin_state_.clear(obj_uuid_str);
+      continue;
+    }
+    double moved_in = 0.0;
+    if (early_on && !steep && planner_data->route_handler) {
+      const auto * past = nero_cutin_state_.record(
+        obj_uuid_str, now, pose.position.x, pose.position.y, np.early_confirm_s);
+      if (past) {
+        // toward ego's path: to the car's right when it is left of the path
+        const int toward =
+          0.0 < autoware::motion_utils::calcLateralOffset(traj_points, pose.position) ? -1 : 1;
+        moved_in = nero_lane_moved_toward(
+          *planner_data->route_handler, past->x, past->y, tf2::getYaw(pose.orientation),
+          pose.position.x, pose.position.y, toward);
+      }
+    }
+    if (behind && front < -np.early_behind_m) {
       nero_cutin_state_.clear(obj_uuid_str);
       continue;
     }
@@ -902,9 +1003,12 @@ void ObstacleCruiseModule::nero_cutin_yield(
                            np.steep_a_stop < v_obj * v_obj /
                                                (2.0 * dist_poly /
                                                 std::max(std::sin(angle_deg * M_PI / 180.0), 0.3));
+    // NERO_CRUISE_CUTIN_EARLY: a faster car that is really moving in counts out to early_max_lat_m (checked below)
+    const bool wide = early_on && !steep && np.yield_max_lat_m < dist_poly &&
+                      dist_poly <= np.early_max_lat_m;
     if (
       is_lead || (steep ? (np.steep_max_lat_m < dist_poly || !committed)
-                        : np.yield_max_lat_m < dist_poly)) {
+                        : (np.yield_max_lat_m < dist_poly && !wide))) {
       nero_cutin_state_.clear(obj_uuid_str);
       continue;
     }
@@ -920,15 +1024,36 @@ void ObstacleCruiseModule::nero_cutin_yield(
     const double yaw_rel = autoware_utils::normalize_radian(obj_yaw - traj_yaw);
     const double s_obj = autoware::motion_utils::calcSignedArcLength(traj_points, 0, pose.position);
     const double d_obj = autoware::motion_utils::calcLateralOffset(traj_points, pose.position);
+    const double v_lon_obj = v_obj * std::cos(dir_rel);
+    double v_lat_obj = v_obj * std::sin(dir_rel);
+    // a yield starts only for a car moving toward ego's path (its offset to it >= 0.3 m smaller within t_s, in the
+    // trajectory's frame as below): not one ego catches up with, close and parallel in the next lane; once started it
+    // holds while the gap is short (also after the car has reached the band beside ego)
+    const double d_end = d_obj + v_lat_obj * np.yield_t_s;
+    const double approach =
+      std::abs(d_obj) - ((d_obj > 0.0) != (d_end > 0.0) ? 0.0 : std::min(std::abs(d_obj), std::abs(d_end)));
+    // NERO_CRUISE_CUTIN_EARLY: a faster car whose offset really shrank (its box, not its heading) completes its move at
+    // >= early_vlat_min sideways; a car behind base_link counts only so
+    const bool confirmed = early_on && !steep && v0 + np.early_dv_min <= v_lon_obj &&
+                           np.early_confirm_m <= moved_in && 0.3 <= approach;
+    bool boosted = false;
+    if (confirmed && std::abs(v_lat_obj) < np.early_vlat_min) {
+      v_lat_obj = d_obj > 0.0 ? -np.early_vlat_min : np.early_vlat_min;
+      boosted = true;
+    }
+    if ((behind || wide) && !confirmed) {
+      nero_cutin_state_.clear(obj_uuid_str);
+      continue;
+    }
     std::vector<Polygon2d> obj_polys;
     for (double t = dt; t <= np.yield_t_s + 1e-6; t += dt) {
       const auto base = autoware::motion_utils::calcLongitudinalOffsetPose(
-        traj_points, 0, s_obj + v_obj * std::cos(dir_rel) * t);
+        traj_points, 0, s_obj + v_lon_obj * t);
       if (!base) {
         break;
       }
       const double by = tf2::getYaw(base->orientation);
-      const double d = d_obj + v_obj * std::sin(dir_rel) * t;
+      const double d = d_obj + v_lat_obj * t;
       auto p = pose;
       p.position.x = base->position.x - d * std::sin(by);
       p.position.y = base->position.y + d * std::cos(by);
@@ -952,12 +1077,6 @@ void ObstacleCruiseModule::nero_cutin_yield(
     const double d0 = min_dist(0, v_min0);
     const bool was_conflict = nero_cutin_state_.in_conflict(obj_uuid_str, now);
     const double gap = np.yield_gap_m + (was_conflict ? 0.3 : 0.0);
-    // ... and a yield starts only for a car moving toward ego's path (its offset to it >= 0.3 m smaller within t_s, in
-    // the trajectory's frame as above): not one ego catches up with, close and parallel in the next lane; once started it
-    // holds while the gap is short (also after the car has reached the band beside ego)
-    const double d_end = d_obj + v_obj * std::sin(dir_rel) * np.yield_t_s;
-    const double approach =
-      std::abs(d_obj) - ((d_obj > 0.0) != (d_end > 0.0) ? 0.0 : std::min(std::abs(d_obj), std::abs(d_end)));
     const double d_now = dist_poly;
     if (gap <= d0 || (!was_conflict && approach < 0.3)) {
       nero_cutin_state_.clear(obj_uuid_str);
@@ -966,17 +1085,30 @@ void ObstacleCruiseModule::nero_cutin_yield(
     if (nero_cutin_state_.count(obj_uuid_str, now) < np.yield_cycles) {
       continue;
     }
+    // NERO_CRUISE_CUTIN_EARLY: while its front is behind base_link the ease-off is capped at early_a
     const int max_steps =
-      steep ? static_cast<int>(std::round(np.steep_a_max / 0.25)) : a_steps;
+      steep ? static_cast<int>(std::round(np.steep_a_max / 0.25))
+            : (behind ? std::min(a_steps, static_cast<int>(std::round(np.early_a / 0.25))) : a_steps);
     int step = 1;
     double v_at = v0, d = d0;
+    std::vector<std::pair<double, double>> d_steps;  // (clearance, speed at it) per step tried
     for (; step <= max_steps; ++step) {
       d = min_dist(step, v_at);
+      d_steps.emplace_back(d, v_at);
       if (gap <= d) {
         break;
       }
     }
     step = std::min(step, max_steps);
+    double d_best = d0;
+    for (const auto & ds : d_steps) {
+      d_best = std::max(d_best, ds.first);
+    }
+    // a car still behind base_link counts only if easing off opens the gap (a car merging in behind ego: braking closes it)
+    if (behind && d_best < d0 + np.taper_hold_gain_m) {
+      nero_cutin_state_.clear(obj_uuid_str);
+      continue;
+    }
     // NERO_CRUISE_YIELD_GAIN (nero_cutin.hpp): no ease-off keeps the gap -> start braking at a_max only if it buys
     // clearance (a started yield is held as before)
     if (
@@ -991,12 +1123,42 @@ void ObstacleCruiseModule::nero_cutin_yield(
       nero_cutin_state_.clear(obj_uuid_str);
       continue;
     }
+    // NERO_CRUISE_CUTIN_TAPER: no ease-off keeps the gap -> the smallest step within taper_m of the best clearance, none
+    // while braking buys < hold_gain_m (armed: the conflict and the yield state stay); within critical_m a_max as before
+    const bool taper = !steep && 0.0 <= np.taper_m && d < gap && np.gain_critical_m <= d0;
+    if (taper) {
+      if (d_best - d0 < np.taper_hold_gain_m) {
+        if (np.debug) {
+          RCLCPP_INFO(
+            logger_,
+            "[NERO_CRUISE_CUTIN] taper hold %s now %.2f d0 %.2f best %.2f v_obj %.2f lon %.2f front %.2f v_ego %.2f%s",
+            obj_uuid_str.substr(0, 6).c_str(), d_now, d0, d_best, v_obj, lon_dist, front, v0,
+            boosted ? " boosted" : "");
+        }
+        nero_cutin_state_.mark_yield(obj_uuid_str, now);
+        continue;
+      }
+      for (size_t i = 0; i < d_steps.size(); ++i) {
+        if (d_best - np.taper_m <= d_steps.at(i).first) {
+          step = static_cast<int>(i) + 1;
+          d = d_steps.at(i).first;
+          v_at = d_steps.at(i).second;
+          break;
+        }
+      }
+    }
     if (np.debug) {
+      char extra[160] = "";
+      if (early_on || 0.0 <= np.taper_m) {
+        std::snprintf(
+          extra, sizeof(extra), "%s%s%s front %.2f moved %.2f best %.2f", behind ? " early" : "",
+          boosted ? " boosted" : "", taper ? " taper" : "", front, moved_in, d_best);
+      }
       RCLCPP_INFO(
         logger_,
-        "[NERO_CRUISE_CUTIN] yield%s %s a %.2f now %.2f d0 %.2f d %.2f v_obj %.2f angle %.1f lon %.2f v_ego %.2f -> %.2f",
+        "[NERO_CRUISE_CUTIN] yield%s %s a %.2f now %.2f d0 %.2f d %.2f v_obj %.2f angle %.1f lon %.2f v_ego %.2f -> %.2f%s",
         steep ? " steep" : "", obj_uuid_str.substr(0, 6).c_str(), 0.25 * step, d_now, d0, d, v_obj,
-        calc_diff_angle_against_trajectory(traj_points, pose) * 180.0 / M_PI, lon_dist, v0, v_at);
+        calc_diff_angle_against_trajectory(traj_points, pose) * 180.0 / M_PI, lon_dist, v0, v_at, extra);
     }
     nero_cutin_state_.mark_yield(obj_uuid_str, now);
     if (steep) {
