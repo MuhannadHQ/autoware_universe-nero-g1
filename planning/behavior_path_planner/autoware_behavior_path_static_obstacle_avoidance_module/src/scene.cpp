@@ -25,6 +25,7 @@
 #include "autoware/behavior_path_static_obstacle_avoidance_module/utils.hpp"
 
 #include <autoware/motion_utils/trajectory/interpolation.hpp>
+#include <autoware_lanelet2_extension/regulatory_elements/road_marking.hpp>
 #include <autoware_lanelet2_extension/regulatory_elements/speed_bump.hpp>
 #include <autoware_lanelet2_extension/utility/message_conversion.hpp>
 #include <autoware_lanelet2_extension/utility/query.hpp>
@@ -33,9 +34,11 @@
 #include <autoware_utils/math/normalization.hpp>
 #include <tf2/utils.h>
 #include <lanelet2_core/geometry/LineString.h>
+#include <lanelet2_core/primitives/BasicRegulatoryElements.h>
 #include <autoware_utils/system/time_keeper.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -297,6 +300,77 @@ const Env & env()
 bool active()
 {
   return env().pause_margin >= 0.0 || env().committed || env().sight_m > 0.0 || env().corridor;
+}
+// NERO_SOA_LANE_BLOCKED=1 (2026-10-26, returnshift job, QUEUE OLS, capture 10-25 #6): a pass whose path is still out of
+// the lane where obstacle_stop will stop ego for a standing vehicle in ego's own lane that the module does not pass
+// (not a target: traffic, a truck unloading 3 m before a junction) ends with ego standing in the oncoming lane (#6: 12 s
+// beside the truck's tail lift, then the operator). Such a pass counts as blocked like overtake v6's corridor check: not
+// yet moving sideways -> the stock yield (ego waits in its lane); moving sideways -> v6's pause, its stop before that
+// vehicle, back inside the lane if the way back fits, else holding the shift ego has (never further out). Needs overtake
+// v6's corridor check and pause switched on (the car since 10-25).
+}  // namespace nero_ovl
+
+namespace nero_ret
+{
+// NERO_SOA_RETURN_NO_NEED (shift_line_generator.cpp has the full note): here, a target that needs no shift is not the
+// target a pause stops before
+bool no_need()
+{
+  static const bool on = [] {
+    const char * v = std::getenv("NERO_SOA_RETURN_NO_NEED");
+    return v && std::atoi(v) > 0;
+  }();
+  return on;
+}
+}  // namespace nero_ret
+
+namespace nero_rcl
+{
+// NERO_SOA_RETURN_CLEAR=1 (2026-10-26, narrowweave job, QUEUE RSB, captures 10-26 #7 "nice" / #8 "scenario", lanelet
+// 44311): out in the oncoming lane beside a row of cars parked in ego's lane, the module planned a line back toward
+// the lane (the return of a target it had passed, once the next car was "wait and see") straight into a car standing
+// in the lane that is not a target (parked facing ego, "queued"); obstacle_stop stopped ego in the oncoming lane
+// inside the gap between the rows and the line was never re-planned (field: 7 s, then the operator drove it through
+// at 11.5 km/h; sim on the car: stands for good). Out of its lane, such a line is replaced by holding ego's shift past
+// every standing object it ran into (where holding clears them by obstacle_stop's lateral margin) and a way back that
+// clears every standing object, over before the next stop line / junction lanelet; if none fits, the module's plan
+// stays. Upstream has no such check (avoid / return lines are checked against targets only).
+bool on()
+{
+  static const bool r = [] {
+    const char * v = std::getenv("NERO_SOA_RETURN_CLEAR");
+    const bool b = v && std::atoi(v) > 0;
+    std::fprintf(stderr, "[NERO_SOA] return_clear=%d\n", b);
+    return b;
+  }();
+  return r;
+}
+constexpr double LAT_EXTRA = 0.15;    // path smoothing / tracking on top of obstacle_stop's lateral margin
+constexpr double LON_MARGIN = 1.0;    // ego's rear past the object before the way back starts
+constexpr double HORIZON = 40.0;      // how far ahead the module's plan is checked
+constexpr double TOWARD_EPS = 0.05;   // a plan point counts as back toward the lane once this much nearer the centre
+// NERO_SOA_RETURN_DEBUG=1 (log only): a line a second while out of the lane with the plan back clear, and the time
+bool debug()
+{
+  static const bool r = [] {
+    const char * v = std::getenv("NERO_SOA_RETURN_DEBUG");
+    return v && std::atoi(v) > 0;
+  }();
+  return r;
+}
+}  // namespace nero_rcl
+
+namespace nero_ovl
+{
+bool lane_blocked()
+{
+  static const bool on = [] {
+    const char * v = std::getenv("NERO_SOA_LANE_BLOCKED");
+    const bool r = v && std::atoi(v) > 0;
+    std::fprintf(stderr, "[NERO_SOA] lane_blocked=%d\n", r);
+    return r;
+  }();
+  return on;
 }
 constexpr double VEHICLE_MIN_V = 1.0;
 constexpr double UNKNOWN_MIN_V = 2.5;
@@ -915,6 +989,20 @@ void StaticObstacleAvoidanceModule::fillEgoStatus(
       }
     }
     nero_corridor_blocker_ = nero_ovl::env().corridor ? neroCorridorBlocker(data) : "";
+    nero_lane_block_.reset();
+    if (nero_ovl::lane_blocked()) {
+      neroUpdateLaneLatch(data);
+    }
+    if (nero_ovl::lane_blocked() && nero_corridor_blocker_.empty()) {
+      nero_lane_block_ = neroLaneBlocker(data);
+      if (nero_lane_block_) {
+        nero_corridor_blocker_ = "own lane " + nero_lane_block_->first;
+        RCLCPP_WARN_THROTTLE(
+          getLogger(), *clock_, 2000,
+          "[NERO_SOA_LANE] the pass ends before %s %.1f m ahead (not passed: traffic): %s", nero_lane_block_->first.c_str(),
+          nero_lane_block_->second, helper_->isShifted() ? "pause / hold, stop before it" : "wait in the lane");
+      }
+    }
     if (!nero_corridor_blocker_.empty()) {
       RCLCPP_WARN_THROTTLE(
         getLogger(), *clock_, 2000,
@@ -1186,6 +1274,12 @@ void StaticObstacleAvoidanceModule::updateEgoBehavior(
   };
 
   insert_velocity();
+
+  if (nero_lane_stop_) {
+    // NERO_SOA_LANE_BLOCKED: the latched vehicle in ego's lane: stop where obstacle_stop does, approached smoothly
+    utils::static_obstacle_avoidance::insertDecelPoint(
+      getEgoPosition(), nero_lane_stop_.value(), 0.0, path.path, stop_pose_);
+  }
 
   if (nero_hold_now_) {
     // NERO_SOA_HOLD_IN_LANE at standstill / creeping: stay where ego is until the car has gone
@@ -1472,9 +1566,13 @@ std::optional<double> StaticObstacleAvoidanceModule::neroPauseTargetDistance(con
 {
   // the target the shift is for: the module's stop target, else the nearest target ahead (a shift may start before
   // the target "requires" avoidance, e.g. at 4-5 m/s 20 m before it)
+  if (nero_lane_block_) return nero_lane_block_->second;  // NERO_SOA_LANE_BLOCKED: stop before the vehicle in the lane
   if (data.stop_target_object) return data.stop_target_object.value().longitudinal;
   std::optional<double> d;
   for (const auto & o : data.target_objects) {
+    // NERO_SOA_RETURN_NO_NEED: a target that needs no shift at all (a kerb object) is not what a shift is for: a pause
+    // that stops before it would leave ego standing out on its way back (sim: hit by a car that never slows)
+    if (nero_ret::no_need() && o.info == ObjectInfo::SAME_DIRECTION_SHIFT) continue;
     if (o.longitudinal > 0.0 && (!d || o.longitudinal < d.value())) d = o.longitudinal;
   }
   return d;
@@ -1548,6 +1646,15 @@ bool StaticObstacleAvoidanceModule::neroOncomingPause(AvoidancePlanningData & da
       hold = h;
       break;
     }
+  }
+  if (!hold && nero_lane_block_ && !nero_onc_ && room > planner_data_->parameters.base_link2front) {
+    // NERO_SOA_LANE_BLOCKED: no way back before the vehicle: hold the shift ego has (never further out), stop before it
+    hold = std::max(0.0, actual);
+    back = nero_ovl::MIN_EASE_DISTANCE;
+    RCLCPP_WARN_THROTTLE(
+      getLogger(), *clock_, 500,
+      "[NERO_SOA_LANE] %s: no way back into the lane before it (needs %.1f m, has %.1f m): holding %.2f m", why.c_str(),
+      needed, room, hold.value());
   }
   if (!hold) {
     RCLCPP_WARN_THROTTLE(
@@ -1714,6 +1821,223 @@ std::string StaticObstacleAvoidanceModule::neroCorridorBlocker(const AvoidancePl
     if (std::abs(sp.shift_length.at(i)) > room.value()) poses.push_back(sp.path.points.at(i).point.pose);
   }
   return neroBlocker(poses, data, true);
+}
+
+std::optional<std::pair<std::string, double>> StaticObstacleAvoidanceModule::neroLaneBlocker(
+  const AvoidancePlanningData & data) const
+{
+  // the planned pass (the candidate path: also while waiting / paused) and how far the body is out of the lane along it
+  const auto & sp = data.candidate_path.path.points.empty() ? helper_->getPreviousSplineShiftPath() : data.candidate_path;
+  if (
+    !planner_data_->dynamic_object || sp.path.points.empty() ||
+    sp.shift_length.size() != sp.path.points.size() || data.reference_path.points.size() < 2) {
+    return std::nullopt;
+  }
+  const auto idx = planner_data_->findEgoIndex(sp.path.points);
+  std::vector<std::pair<double, double>> plan;  // (arc length from ego, shift)
+  double max_shift = 0.0, s = 0.0;
+  for (size_t i = idx; i < sp.path.points.size() && s < 60.0; ++i) {
+    if (i > idx) s += autoware_utils::calc_distance2d(sp.path.points.at(i - 1), sp.path.points.at(i));
+    plan.emplace_back(s, sp.shift_length.at(i));
+    if (std::abs(sp.shift_length.at(i)) > std::abs(max_shift)) max_shift = sp.shift_length.at(i);
+  }
+  const auto room = neroInLaneShiftLimit(data, max_shift > 0.0, 0.0);
+  if (!room || std::abs(max_shift) <= room.value()) return std::nullopt;  // the pass stays in the lane
+  const auto & vp = planner_data_->parameters;
+  constexpr double OBSTACLE_STOP_MARGIN = 5.0;  // obstacle_stop's stop margin on the car
+  std::optional<std::pair<std::string, double>> best;
+  for (const auto & o : planner_data_->dynamic_object->objects) {
+    const auto label = utils::getHighestProbLabel(o.classification);
+    const bool vehicle = label == ObjectClassification::CAR || label == ObjectClassification::TRUCK ||
+                         label == ObjectClassification::BUS || label == ObjectClassification::TRAILER ||
+                         label == ObjectClassification::MOTORCYCLE;
+    if (!vehicle) continue;
+    const auto & tw = o.kinematics.initial_twist_with_covariance.twist.linear;
+    if (std::hypot(tw.x, tw.y) >= 0.5) continue;  // standing only
+    if (!neroNeverPassed(data, o)) continue;  // only a vehicle the module has judged traffic (never avoided)
+    const auto & c = o.kinematics.initial_pose_with_covariance.pose.position;
+    const lanelet::BasicPoint2d cp{c.x, c.y};
+    if (!std::any_of(data.current_lanelets.begin(), data.current_lanelets.end(), [&](const auto & ll) {
+          return boost::geometry::within(cp, ll.polygon2d().basicPolygon());
+        })) {
+      continue;  // not in ego's own lane
+    }
+    double s_near = 1e9, s_far = -1e9;
+    const auto poly = autoware_utils::to_polygon2d(o.kinematics.initial_pose_with_covariance.pose, o.shape);
+    if (std::any_of(data.target_objects.begin(), data.target_objects.end(), [&](const auto & t) {
+          return t.is_avoidable && boost::geometry::intersects(t.envelope_poly, poly);
+        })) {
+      continue;  // the place of a target the module passes (e.g. the vehicle's own low fragment): not a blocker
+    }
+    for (const auto & q : poly.outer()) {
+      const double sq = autoware::motion_utils::calcSignedArcLength(
+        data.reference_path.points, getEgoPosition(), autoware_utils::create_point(q.x(), q.y(), 0.0));
+      s_near = std::min(s_near, sq);
+      s_far = std::max(s_far, sq);
+    }
+    if (s_near < vp.base_link2front || s_near > 60.0) continue;  // already beside ego (passed by now), or far
+    // the body out of the lane anywhere from where obstacle_stop stops ego for it to its far end: ego would stand out
+    const double from = std::max(0.0, s_near - vp.base_link2front - OBSTACLE_STOP_MARGIN);
+    const bool out = std::any_of(plan.begin(), plan.end(), [&](const auto & p) {
+      return p.first >= from && p.first <= s_far && std::abs(p.second) > room.value();
+    });
+    if (!out || (best && best->second <= s_near)) continue;
+    nero_lane_latch_ = std::string(o.object_id.uuid.begin(), o.object_id.uuid.end());
+    char buf[48];
+    std::snprintf(
+      buf, sizeof(buf), "vehicle %02x%02x%02x%02x", o.object_id.uuid[0], o.object_id.uuid[1], o.object_id.uuid[2],
+      o.object_id.uuid[3]);
+    best = std::make_pair(std::string(buf), s_near);
+  }
+  return best;
+}
+
+bool StaticObstacleAvoidanceModule::neroNeverPassed(
+  const AvoidancePlanningData & data, const PredictedObject & o) const
+{
+  // not a target, and judged "not a parked object" (traffic: near a stop line / junction, queued, not parked): the
+  // module never avoids it. A stopped vehicle it waits and sees about (ambiguous) may still be passed: not counted.
+  if (std::any_of(data.target_objects.begin(), data.target_objects.end(), [&](const auto & t) {
+        return t.object.object_id == o.object_id;
+      })) {
+    return false;
+  }
+  const auto it = std::find_if(data.other_objects.begin(), data.other_objects.end(), [&](const auto & t) {
+    return t.object.object_id == o.object_id && t.info == ObjectInfo::IS_NOT_PARKING_OBJECT;
+  });
+  // narrowweave (10-26 #7 / #8, 44311): a row of cars parked in the lane is "queued" by the queue rule; only a vehicle
+  // that waits for something is traffic (else ego waited behind the parked row for good)
+  return it != data.other_objects.end() && neroWaiting(data, *it);
+}
+
+std::vector<double> StaticObstacleAvoidanceModule::neroStopsAhead(const AvoidancePlanningData & data) const
+{
+  std::vector<double> out;
+  const auto & ref = data.reference_path.points;
+  if (ref.size() < 2) return out;
+  const auto add = [&](const double x, const double y) {
+    out.push_back(
+      autoware::motion_utils::calcSignedArcLength(ref, getEgoPosition(), autoware_utils::create_point(x, y, 0.0)));
+  };
+  for (const auto * lls : {&data.current_lanelets, &data.extend_lanelets}) {
+    for (const auto & llt : *lls) {
+      if (llt.hasAttribute("turn_direction") && !llt.centerline().empty()) {
+        add(llt.centerline().front().x(), llt.centerline().front().y());
+      }
+      for (const auto & ts : llt.regulatoryElementsAs<lanelet::TrafficSign>()) {
+        for (const auto & l : ts->refLines()) {
+          if (!l.empty()) add(0.5 * (l.front().x() + l.back().x()), 0.5 * (l.front().y() + l.back().y()));
+        }
+      }
+      for (const auto & rm : llt.regulatoryElementsAs<lanelet::autoware::RoadMarking>()) {
+        const auto l = rm->roadMarking();
+        if (l.attributeOr(lanelet::AttributeName::Type, "") == std::string("stop_line") && !l.empty()) {
+          add(0.5 * (l.front().x() + l.back().x()), 0.5 * (l.front().y() + l.back().y()));
+        }
+      }
+    }
+  }
+  return out;
+}
+
+bool StaticObstacleAvoidanceModule::neroWaiting(const AvoidancePlanningData & data, const ObjectData & od) const
+{
+  static const double stop_line_m = [] {
+    const char * v = std::getenv("NERO_SOA_AMBIGUOUS_STOP_LINE_M");
+    return v ? std::atof(v) : 20.0;
+  }();
+  static const double queue_m = [] {
+    const char * v = std::getenv("NERO_SOA_AMBIGUOUS_QUEUE_M");
+    return v ? std::atof(v) : 15.0;
+  }();
+  const auto & ref = data.reference_path.points;
+  if (ref.size() < 2 || data.arclength_from_ego.size() != ref.size() || !planner_data_->dynamic_object) return true;
+  const auto stops = neroStopsAhead(data);
+  // the standing / slow vehicles near ego's lane, each projected once: (s of its centre, half length, speed, id)
+  struct Veh
+  {
+    double s, half, v;
+    unique_identifier_msgs::msg::UUID id;
+  };
+  std::vector<Veh> vehs;
+  for (const auto & o : planner_data_->dynamic_object->objects) {
+    const auto label = utils::getHighestProbLabel(o.classification);
+    if (
+      label != ObjectClassification::CAR && label != ObjectClassification::TRUCK &&
+      label != ObjectClassification::BUS && label != ObjectClassification::TRAILER &&
+      label != ObjectClassification::MOTORCYCLE) {
+      continue;
+    }
+    const auto & tw = o.kinematics.initial_twist_with_covariance.twist.linear;
+    const double v = std::hypot(tw.x, tw.y);
+    if (v > 2.0) continue;
+    const auto & p = o.kinematics.initial_pose_with_covariance.pose.position;
+    const size_t seg = autoware::motion_utils::findNearestSegmentIndex(ref, p);
+    if (std::abs(autoware::motion_utils::calcLateralOffset(ref, p, seg)) > 1.5) continue;
+    vehs.push_back(
+      {data.arclength_from_ego.at(seg) + autoware::motion_utils::calcLongitudinalOffsetToSegment(ref, seg, p),
+       0.5 * o.shape.dimensions.x, v, o.object_id});
+  }
+  const auto stop_factor = [&](const unique_identifier_msgs::msg::UUID & id) {  // the module's own distance, if judged
+    for (const auto * lst : {&data.target_objects, &data.other_objects}) {
+      for (const auto & t : *lst) {
+        if (t.object.object_id == id) return t.to_stop_factor_distance;
+      }
+    }
+    return std::numeric_limits<double>::infinity();
+  };
+  const auto it0 = std::find_if(vehs.begin(), vehs.end(), [&](const auto & q) { return q.id == od.object.object_id; });
+  if (it0 == vehs.end()) return true;  // not near ego's lane: as before
+  const Veh * cur = &(*it0);
+  for (int k = 0; k < 12; ++k) {
+    if (k > 0 && cur->v >= 0.5) return true;  // a vehicle ahead in the row moves: a queue in traffic
+    const double s_front = cur->s + cur->half;
+    if (stop_factor(cur->id) < stop_line_m) return true;
+    for (const double l : stops) {
+      if (l >= s_front - 1.0 && l - s_front < stop_line_m) return true;  // waiting before a stop line / junction
+    }
+    const Veh * next = nullptr;  // the next vehicle ahead in ego's lane within the queue gap
+    for (const auto & q : vehs) {
+      if (q.id == cur->id || q.s <= cur->s || q.s - q.half - s_front > queue_m) continue;
+      if (!next || q.s < next->s) next = &q;
+    }
+    if (!next) return false;  // the head of the row waits for nothing: parked
+    cur = next;
+  }
+  return true;
+}
+
+void StaticObstacleAvoidanceModule::neroUpdateLaneLatch(const AvoidancePlanningData & data) const
+{
+  nero_lane_stop_.reset();
+  if (nero_lane_latch_.empty() || !planner_data_->dynamic_object || data.reference_path.points.size() < 2) {
+    nero_lane_latch_.clear();
+    return;
+  }
+  const auto & vp = planner_data_->parameters;
+  constexpr double OBSTACLE_STOP_MARGIN = 5.0;  // obstacle_stop's stop margin on the car
+  for (const auto & o : planner_data_->dynamic_object->objects) {
+    if (std::string(o.object_id.uuid.begin(), o.object_id.uuid.end()) != nero_lane_latch_) continue;
+    const auto & tw = o.kinematics.initial_twist_with_covariance.twist.linear;
+    const auto & c = o.kinematics.initial_pose_with_covariance.pose.position;
+    const lanelet::BasicPoint2d cp{c.x, c.y};
+    const bool in_lane = std::any_of(data.current_lanelets.begin(), data.current_lanelets.end(), [&](const auto & ll) {
+      return boost::geometry::within(cp, ll.polygon2d().basicPolygon());
+    });
+    double s_near = 1e9;
+    const auto poly = autoware_utils::to_polygon2d(o.kinematics.initial_pose_with_covariance.pose, o.shape);
+    for (const auto & q : poly.outer()) {
+      s_near = std::min(
+        s_near, autoware::motion_utils::calcSignedArcLength(
+                  data.reference_path.points, getEgoPosition(), autoware_utils::create_point(q.x(), q.y(), 0.0)));
+    }
+    if (std::hypot(tw.x, tw.y) < 0.5 && in_lane && s_near >= vp.base_link2front && neroNeverPassed(data, o)) {
+      nero_lane_stop_ = std::max(0.0, s_near - vp.base_link2front - OBSTACLE_STOP_MARGIN);
+      return;
+    }
+    break;
+  }
+  nero_lane_latch_.clear();  // gone, moving, out of the lane or beside ego: released
 }
 
 std::optional<double> StaticObstacleAvoidanceModule::neroPassSightNeeded(const AvoidancePlanningData & data) const
@@ -1886,6 +2210,190 @@ void StaticObstacleAvoidanceModule::neroOncomingReturn(AvoidancePlanningData & d
     "[NERO_SOA_OVL] oncoming %s %.1f m/s, gap %.1f m, beside / past the targets: back into the lane from %.1f m "
     "ahead over %.1f m (shift %.2f m)",
     nero_onc_->id.c_str(), nero_onc_->v, nero_onc_->gap, clear, length, ego_shift);
+}
+
+void StaticObstacleAvoidanceModule::neroReturnClear(AvoidancePlanningData & data)
+{
+  const auto ego_shift = helper_->getEgoShift();
+  const auto room = neroInLaneShiftLimit(data, ego_shift > 0.0, 0.0);
+  if (!room || std::abs(ego_shift) <= room.value() || nero_paused_ || nero_returning_) {
+    nero_rcl_holding_ = false;  // the body is in its lane, or overtake v6's pause / quick return has it
+    return;
+  }
+  const auto & sp = data.candidate_path;
+  const auto & ref = data.reference_path.points;
+  if (
+    ref.size() < 2 || sp.path.points.size() != ref.size() || sp.shift_length.size() != ref.size() ||
+    data.arclength_from_ego.size() != ref.size() || !planner_data_->dynamic_object) {
+    return;
+  }
+  const auto t_start = std::chrono::steady_clock::now();
+  const auto & vp = planner_data_->parameters;
+  const double half_w = 0.5 * vp.vehicle_width;
+  struct Standing
+  {
+    autoware_utils::Polygon2d poly;
+    double margin;        // obstacle_stop's lateral margin for the class (UNKNOWN 0.3, others 0.1) + LAT_EXTRA
+    double s_near, s_far; // its nearest / farthest point along the reference path from ego
+    std::string id;
+  };
+  // standing objects near enough to matter: along the next HORIZON m, laterally between the lane centre and ego's
+  // shift (plus the body and the margin)
+  const double band_lo = std::min(0.0, ego_shift) - half_w - 1.0;
+  const double band_hi = std::max(0.0, ego_shift) + half_w + 1.0;
+  std::vector<Standing> objs;
+  for (const auto & o : planner_data_->dynamic_object->objects) {
+    const auto & tw = o.kinematics.initial_twist_with_covariance.twist.linear;
+    if (std::hypot(tw.x, tw.y) >= 0.5) continue;  // standing objects only
+    // its centre's place along / beside the reference path and its half diagonal: a conservative extent (one
+    // projection per object; the exact far end only for the objects the plan runs into)
+    const auto & c = o.kinematics.initial_pose_with_covariance.pose.position;
+    if (std::hypot(c.x - getEgoPosition().x, c.y - getEgoPosition().y) > nero_rcl::HORIZON + 30.0) continue;
+    const double r = 0.5 * std::hypot(o.shape.dimensions.x, o.shape.dimensions.y);
+    const size_t seg = autoware::motion_utils::findNearestSegmentIndex(ref, c);
+    const double s_c = data.arclength_from_ego.at(seg) + autoware::motion_utils::calcLongitudinalOffsetToSegment(ref, seg, c);
+    const double l_c = autoware::motion_utils::calcLateralOffset(ref, c, seg);
+    Standing st;
+    st.margin =
+      (utils::getHighestProbLabel(o.classification) == ObjectClassification::UNKNOWN ? 0.3 : 0.1) +
+      nero_rcl::LAT_EXTRA;
+    st.s_near = s_c - r;
+    st.s_far = s_c + r;
+    if (st.s_far < -vp.base_link2rear || st.s_near > nero_rcl::HORIZON + 30.0) continue;  // behind ego / far ahead
+    if (l_c + r < band_lo - st.margin || l_c - r > band_hi + st.margin) continue;         // off to the side
+    st.poly = autoware_utils::to_polygon2d(o.kinematics.initial_pose_with_covariance.pose, o.shape);
+    char id[8];
+    std::snprintf(id, sizeof(id), "%02x%02x", o.object_id.uuid[0], o.object_id.uuid[1]);
+    st.id = id;
+    objs.push_back(st);
+  }
+  const auto footprint = [&](const geometry_msgs::msg::Pose & p) {
+    return autoware_utils::to_footprint(p, vp.base_link2front, vp.base_link2rear, vp.vehicle_width);
+  };
+  // the body at path arc length s can only come near objects overlapping [s - rear, s + front] (+ 0.5 m)
+  const auto near_s = [&](const Standing & o, const double s) {
+    return o.s_near <= s + vp.base_link2front + 0.5 && o.s_far >= s - vp.base_link2rear - 0.5;
+  };
+  const auto ego_idx = data.ego_closest_path_index;
+  constexpr double STEP = 0.5;  // body poses every 0.5 m
+
+  // the module's plan where it brings the body back toward the lane: the standing objects it runs into there that a
+  // body holding ego's shift at the same place clears
+  std::vector<size_t> hit;
+  double last_s = -1e9;
+  for (size_t i = ego_idx; i < ref.size(); ++i) {
+    const double s = data.arclength_from_ego.at(i);
+    if (s > nero_rcl::HORIZON) break;
+    if (s < 0.0 || std::abs(sp.shift_length.at(i)) > std::abs(ego_shift) - nero_rcl::TOWARD_EPS) continue;
+    if (s - last_s < STEP) continue;
+    last_s = s;
+    std::optional<autoware_utils::Polygon2d> f_plan;
+    for (size_t k = 0; k < objs.size(); ++k) {
+      if (!near_s(objs.at(k), s) || std::find(hit.begin(), hit.end(), k) != hit.end()) continue;
+      if (!f_plan) f_plan = footprint(sp.path.points.at(i).point.pose);
+      if (boost::geometry::distance(f_plan.value(), objs.at(k).poly) >= objs.at(k).margin) continue;
+      const auto f_hold = footprint(autoware_utils::calc_offset_pose(ref.at(i).point.pose, 0.0, ego_shift, 0.0));
+      if (boost::geometry::distance(f_hold, objs.at(k).poly) < objs.at(k).margin) continue;  // in the way out there too
+      hit.push_back(k);
+    }
+  }
+  const auto elapsed_ms = [&] {
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_start).count();
+  };
+  if (hit.empty()) {
+    nero_rcl_holding_ = false;
+    if (nero_rcl::debug()) {
+      RCLCPP_INFO_THROTTLE(
+        getLogger(), *clock_, 1000, "[NERO_SOA_RCL] out (shift %.2f): the plan back is clear (%zu objects, %.2f ms)",
+        ego_shift, objs.size(), elapsed_ms());
+    }
+    return;
+  }
+
+  // the next stop line or junction lanelet ahead: the way back must be over before the front reaches it
+  double limit = data.arclength_from_ego.back() - vp.base_link2front;
+  for (const double d : neroStopsAhead(data)) {
+    if (d > 0.0) limit = std::min(limit, d - vp.base_link2front - 0.5);
+  }
+
+  // hold ego's shift until the rear is past those objects, then back to the centre (smooth S); every standing object
+  // in the way back pushes the start past it; the hold itself must be clear
+  double start = 0.0;
+  std::string who;
+  for (const auto k : hit) {
+    auto & o = objs.at(k);
+    o.s_far = -1e9;  // the exact far end of the objects the plan ran into
+    for (const auto & q : o.poly.outer()) {
+      o.s_far = std::max(
+        o.s_far, autoware::motion_utils::calcSignedArcLength(
+                   ref, getEgoPosition(), autoware_utils::create_point(q.x(), q.y(), 0.0)));
+    }
+    start = std::max(start, o.s_far + vp.base_link2rear + nero_rcl::LON_MARGIN);
+    who += (who.empty() ? "" : ",") + objs.at(k).id;
+  }
+  const double v = std::max(getEgoSpeed(), 1.0);
+  const double len_nominal = helper_->getNominalAvoidanceDistance(std::abs(ego_shift));
+  const double len_sharp = std::max(
+    nero_ovl::MIN_EASE_DISTANCE, autoware::motion_utils::calc_longitudinal_dist_from_jerk(
+                                   std::abs(ego_shift), parameters_->lateral_max_jerk_map.back(), v));
+  const auto y = [&](const double s, const double st, const double len) {
+    if (s <= st) return ego_shift;
+    if (s >= st + len) return 0.0;
+    const double x = (s - st) / std::max(len, 0.1);
+    return ego_shift * (1.0 - x * x * (3.0 - 2.0 * x));
+  };
+  std::string why = "no way back before the stop line / junction";
+  for (const double len : {len_nominal, len_sharp}) {
+    double st = start;
+    for (int iter = 0; iter < 20 && st + len <= limit; ++iter) {
+      double far = -1e9;
+      std::string blocker;
+      bool hold_blocked = false;
+      double last = -1e9;
+      for (size_t i = ego_idx; i < ref.size(); ++i) {
+        const double s = data.arclength_from_ego.at(i);
+        if (s > st + len + vp.base_link2front) break;
+        if (s < 0.0 || s - last < STEP) continue;
+        last = s;
+        std::optional<autoware_utils::Polygon2d> f;
+        for (const auto & o : objs) {
+          if (!near_s(o, s)) continue;
+          if (!f) f = footprint(autoware_utils::calc_offset_pose(ref.at(i).point.pose, 0.0, y(s, st, len), 0.0));
+          if (boost::geometry::distance(f.value(), o.poly) >= o.margin) continue;
+          if (s <= st) {
+            hold_blocked = true;
+            blocker = o.id;
+          } else if (o.s_far > far) {
+            far = o.s_far;
+            blocker = o.id;
+          }
+        }
+        if (hold_blocked) break;
+      }
+      if (hold_blocked) {
+        why = "holding the shift runs into " + blocker;
+        break;
+      }
+      if (far < -1e8) {
+        neroFreezeShift(data, ego_shift, 0.0, st, len);
+        data.new_shift_line.clear();
+        data.safe_shift_line.clear();
+        RCLCPP_WARN_THROTTLE(
+          getLogger(), *clock_, 1000,
+          "[NERO_SOA_RCL] the way back toward the lane ran into %s: shift %.2f held, back from %.1f m over %.1f m "
+          "(stop line / junction %.1f m; %zu objects, %.2f ms)",
+          who.c_str(), ego_shift, st, len, limit, objs.size(), elapsed_ms());
+        nero_rcl_holding_ = true;
+        return;
+      }
+      st = std::max(st, far + vp.base_link2rear + nero_rcl::LON_MARGIN);
+      why = "way back blocked up to " + blocker;
+    }
+  }
+  nero_rcl_holding_ = false;
+  RCLCPP_WARN_THROTTLE(
+    getLogger(), *clock_, 1000, "[NERO_SOA_RCL] the way back toward the lane ran into %s, no hold: %s (%.2f ms)",
+    who.c_str(), why.c_str(), elapsed_ms());
 }
 
 void StaticObstacleAvoidanceModule::neroInsertPauseStop(ShiftedPath & shifted_path) const
@@ -2994,6 +3502,9 @@ void StaticObstacleAvoidanceModule::updateData()
   if (nero_ovl::active()) {
     neroOncomingReturn(avoid_data_);  // NERO_SOA_ONCOMING_COMMITTED
   }
+  if (nero_rcl::on()) {
+    neroReturnClear(avoid_data_);  // NERO_SOA_RETURN_CLEAR
+  }
 
   if (nero_ovl::env().debug) {
     neroOncomingDebugLog();  // NERO_SOA_ONCOMING_DEBUG (log only)
@@ -3054,6 +3565,8 @@ void StaticObstacleAvoidanceModule::initVariables()
   nero_stop_now_ = false;
   nero_returning_ = false;
   nero_onc_.reset();
+  nero_lane_latch_.clear();
+  nero_lane_stop_.reset();
 }
 
 void StaticObstacleAvoidanceModule::initRTCStatus()

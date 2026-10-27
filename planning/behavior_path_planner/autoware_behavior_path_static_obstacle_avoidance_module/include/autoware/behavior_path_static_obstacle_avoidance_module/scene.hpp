@@ -499,8 +499,35 @@ private:
   mutable double nero_pause_ease_{0.0};
   mutable double nero_pause_desired_{0.0};  // signed shift ego was heading for when the pause began
   mutable double nero_pause_clear_since_{-1.0};
+  // ---- nero (2026-10-26, returnshift job, QUEUE OLS): NERO_SOA_LANE_BLOCKED. A standing vehicle in ego's own lane that
+  // is not an avoidance target (traffic: the module does not pass it), with the planned path still out of the lane
+  // where obstacle_stop will stop ego for it (or beside it): (id, distance from ego to its nearest point), or nullopt
+  std::optional<std::pair<std::string, double>> neroLaneBlocker(const AvoidancePlanningData & data) const;
+  mutable std::optional<std::pair<std::string, double>> nero_lane_block_;
+  // ... once found, that vehicle is latched (its uuid bytes) while it stands in ego's lane ahead: the module's own stop
+  // where obstacle_stop stops for it (a smooth approach; it never moves the stop nearer than obstacle_stop's)
+  mutable std::string nero_lane_latch_;
+  mutable std::optional<double> nero_lane_stop_;
+  void neroUpdateLaneLatch(const AvoidancePlanningData & data) const;
+  bool neroNeverPassed(
+    const AvoidancePlanningData & data, const PredictedObject & o) const;
   mutable bool nero_stop_now_{false};
   mutable std::string nero_corridor_blocker_;  // NERO_SOA_ONCOMING_CORRIDOR: this cycle's blocker ("" = free)
+
+  // ---- nero (2026-10-26, narrowweave job, QUEUE RSB): NERO_SOA_RETURN_CLEAR. Out of its lane, a planned line back
+  // toward the lane that brings the body within obstacle_stop's lateral margin of a standing object which holding ego's
+  // shift clears (a car parked facing ego in its lane, a stopped car the module waits and sees): the shift is held past
+  // those objects and ego returns over a way back clear of every standing object, before the next stop line or
+  // junction; when no such way fits, the module's own plan stays (the stops' business)
+  void neroReturnClear(AvoidancePlanningData & data);
+  mutable bool nero_rcl_holding_{false};
+  // arc lengths from ego along the reference path of the stop lines (stop signs' ref lines, stop-line markings) and the
+  // junction lanelets' starts on the route ahead
+  std::vector<double> neroStopsAhead(const AvoidancePlanningData & data) const;
+  // NERO_SOA_LANE_BLOCKED (narrowweave): a vehicle judged "not a parked object" is traffic only while it waits for
+  // something: it, or the head of the row of standing vehicles it stands in (gaps <= the queue rule's), stands within the
+  // stop-line rule's distance of a stop line / junction, or a vehicle ahead in that row moves; else it is a parked row
+  bool neroWaiting(const AvoidancePlanningData & data, const ObjectData & od) const;
 
   // ---- nero (2026-10-25, passstart job): an object ahead makes the pass unsafe in the last metres before the shift
   // starts (scene.cpp, NERO_SOA_ONCOMING_START_YIELD). The unsafe object ahead in this cycle's safety check, or "".

@@ -17,8 +17,12 @@
 #include "autoware/behavior_path_planner_common/utils/utils.hpp"
 #include "autoware/behavior_path_static_obstacle_avoidance_module/utils.hpp"
 
+#include <magic_enum.hpp>
+
 #include <algorithm>
 #include <cstdio>
+#include <iomanip>
+#include <sstream>
 #include <unordered_map>
 #include <cstdlib>
 #include <chrono>
@@ -77,6 +81,195 @@ bool nero_same_side_harmless()
     return r;
   }();
   return on;
+}
+
+// NERO_SOA_RETURN_NO_NEED=1 (2026-10-26, QUEUE OLS, capture 10-25 #6): addReturnShiftLine adds no return while any
+// target ahead is not avoidable, and a target that needs no shift at all (SAME_DIRECTION_SHIFT: every kerb UNKNOWN,
+// bin or car parked off the lane is a target, the UNKNOWN filter has no "enough lateral distance" check) is never
+// avoidable: on a street lined with them a robot that is out of its lane (an avoid line with no registered return, a
+// re-engage beside the lane) never comes back. With the switch such targets do not withhold the return (they stay
+// targets for everything else: the safety check, the same-side rule, the stops).
+bool nero_return_no_need()
+{
+  static const bool on = [] {
+    const char * v = std::getenv("NERO_SOA_RETURN_NO_NEED");
+    const bool r = v && std::atoi(v) > 0;
+    std::fprintf(stderr, "[NERO_SOA] return_no_need=%d\n", r);
+    return r;
+  }();
+  return on;
+}
+
+// NERO_SOA_RETURN_DEBUG=1 (log only, 2026-10-26, QUEUE OLS): why addReturnShiftLine adds no return. One line when the
+// reason changes and at most once a second otherwise: the reason, ego's shift, the path shifter's base offset and last
+// registered end shift, and every target ahead (id, class, info, longitudinal, overhang, side, avoidable).
+bool nero_return_debug()
+{
+  static const bool on = [] {
+    const char * v = std::getenv("NERO_SOA_RETURN_DEBUG");
+    return v && std::atoi(v) > 0;
+  }();
+  return on;
+}
+
+void nero_return_log(
+  const std::string & why, const AvoidancePlanningData & data, const double ego_shift,
+  const double base_offset, const std::optional<ShiftLine> & last)
+{
+  if (!nero_return_debug()) {
+    return;
+  }
+  static std::string last_why;
+  static auto last_t = std::chrono::steady_clock::time_point{};
+  const auto now = std::chrono::steady_clock::now();
+  if (why == last_why && now - last_t < std::chrono::seconds(1)) {
+    return;
+  }
+  last_why = why;
+  last_t = now;
+  std::ostringstream ss;
+  ss << std::fixed << std::setprecision(2) << "[NERO_SOA_RET] " << why << " | ego_shift " << ego_shift
+     << " base_offset " << base_offset << " last_end "
+     << (last.has_value() ? std::to_string(last.value().end_shift_length).substr(0, 5) : std::string("none"))
+     << " | ahead:";
+  int n = 0;
+  for (const auto & o : data.target_objects) {
+    if (o.longitudinal <= 0.0) continue;
+    if (++n > 10) {
+      ss << " ...";
+      break;
+    }
+    char id[9];
+    std::snprintf(
+      id, sizeof(id), "%02x%02x%02x%02x", o.object.object_id.uuid[0], o.object.object_id.uuid[1],
+      o.object.object_id.uuid[2], o.object.object_id.uuid[3]);
+    ss << " " << id << ":" << static_cast<int>(utils::getHighestProbLabel(o.object.classification)) << ":"
+       << magic_enum::enum_name(o.info) << ":lon " << o.longitudinal << ":ovh "
+       << (o.overhang_points.empty() ? 0.0 : o.overhang_points.front().first) << ":"
+       << (isOnRight(o) ? "R" : "L") << (o.is_avoidable ? ":A" : ":a");
+  }
+  RCLCPP_INFO(rclcpp::get_logger("static_obstacle_avoidance"), "%s", ss.str().c_str());
+}
+
+// NERO_SOA_RETURN_NO_NEED: where a return from `shift` to the lane centre over `len` m may start and must end so that
+// every standing object's envelope (targets and others: a truck standing in the lane is not a target) keeps its class's
+// lateral hard margin from the robot's sides. The robot's lateral place along the return is the smooth S of a
+// jerk-limited shift; its body passes a point at s_p while base_link is in [s_p - front, s_p + rear].
+// - an object the robot passes out there but the return would come closer to (a truck beside the shifted path): the
+//   return starts only once the rear has passed it;
+// - an object in the way of the shifted path itself (within obstacle_stop's lateral margin of it: staying out runs into
+//   it, e.g. something on the far side of the lane line ahead): the return must be over before the front reaches it;
+// - points after the return's end (the lane ahead) are the avoidance's / the stops' business.
+// Returns {start, end limit}; nullopt when the start moves past `limit`.
+std::optional<std::pair<double, double>> nero_return_window(
+  const AvoidancePlanningData & data, const std::shared_ptr<const PlannerData> & planner_data,
+  const std::shared_ptr<AvoidanceParameters> & parameters, const double shift, double start,
+  const double len, const double limit, std::string & who, std::string & who_end)
+{
+  const auto & points = data.reference_path.points;
+  if (points.size() < 2 || data.arclength_from_ego.size() != points.size()) {
+    return std::make_pair(start, limit);
+  }
+  const double half_w = 0.5 * planner_data->parameters.vehicle_width;
+  const double front = planner_data->parameters.base_link2front;
+  const double rear = planner_data->parameters.base_link2rear;
+  constexpr double LON_MARGIN = 0.5;
+  constexpr double LAT_EXTRA = 0.1;  // the S profile is approximated
+  struct Pt
+  {
+    double s;
+    double l;
+    double m;       // the module's margin (hard) for the return
+    double m_stop;  // obstacle_stop's lateral margin on the car (vehicles 0.1 m, others 0.3 m)
+    std::string id;
+    size_t obj;
+  };
+  std::vector<Pt> pts;
+  size_t n_obj = 0;
+  const auto add = [&](const ObjectData & o) {
+    const auto type = utils::getHighestProbLabel(o.object.classification);
+    const auto & op = parameters->object_parameters.at(type);
+    if (o.move_time > op.moving_time_threshold) return;  // moving: not a standing object
+    const bool vehicle = type == ObjectClassification::CAR || type == ObjectClassification::TRUCK ||
+                         type == ObjectClassification::BUS || type == ObjectClassification::TRAILER ||
+                         type == ObjectClassification::MOTORCYCLE;
+    char id[9];
+    std::snprintf(
+      id, sizeof(id), "%02x%02x%02x%02x", o.object.object_id.uuid[0], o.object.object_id.uuid[1],
+      o.object.object_id.uuid[2], o.object.object_id.uuid[3]);
+    // the envelope's outline every 0.5 m, not only its corners (narrowweave 2026-10-26: an object straddling the line
+    // ego returns to, corners on both sides of it, was never in the way: c08's 4bbb26 across the lane centre made the
+    // return end in front of the parked row and ego waited behind it for good)
+    const auto & outer = o.envelope_poly.outer();
+    for (size_t j = 0; j + 1 < outer.size() || (j == 0 && outer.size() == 1); ++j) {
+      const auto & a = outer.at(j);
+      const auto & b = outer.at(std::min(j + 1, outer.size() - 1));
+      const int n_step = std::max(1, static_cast<int>(std::ceil(std::hypot(b.x() - a.x(), b.y() - a.y()) / 0.5)));
+      for (int k = 0; k < n_step; ++k) {
+        geometry_msgs::msg::Point p;
+        p.x = a.x() + (b.x() - a.x()) * k / n_step;
+        p.y = a.y() + (b.y() - a.y()) * k / n_step;
+        const size_t seg = autoware::motion_utils::findNearestSegmentIndex(points, p);
+        const double s = data.arclength_from_ego.at(seg) +
+                         autoware::motion_utils::calcLongitudinalOffsetToSegment(points, seg, p);
+        if (s < -rear - LON_MARGIN || s > limit + front) continue;
+        pts.push_back(
+          {s, autoware::motion_utils::calcLateralOffset(points, p, seg),
+           half_w + op.lateral_hard_margin + LAT_EXTRA, half_w + (vehicle ? 0.1 : 0.3), id, n_obj});
+      }
+    }
+    ++n_obj;
+  };
+  for (const auto & o : data.target_objects) add(o);
+  for (const auto & o : data.other_objects) add(o);
+
+  // per object ahead: in the way of staying out (a point within obstacle_stop's margin of the shifted path), and in the
+  // way of the lane centre (a point within the module's margin of it): an end limit only for one that blocks staying
+  // out but not the centre (returning clears it); one that blocks both (a truck in the lane) is the stops' business
+  std::vector<char> blocks_stay(n_obj, 0), blocks_centre(n_obj, 0);
+  std::vector<double> near(n_obj, 1e9);
+  for (const auto & p : pts) {
+    if (p.s < front) continue;
+    if (std::abs(p.l - shift) < p.m_stop) blocks_stay[p.obj] = 1;
+    if (std::abs(p.l) < p.m) blocks_centre[p.obj] = 1;
+    near[p.obj] = std::min(near[p.obj], p.s);
+  }
+  double end_limit = limit;
+  for (const auto & p : pts) {
+    if (!blocks_stay[p.obj] || blocks_centre[p.obj]) continue;
+    if (near[p.obj] - front - LON_MARGIN < end_limit) {
+      end_limit = near[p.obj] - front - LON_MARGIN;
+      who_end = p.id;
+    }
+  }
+  const auto y = [&](const double s, const double st) {
+    if (s <= st) return shift;
+    if (s >= st + len) return 0.0;
+    const double x = (s - st) / std::max(len, 0.1);
+    return shift * (1.0 - x * x * (3.0 - 2.0 * x));
+  };
+  for (int iter = 0; iter < 20; ++iter) {
+    double far = -1e9;
+    for (const auto & p : pts) {
+      if (blocks_stay[p.obj] && !blocks_centre[p.obj]) continue;  // the end limit above
+      if (p.s - front > start + len) continue;         // the lane after the return
+      const double ya = y(p.s - front, start);
+      const double yb = y(p.s + rear, start);
+      // the body's lateral clearance to the point while passing it on the return vs staying out: a conflict only
+      // where the return brings the body closer than the margin and closer than it is out there
+      const double lo = std::min(ya, yb), hi = std::max(ya, yb);
+      const double d_ret = p.l < lo ? lo - p.l : (p.l > hi ? p.l - hi : 0.0);
+      const double d_stay = std::abs(p.l - shift);
+      if (d_ret < p.m && d_ret < d_stay - 0.01 && p.s > far) {
+        far = p.s;
+        who = p.id;
+      }
+    }
+    if (far < -1e8) return std::make_pair(start, end_limit);
+    start = std::max(start, far + rear + LON_MARGIN);
+    if (start > limit) return std::nullopt;
+  }
+  return std::nullopt;
 }
 }  // namespace
 
@@ -1184,25 +1377,34 @@ AvoidLineArray ShiftLineGenerator::addReturnShiftLine(
       });
     if (has_object_near_goal) {
       RCLCPP_DEBUG(rclcpp::get_logger(""), "object near goal exists so skip adding return shift");
+      nero_return_log("object near goal", data, helper_->getEgoShift(), base_offset_, last_);
       return ret;
     }
   }
 
+  // NERO_SOA_RETURN_NO_NEED: a target that needs no shift even from the lane centre (SAME_DIRECTION_SHIFT: kerb
+  // objects, bins, cars parked off the lane) does not withhold the return; the return ends at the centre, which keeps
+  // its margin by that very verdict, and every shift on the way lies between ego's and the centre's
   const auto exist_unavoidable_object = std::any_of(
-    data.target_objects.begin(), data.target_objects.end(),
-    [](const auto & o) { return !o.is_avoidable && o.longitudinal > 0.0; });
+    data.target_objects.begin(), data.target_objects.end(), [](const auto & o) {
+      if (nero_return_no_need() && o.info == ObjectInfo::SAME_DIRECTION_SHIFT) return false;
+      return !o.is_avoidable && o.longitudinal > 0.0;
+    });
 
   if (exist_unavoidable_object) {
+    nero_return_log("unavoidable target ahead", data, helper_->getEgoShift(), base_offset_, last_);
     return ret;
   }
 
   if (last_.has_value()) {
     if (std::abs(last_.value().end_shift_length) < RETURN_SHIFT_THRESHOLD) {
+      nero_return_log("last registered line already ends at the centre", data, helper_->getEgoShift(), base_offset_, last_);
       return ret;
     }
   } else {
     // If the return-to-center shift points are already registered, do nothing.
     if (std::abs(base_offset_) < ep) {
+      nero_return_log("no base offset", data, helper_->getEgoShift(), base_offset_, last_);
       return ret;
     }
   }
@@ -1253,6 +1455,7 @@ AvoidLineArray ShiftLineGenerator::addReturnShiftLine(
       });
     if (has_last_shift_near_goal) {
       RCLCPP_DEBUG(rclcpp::get_logger(""), "last shift line is near the objects");
+      nero_return_log("last shift line near the goal", data, helper_->getEgoShift(), base_offset_, last_);
       return ret;
     }
   }
@@ -1263,6 +1466,7 @@ AvoidLineArray ShiftLineGenerator::addReturnShiftLine(
   if (std::fabs(last_sl.end_shift_length) < RETURN_SHIFT_THRESHOLD) {
     const auto current_base_shift = helper_->getEgoShift();
     if (std::abs(current_base_shift) < ep) {
+      nero_return_log("ego not shifted", data, current_base_shift, base_offset_, last_);
       return ret;
     }
 
@@ -1275,6 +1479,7 @@ AvoidLineArray ShiftLineGenerator::addReturnShiftLine(
       if (
         (current_base_shift > 0.0 && sl.end_shift_length < -ep) ||
         (current_base_shift < 0.0 && sl.end_shift_length > ep)) {
+        nero_return_log("a line to the other side exists", data, current_base_shift, base_offset_, last_);
         return ret;
       }
     }
@@ -1282,6 +1487,7 @@ AvoidLineArray ShiftLineGenerator::addReturnShiftLine(
     // If return shift already exists in candidate or registered shift lines, skip adding return
     // shift.
     if (has_candidate_point || has_registered_point) {
+      nero_return_log("a return line already exists", data, current_base_shift, base_offset_, last_);
       return ret;
     }
 
@@ -1312,6 +1518,10 @@ AvoidLineArray ShiftLineGenerator::addReturnShiftLine(
   // check if there is enough distance for return.
   if (last_sl_distance > remaining_distance) {  // tmp: add some small number (+1.0)
     RCLCPP_DEBUG(rclcpp::get_logger(""), "No enough distance for return.");
+    nero_return_log(
+      "no room for the return: last line ends " + std::to_string(last_sl_distance).substr(0, 6) +
+        " m, remaining " + std::to_string(remaining_distance).substr(0, 6) + " m",
+      data, helper_->getEgoShift(), base_offset_, last_);
     return ret;
   }
 
@@ -1345,8 +1555,42 @@ AvoidLineArray ShiftLineGenerator::addReturnShiftLine(
     avoid_distance_scaled *= scale;
   }
 
+  // NERO_SOA_RETURN_NO_NEED: the return starts only where it clears every standing object it would come closer to,
+  // and is over before an object that blocks staying out (sharper if needed, at most the module's sharpest)
+  bool nero_moved_start = false;
+  if (nero_return_no_need()) {
+    std::string who, who_end;
+    const auto window = nero_return_window(
+      data, data_, parameters_, last_sl.end_shift_length, prepare_distance_scaled, avoid_distance_scaled,
+      remaining_distance, who, who_end);
+    if (!window) {
+      nero_return_log(
+        "return would touch standing object " + who + ": not before the dead line", data,
+        helper_->getEgoShift(), base_offset_, last_);
+      return ret;
+    }
+    if (window->first > prepare_distance_scaled + 1e-3) {
+      nero_return_log(
+        "return start moved " + std::to_string(prepare_distance_scaled).substr(0, 5) + " -> " +
+          std::to_string(window->first).substr(0, 5) + " m past standing object " + who,
+        data, helper_->getEgoShift(), base_offset_, last_);
+      prepare_distance_scaled = window->first;
+      nero_moved_start = true;
+    }
+    if (prepare_distance_scaled + avoid_distance_scaled > window->second) {
+      const double sharp = helper_->getSharpAvoidanceDistance(std::abs(last_sl.end_shift_length));
+      const double fit = std::max(sharp, window->second - prepare_distance_scaled);
+      nero_return_log(
+        "return over " + std::to_string(avoid_distance_scaled).substr(0, 5) + " -> " + std::to_string(fit).substr(0, 5) +
+          " m to end before " + who_end + " (in the way of staying out" +
+          (fit > window->second - prepare_distance_scaled ? ", the sharpest does not fit)" : ")"),
+        data, helper_->getEgoShift(), base_offset_, last_);
+      avoid_distance_scaled = std::min(avoid_distance_scaled, fit);
+    }
+  }
+
   // shift point for prepare distance: from last shift to return-start point.
-  if (nominal_prepare_distance > last_sl_distance) {
+  if (nominal_prepare_distance > last_sl_distance || nero_moved_start) {
     AvoidLine al;
     al.id = generate_uuid();
     al.start_idx = last_sl.end_idx;
@@ -1380,6 +1624,11 @@ AvoidLineArray ShiftLineGenerator::addReturnShiftLine(
     debug.step1_return_shift_line.push_back(al);
   }
 
+  nero_return_log(
+    "return added from " + std::to_string(last_sl.end_shift_length).substr(0, 5) + " at " +
+      std::to_string(prepare_distance_scaled).substr(0, 5) + " m over " +
+      std::to_string(avoid_distance_scaled).substr(0, 5) + " m",
+    data, helper_->getEgoShift(), base_offset_, last_);
   return ret;
 }
 
