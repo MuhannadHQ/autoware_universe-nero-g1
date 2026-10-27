@@ -23,6 +23,12 @@
 //     in the band (obstacle_stop below 3.0 m/s along the path, cruise at <= 30 deg): ~1 s before contact for a car entering
 //     3 m ahead of a robot at 20 km/h.
 //   NERO_CRUISE_CUTIN_DEBUG=1 - log only: every yield (object, deceleration, distances).
+//   NERO_CRUISE_YIELD_GAIN="gain_m,critical_m" (mergeahead 2026-10-27, QUEUE CUTY; needs _YIELD) - when no ease-off up to
+//     a_max keeps gap_m (the car is already about that close), a squeeze yield STARTS (braking at a_max) only if that
+//     adds >= gain_m to the closest approach, or the car would otherwise come within critical_m; a car passing at about its
+//     closest now draws nothing; a yield already started is held as before (c56c: released early, its car passed at
+//     0.92 m instead of 1.13) (10-25 #20: 330df8 joining the next lane beside ego's nose and pulling away at +2 m/s got
+//     -2.0 m/s2 for 1.2 s, 2.8 -> 1.0 m/s, for +0.12 m). The steep branch is unchanged. Unset = cutin_1027.
 #ifndef NERO_CUTIN_HPP_
 #define NERO_CUTIN_HPP_
 
@@ -46,6 +52,8 @@ struct NeroCutinParam
   double steep_a_stop{3.0};
   double steep_max_lat_m{6.0};
   double steep_a_max{2.5};
+  double gain_m{0.0};
+  double gain_critical_m{0.3};
   bool debug{false};
 };
 
@@ -63,6 +71,9 @@ inline const NeroCutinParam & nero_cutin_param()
         e, "%lf,%lf,%lf,%lf,%lf", &r.steep_min_deg, &r.steep_max_deg, &r.steep_a_stop,
         &r.steep_max_lat_m, &r.steep_a_max);
     }
+    if (const char * e = std::getenv("NERO_CRUISE_YIELD_GAIN")) {
+      std::sscanf(e, "%lf,%lf", &r.gain_m, &r.gain_critical_m);
+    }
     if (const char * e = std::getenv("NERO_CRUISE_CUTIN_DEBUG")) {
       r.debug = std::string(e) == "1";
     }
@@ -78,6 +89,7 @@ struct NeroCutinState
   {
     double last{-1e9};
     int n{0};
+    double yielded{-1e9};  // the last cycle a yield was output for it
   };
   std::unordered_map<std::string, Hits> hits;
 
@@ -94,6 +106,12 @@ struct NeroCutinState
     return it != hits.end() && now - it->second.last < 0.25;
   }
   void clear(const std::string & uuid) { hits.erase(uuid); }
+  void mark_yield(const std::string & uuid, const double now) { hits[uuid].yielded = now; }
+  bool yielding(const std::string & uuid, const double now) const
+  {
+    const auto it = hits.find(uuid);
+    return it != hits.end() && now - it->second.yielded < 0.25;
+  }
   void prune(const double now)
   {
     for (auto it = hits.begin(); it != hits.end();) {

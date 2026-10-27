@@ -19,13 +19,17 @@
 #include <autoware/motion_utils/marker/virtual_wall_marker_creator.hpp>
 #include <autoware/motion_utils/trajectory/trajectory.hpp>
 #include <autoware/signal_processing/lowpass_filter_1d.hpp>
+#include <autoware_utils/geometry/boost_polygon_utils.hpp>
 #include <autoware_utils/geometry/geometry.hpp>
 #include <autoware_utils/ros/marker_helper.hpp>
 #include <autoware_utils/ros/parameter.hpp>
 #include <autoware_utils/ros/update_param.hpp>
 #include <autoware_utils/ros/uuid_helper.hpp>
 
+#include <tf2/utils.h>
+
 #include <algorithm>
+#include <cmath>
 #include <iostream>
 #include <limits>
 #include <map>
@@ -390,6 +394,10 @@ ObstacleSlowDownModule::filter_slow_down_obstacle_for_predicted_object(
   autoware_utils::ScopedTimeTrack st(__func__, *time_keeper_);
 
   const auto & current_pose = odometry.pose.pose;
+  nero_osd_cycle_ = NeroOsdCycle{&odometry, &vehicle_info, false, {}};
+  if (nero_osd_param().enabled || nero_osd_param().debug) {
+    nero_osd_record(traj_points, objects, current_pose.position);
+  }
 
   // calculate collision points with trajectory with lateral stop margin
   // NOTE: For additional margin, hysteresis is not divided by two.
@@ -523,10 +531,20 @@ ObstacleSlowDownModule::create_slow_down_obstacle_for_predicted_object(
     p.max_lat_margin + p.lat_hysteresis_margin / 2.0,
     p.max_lat_margin - p.lat_hysteresis_margin / 2.0);
 
+  // NERO_OSD_NOT_IN_WAY (nero_osd.hpp): a moving vehicle that is not in ego's way does not meet the condition (the
+  // stock 5-cycle hysteresis still applies); NERO_OSD_DEBUG=1 alone only logs
+  bool nero_not_in_way = false;
+  if (is_lat_dist_low && (nero_osd_param().enabled || nero_osd_param().debug)) {
+    nero_not_in_way =
+      nero_osd_not_in_way(traj_points, object, dist_from_obj_poly_to_traj_poly, obj_uuid_str) &&
+      nero_osd_param().enabled;
+  }
+  const bool is_slow_down_condition_met = is_lat_dist_low && !nero_not_in_way;
+
   const bool is_slow_down_required = [&]() {
     if (is_prev_obstacle_slow_down) {
       // check if exiting slow down
-      if (!is_lat_dist_low) {
+      if (!is_slow_down_condition_met) {
         const int count = slow_down_condition_counter_.decrease_counter(obj_uuid_str);
         if (count <= -p.successive_num_to_exit_slow_down_condition) {
           slow_down_condition_counter_.reset(obj_uuid_str);
@@ -536,7 +554,7 @@ ObstacleSlowDownModule::create_slow_down_obstacle_for_predicted_object(
       return true;
     }
     // check if entering slow down
-    if (is_lat_dist_low) {
+    if (is_slow_down_condition_met) {
       const int count = slow_down_condition_counter_.increase_counter(obj_uuid_str);
       if (p.successive_num_to_entry_slow_down_condition <= count) {
         slow_down_condition_counter_.reset(obj_uuid_str);
@@ -625,6 +643,177 @@ ObstacleSlowDownModule::create_slow_down_obstacle_for_predicted_object(
     dist_from_obj_poly_to_traj_poly,
     front_collision_point,
     back_collision_point};
+}
+
+void ObstacleSlowDownModule::nero_osd_record(
+  const std::vector<TrajectoryPoint> & traj_points,
+  const std::vector<std::shared_ptr<PlannerData::Object>> & objects, const geometry_msgs::msg::Point & ego_pos)
+{
+  // the measured offset of every moving vehicle near ego's path (within 8 m aside, 10 m behind .. 60 m ahead)
+  if (traj_points.size() < 2) {
+    return;
+  }
+  const double now = clock_->now().seconds();
+  nero_osd_history_.prune(now);
+  for (const auto & object : objects) {
+    const auto & po = object->predicted_object;
+    const uint8_t label = po.classification.at(0).label;
+    if (
+      label != ObjectClassification::CAR && label != ObjectClassification::TRUCK &&
+      label != ObjectClassification::BUS && label != ObjectClassification::TRAILER &&
+      label != ObjectClassification::MOTORCYCLE) {
+      continue;
+    }
+    const double lon = object->get_dist_from_ego_longitudinal(traj_points, ego_pos);
+    if (lon < -10.0 || 60.0 < lon) {
+      continue;
+    }
+    const double d = object->get_dist_to_traj_lateral(traj_points);
+    if (8.0 < std::abs(d)) {
+      continue;
+    }
+    const auto & tw = po.kinematics.initial_twist_with_covariance.twist;
+    nero_osd_history_.add(
+      autoware_utils::to_hex_string(po.object_id), now, d, std::hypot(tw.linear.x, tw.linear.y));
+  }
+}
+
+bool ObstacleSlowDownModule::nero_osd_not_in_way(
+  const std::vector<TrajectoryPoint> & traj_points, const std::shared_ptr<PlannerData::Object> & object,
+  const double dist_from_obj_poly_to_traj_poly, const std::string & obj_uuid_str)
+{
+  const auto & np = nero_osd_param();
+  auto & c = nero_osd_cycle_;
+  if (!c.odometry || !c.vehicle_info || traj_points.size() < 2) {
+    return false;
+  }
+  const auto & predicted_object = object->predicted_object;
+  const uint8_t label = predicted_object.classification.at(0).label;
+  const bool is_vehicle =
+    label == ObjectClassification::CAR || label == ObjectClassification::TRUCK ||
+    label == ObjectClassification::BUS || label == ObjectClassification::TRAILER ||
+    label == ObjectClassification::MOTORCYCLE;
+  const auto & pose = predicted_object.kinematics.initial_pose_with_covariance.pose;
+  const auto & twist = predicted_object.kinematics.initial_twist_with_covariance.twist;
+  const double v_obj = std::hypot(twist.linear.x, twist.linear.y);
+  if (!is_vehicle || v_obj < np.min_v) {
+    if (np.debug) {
+      RCLCPP_INFO(
+        logger_, "[NERO_OSD] %s cls %d v %.2f gap %.2f -> stock (class / speed)",
+        obj_uuid_str.substr(0, 6).c_str(), label, v_obj, dist_from_obj_poly_to_traj_poly);
+    }
+    return false;
+  }
+  constexpr double dt = 0.1;
+  const auto & vi = *c.vehicle_info;
+  const auto & ego_pose = c.odometry->pose.pose;
+  const double v0 = std::max(0.0, c.odometry->twist.twist.linear.x);
+  // ego's footprints along the trajectory, once per cycle: from its speed, accelerating at 1 m/s2 up to the trajectory's
+  // speed (the closest ego could get to a car ahead)
+  if (!c.ego_ready) {
+    c.ego_ready = true;
+    std::vector<double> cum{0.0};
+    for (size_t i = 1; i < traj_points.size(); ++i) {
+      cum.push_back(
+        cum.back() + autoware_utils::calc_distance2d(traj_points.at(i - 1), traj_points.at(i)));
+    }
+    constexpr double ego_acc = 1.0;
+    double s = autoware::motion_utils::calcSignedArcLength(traj_points, 0, ego_pose.position);
+    double v = v0;
+    for (double t = 0.0; t <= np.t_s + 1e-6; t += dt) {
+      const auto fp_pose = autoware::motion_utils::calcLongitudinalOffsetPose(traj_points, 0, s);
+      if (!fp_pose) {
+        break;
+      }
+      c.ego_footprints.push_back(autoware_utils::to_footprint(
+        *fp_pose, vi.max_longitudinal_offset_m, vi.rear_overhang_m, vi.vehicle_width_m));
+      const size_t k = std::min<size_t>(
+        std::upper_bound(cum.begin(), cum.end(), s) - cum.begin(), traj_points.size() - 1);
+      v = std::min<double>(v + ego_acc * dt, std::max(v0, static_cast<double>(traj_points.at(k).longitudinal_velocity_mps)));
+      s += v * dt;
+    }
+  }
+  // its box carried at its current velocity in the trajectory's frame (cutin_1027's check)
+  const double obj_yaw = tf2::getYaw(pose.orientation);
+  const double traj_yaw = tf2::getYaw(
+    traj_points.at(autoware::motion_utils::findNearestIndex(traj_points, pose.position)).pose.orientation);
+  const double dir_rel =
+    autoware_utils::normalize_radian(obj_yaw + std::atan2(twist.linear.y, twist.linear.x) - traj_yaw);
+  const double yaw_rel = autoware_utils::normalize_radian(obj_yaw - traj_yaw);
+  const double angle_deg = std::abs(yaw_rel) * 180.0 / M_PI;
+  const double s_obj = autoware::motion_utils::calcSignedArcLength(traj_points, 0, pose.position);
+  const double d_obj = autoware::motion_utils::calcLateralOffset(traj_points, pose.position);
+  // its speed toward / away from ego's path: the measured offset trend (1 s) once it exists, else its heading
+  double v_lat = v_obj * std::sin(dir_rel);
+  double v_lat_meas = 0.0;
+  const bool measured = nero_osd_history_.rate(obj_uuid_str, v_lat_meas);
+  if (measured) {
+    v_lat = v_lat_meas;
+  }
+  // its speed changes at its measured acceleration (-4..+1 m/s2), else it keeps its speed
+  double a_obj = 0.0;
+  if (nero_osd_history_.rate(obj_uuid_str, a_obj, true)) {
+    a_obj = std::clamp(a_obj, -4.0, 1.0);
+  }
+  const auto travelled = [&](const double t) {
+    const double t_stop = a_obj < 0.0 ? v_obj / -a_obj : std::numeric_limits<double>::max();
+    const double tt = std::min(t, t_stop);
+    return v_obj * tt + 0.5 * a_obj * tt * tt;
+  };
+  double d_min = std::numeric_limits<double>::max();
+  double d_now = std::numeric_limits<double>::max();
+  double t_min = 0.0;
+  for (size_t i = 0; i < c.ego_footprints.size(); ++i) {
+    const double t = dt * static_cast<double>(i);
+    Polygon2d obj_poly;
+    if (i == 0) {
+      obj_poly = autoware_utils::to_polygon2d(pose, predicted_object.shape);
+    } else {
+      const auto base = autoware::motion_utils::calcLongitudinalOffsetPose(
+        traj_points, 0, s_obj + travelled(t) * std::cos(dir_rel));
+      if (!base) {
+        break;
+      }
+      const double by = tf2::getYaw(base->orientation);
+      const double d = d_obj + v_lat * t;
+      auto q = pose;
+      q.position.x = base->position.x - d * std::sin(by);
+      q.position.y = base->position.y + d * std::cos(by);
+      q.orientation = autoware_utils::create_quaternion_from_yaw(by + yaw_rel);
+      obj_poly = autoware_utils::to_polygon2d(q, predicted_object.shape);
+    }
+    const double d = boost::geometry::distance(c.ego_footprints.at(i), obj_poly);
+    if (i == 0) {
+      d_now = d;
+    }
+    if (d < d_min) {
+      d_min = d;
+      t_min = t;
+    }
+  }
+  // its offset to ego's path within t_s (shrinking = moving toward the path)
+  const double d_end = d_obj + v_lat * np.t_s;
+  const double approach =
+    std::abs(d_obj) - ((d_obj > 0.0) != (d_end > 0.0) ? 0.0 : std::min(std::abs(d_obj), std::abs(d_end)));
+  // (separating) never closer than it is now (or than keep_m, when farther now)
+  const bool pull_away = np.min_gap_m <= d_now && std::min(d_now, np.keep_m) - 0.05 <= d_min;
+  // (beside) keeping its own lane next to ego's
+  const bool beside = angle_deg <= np.max_deg && approach < np.approach_m && np.min_gap_m <= d_min &&
+                      np.min_gap_m <= dist_from_obj_poly_to_traj_poly;
+  // (passing) clearly faster along the path and never within pass_m
+  const bool passing = 0.0 < np.pass_m && v0 + 0.5 <= v_obj * std::cos(dir_rel) && np.pass_m <= d_min;
+  const bool not_in_way = pull_away || beside || passing;
+  if (np.debug) {
+    RCLCPP_INFO(
+      logger_,
+      "[NERO_OSD] %s cls %d v %.2f a %.2f ang %.1f gap %.2f lon %.2f d_obj %.2f vlat %.2f%s appr %.2f dmin %.2f t %.1f "
+      "dnow %.2f v_ego %.2f -> %s",
+      obj_uuid_str.substr(0, 6).c_str(), label, v_obj, a_obj, angle_deg, dist_from_obj_poly_to_traj_poly,
+      s_obj - autoware::motion_utils::calcSignedArcLength(traj_points, 0, ego_pose.position), d_obj, v_lat,
+      measured ? "m" : "h", approach, d_min, t_min, d_now, v0,
+      pull_away ? "not in way (separating)" : beside ? "not in way (beside)" : passing ? "not in way (passing)" : "stock");
+  }
+  return not_in_way;
 }
 
 SlowDownObstacle ObstacleSlowDownModule::create_slow_down_obstacle_for_point_cloud(

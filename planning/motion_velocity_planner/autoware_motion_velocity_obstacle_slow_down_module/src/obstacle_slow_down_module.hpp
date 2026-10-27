@@ -19,6 +19,7 @@
 #include "autoware/motion_velocity_planner_common/utils.hpp"
 #include "autoware_utils/system/stop_watch.hpp"
 #include "autoware_utils/system/time_keeper.hpp"
+#include "nero_osd.hpp"
 #include "parameters.hpp"
 #include "type_alias.hpp"
 #include "types.hpp"
@@ -86,6 +87,23 @@ private:
   bool need_to_clear_velocity_limit_{false};
   mutable std::shared_ptr<autoware_utils::TimeKeeper> time_keeper_;
   mutable std::optional<std::vector<Polygon2d>> decimated_traj_polys_{std::nullopt};
+
+  // NERO_OSD_NOT_IN_WAY (nero_osd.hpp): this cycle's ego state and ego's footprints along the trajectory (lazily)
+  struct NeroOsdCycle
+  {
+    const Odometry * odometry{nullptr};
+    const VehicleInfo * vehicle_info{nullptr};
+    bool ego_ready{false};
+    std::vector<Polygon2d> ego_footprints;  // t = 0, 0.1, ...
+  };
+  NeroOsdCycle nero_osd_cycle_;
+  NeroOsdHistory nero_osd_history_;
+  void nero_osd_record(
+    const std::vector<TrajectoryPoint> & traj_points,
+    const std::vector<std::shared_ptr<PlannerData::Object>> & objects, const geometry_msgs::msg::Point & ego_pos);
+  bool nero_osd_not_in_way(
+    const std::vector<TrajectoryPoint> & traj_points, const std::shared_ptr<PlannerData::Object> & object,
+    const double dist_from_obj_poly_to_traj_poly, const std::string & obj_uuid_str);
 
   std::vector<autoware::motion_velocity_planner::SlowDownPointData>
   convert_point_cloud_to_slow_down_points(

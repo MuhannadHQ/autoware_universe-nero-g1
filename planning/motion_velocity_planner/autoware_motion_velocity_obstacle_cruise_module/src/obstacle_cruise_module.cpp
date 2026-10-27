@@ -977,6 +977,20 @@ void ObstacleCruiseModule::nero_cutin_yield(
       }
     }
     step = std::min(step, max_steps);
+    // NERO_CRUISE_YIELD_GAIN (nero_cutin.hpp): no ease-off keeps the gap -> start braking at a_max only if it buys
+    // clearance (a started yield is held as before)
+    if (
+      !steep && 0.0 < np.gain_m && d < gap && d - d0 < np.gain_m && np.gain_critical_m <= d0 &&
+      !nero_cutin_state_.yielding(obj_uuid_str, now)) {
+      if (np.debug) {
+        RCLCPP_INFO(
+          logger_,
+          "[NERO_CRUISE_CUTIN] no gain %s now %.2f d0 %.2f d(a_max) %.2f v_obj %.2f lon %.2f v_ego %.2f",
+          obj_uuid_str.substr(0, 6).c_str(), d_now, d0, d, v_obj, lon_dist, v0);
+      }
+      nero_cutin_state_.clear(obj_uuid_str);
+      continue;
+    }
     if (np.debug) {
       RCLCPP_INFO(
         logger_,
@@ -984,6 +998,7 @@ void ObstacleCruiseModule::nero_cutin_yield(
         steep ? " steep" : "", obj_uuid_str.substr(0, 6).c_str(), 0.25 * step, d_now, d0, d, v_obj,
         calc_diff_angle_against_trajectory(traj_points, pose) * 180.0 / M_PI, lon_dist, v0, v_at);
     }
+    nero_cutin_state_.mark_yield(obj_uuid_str, now);
     if (steep) {
       a_steep = std::max(a_steep, step);
       v_steep = std::min(v_steep, v0 - 0.25 * step * 2.0);
