@@ -51,6 +51,12 @@ double calc_dist_from_pose_to_terminal_end(
 double calc_stopping_distance(const LCParamPtr & lc_param_ptr);
 
 /**
+ * @brief NERO (routelc job): the distance from where the lane change's first target lane begins (beside the current
+ * lanes) to the terminal end of the current lanes, along the current lanes.
+ */
+double nero_change_window(const CommonDataPtr & common_data_ptr, const lanelet::ConstLanelets & lanes);
+
+/**
  * @brief Calculates the distance to last fit width position along the lane
  *
  * This function computes the distance from the current ego position to the last

@@ -519,6 +519,11 @@ std::vector<lane_change::TrajectoryGroup> generate_frenet_candidates(
   const auto & target_lanes = common_data_ptr->lanes_ptr->target;
   const auto direction = common_data_ptr->direction;
   const auto current_lane_boundary = get_linestring_bound(current_lanes, direction);
+  // NERO_LC_DEBUG=1 (log only, routelc job): why the frenet search gives no candidate (once a second)
+  struct NeroFrenetCount
+  {
+    size_t prep_fail{0}, ref_empty{0}, no_sampling{0}, generated{0}, duplicate{0}, out_of_bound{0};
+  } nero_count;
 
   for (const auto & metric : prep_metrics) {
     PathWithLaneId prepare_segment;
@@ -526,6 +531,7 @@ std::vector<lane_change::TrajectoryGroup> generate_frenet_candidates(
       if (!utils::lane_change::get_prepare_segment(
             common_data_ptr, prev_module_path, metric.length, prepare_segment)) {
         RCLCPP_DEBUG(get_logger(), "Reject: failed to get valid prepare segment!");
+        ++nero_count.prep_fail;
         continue;
       }
     } catch (const std::exception & e) {
@@ -539,12 +545,37 @@ std::vector<lane_change::TrajectoryGroup> generate_frenet_candidates(
         common_data_ptr, target_lanes, lc_start_pose) -
       common_data_ptr->lc_param_ptr->lane_change_finish_judge_buffer;
     const auto max_lc_len = transient_data.lane_changing_length.max;
-    const auto max_lane_changing_length = std::min(dist_to_end_from_lc_start, max_lc_len);
+    auto max_lane_changing_length = std::min(dist_to_end_from_lc_start, max_lc_len);
+    // NERO_LC_FRENET_ROOM=1 (routelc job 2026-10-26): lane_changing_length.max is an upper bound (a 3 s prepare at the
+    // highest acceleration + the change), and the target reference below is rejected when the target lane gives less
+    // room than that before the next change's buffer. Near the terminal with two changes due (93643 -> 41986 -> 93649)
+    // that rejected every candidate from the waiting stop (57 of 57 metrics "no target reference", sim 1026-215257)
+    // although the change itself needs ~9-14 m: the robot could never start from its stand. Cap the length at that
+    // room; below the minimum change length there is no candidate (as the gate says). Unset = upstream (same in main).
+    static const bool nero_frenet_room = [] {
+      const char * v = std::getenv("NERO_LC_FRENET_ROOM");
+      return v != nullptr && std::atoi(v) > 0;
+    }();
+    if (nero_frenet_room) {
+      const double s_lc_start = lanelet::utils::getArcCoordinates(target_lanes, lc_start_pose).length;
+      const double s_limit =
+        (common_data_ptr->lanes_ptr->target_lane_in_goal_section
+           ? lanelet::utils::getArcCoordinates(target_lanes, common_data_ptr->route_handler_ptr->getGoalPose()).length
+           : transient_data.target_lane_length) -
+        transient_data.next_dist_buffer.min;
+      const double room = s_limit - s_lc_start;
+      if (room < transient_data.lane_changing_length.min) {
+        ++nero_count.ref_empty;
+        continue;
+      }
+      max_lane_changing_length = std::min(max_lane_changing_length, room);
+    }
 
     constexpr auto resample_interval = 0.5;
     const auto target_lane_reference_path = get_reference_path_from_target_lane(
       common_data_ptr, lc_start_pose, max_lane_changing_length, resample_interval);
     if (target_lane_reference_path.points.empty()) {
+      ++nero_count.ref_empty;
       continue;
     }
 
@@ -572,11 +603,13 @@ std::vector<lane_change::TrajectoryGroup> generate_frenet_candidates(
       init_sampling_parameters(common_data_ptr, metric, initial_state, reference_spline);
 
     if (!sampling_parameters_opt) {
+      ++nero_count.no_sampling;
       continue;
     }
 
     auto frenet_trajectories = frenet_planner::generateTrajectories(
       reference_spline, initial_state, *sampling_parameters_opt);
+    nero_count.generated += frenet_trajectories.size();
 
     trajectory_groups.reserve(trajectory_groups.size() + frenet_trajectories.size());
     for (const auto & traj : frenet_trajectories) {
@@ -585,6 +618,7 @@ std::vector<lane_change::TrajectoryGroup> generate_frenet_candidates(
           traj.frenet_points.back().s -
           trajectory_groups.back().lane_changing.frenet_points.back().s);
         if (diff < common_data_ptr->lc_param_ptr->trajectory.th_lane_changing_length_diff) {
+          ++nero_count.duplicate;
           continue;
         }
       }
@@ -593,6 +627,7 @@ std::vector<lane_change::TrajectoryGroup> generate_frenet_candidates(
         check_out_of_bound_paths(common_data_ptr, traj.poses, current_lane_boundary, direction);
 
       if (out_of_bound) {
+        ++nero_count.out_of_bound;
         continue;
       }
 
@@ -610,6 +645,19 @@ std::vector<lane_change::TrajectoryGroup> generate_frenet_candidates(
   };
 
   ranges::for_each(trajectory_groups, limit_vel);
+
+  static const bool nero_debug = std::getenv("NERO_LC_DEBUG") != nullptr;
+  static double nero_last = 0.0;
+  const double nero_now = rclcpp::Clock(RCL_STEADY_TIME).now().seconds();
+  if (nero_debug && nero_now - nero_last > 1.0) {
+    nero_last = nero_now;
+    RCLCPP_INFO(
+      get_logger(),
+      "[NERO_LC] frenet %zu metrics -> %zu groups: prepare segment failed %zu, no target reference %zu, no sampling "
+      "%zu, generated %zu, same length %zu, out of bound %zu",
+      prep_metrics.size(), trajectory_groups.size(), nero_count.prep_fail, nero_count.ref_empty,
+      nero_count.no_sampling, nero_count.generated, nero_count.duplicate, nero_count.out_of_bound);
+  }
 
   ranges::sort(trajectory_groups, [&](const auto & p1, const auto & p2) {
     return calc_average_curvature(p1.lane_changing.curvatures) <

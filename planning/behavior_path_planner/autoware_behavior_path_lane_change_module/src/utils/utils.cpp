@@ -46,6 +46,9 @@
 #include <range/v3/view.hpp>
 #include <rclcpp/rclcpp.hpp>
 
+#include <chrono>
+#include <cstdlib>
+
 #include <boost/geometry/algorithms/buffer.hpp>
 #include <boost/geometry/algorithms/distance.hpp>
 #include <boost/geometry/algorithms/within.hpp>
@@ -500,7 +503,26 @@ bool is_delay_lane_change(
     return gap_length > gap_threshold;
   };
 
+  // NERO_LC_DEBUG (log only, streamjoin job): the delay check's inputs (NERO_LC_DELAY_NO_ROOM acts at its call site)
+  static const bool nero_debug = std::getenv("NERO_LC_DEBUG") != nullptr;
+  const auto dist_to_terminal_start = common_data_ptr->transient_data.dist_to_terminal_start;
+
   for (auto it = target_objects.begin(); it < target_objects.end(); ++it) {
+    const double far_end = it->dist_from_ego + 0.5 * it->shape.dimensions.x;
+    if (nero_debug) {
+      static double last = 0.0;
+      const double now =
+        std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+      if (now - last > 0.5) {
+        last = now;
+        RCLCPP_INFO(
+          get_logger(),
+          "[NERO_LC_DELAY] obj %.1f m (far end %.1f), to end %.1f, buffer %.1f, latest start %.1f, lc length %.1f, "
+          "near_end %d, ego v %.2f",
+          it->dist_from_ego, far_end, dist_to_end, dist_buffer, dist_to_terminal_start,
+          lane_change_path.info.length.lane_changing, is_near_end(*it) ? 1 : 0, ego_vel);
+      }
+    }
     if (is_near_end(*it)) break;
 
     if (it->dist_from_ego < lane_change_path.info.length.lane_changing) continue;

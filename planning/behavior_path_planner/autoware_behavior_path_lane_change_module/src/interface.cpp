@@ -36,6 +36,7 @@
 #include <cstdlib>
 #include <limits>
 #include <memory>
+#include <vector>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -209,25 +210,59 @@ double nero_env(const char * name, const double fallback)
 // gradually, rolls the last NERO_LC_WAIT_ROLL m (default 0) at NERO_LC_WAIT_CRAWL (default 0.8 m/s)
 // signalling and hugging the line — time for drivers behind to let it in while it is still moving —
 // and stops only at the stop point itself if no gap has come by then.
-void nero_cap_waiting_velocity(PathWithLaneId & path, const PoseWithDetailOpt & stop, const Direction direction)
+void nero_cap_waiting_velocity(
+  PathWithLaneId & path, const PoseWithDetailOpt & stop, const Direction direction, const bool two_or_more,
+  const geometry_msgs::msg::Point & ego_position, const double ego_velocity, const bool multi_roll_ok)
 {
   static const int saudi_dir = static_cast<int>(nero_env("NERO_LC_SAUDI_DIR", 0.0));  // see scene.cpp
+  // NERO_LC_MULTI_ROLL=1 (streamjoin job 2026-10-27): with two or more changes due the rolling wait acts in every
+  // direction (NERO_LC_SAUDI_DIR keeps it to the left changes, the U-turn merge). The right changes otherwise braked to a
+  // stand at their waiting stop and started both changes from it: 0.5 m/s2 launches, a stand at every stream car (10-26e
+  // #28 / #29: the operator rolled in behind the stream; Ahmed 10-27 on the c28 sim: "the stops are too long it should be
+  // smoother and without stops"). Unset = the car.
+  // (streamjoin2: only while the change waits for a gap in a passing stream, or continues such a change: multi_roll_ok;
+  // sim c56c: the rolling wait slowed a robot whose change was unsafe for a car cutting in from the other side, the
+  // approval came 0.3 m/s slower and the approved change later ran on past the car merging in behind it, 0.38 m)
+  static const bool multi_roll = nero_env("NERO_LC_MULTI_ROLL", 0.0) > 0.0;
   if (
-    (saudi_dir == 1 && direction != Direction::LEFT) || (saudi_dir == 2 && direction != Direction::RIGHT)) {
+    !(two_or_more && multi_roll && multi_roll_ok) &&
+    ((saudi_dir == 1 && direction != Direction::LEFT) || (saudi_dir == 2 && direction != Direction::RIGHT))) {
     return;
   }
   static const double decel = nero_env("NERO_LC_WAIT_DECEL", 0.0);
-  static const double crawl = nero_env("NERO_LC_WAIT_CRAWL", 0.8);
+  static const double crawl_single = nero_env("NERO_LC_WAIT_CRAWL", 0.8);
+  // NERO_LC_MULTI_WAIT_CRAWL=<m/s> (routelc job 2026-10-26): with two or more changes due the rolling wait rolls at this
+  // speed instead of NERO_LC_WAIT_CRAWL (1.2 m/s on the car, tuned for the single change before the U-turn: there the
+  // crawl and the hug show the drivers behind ego wants in). At 93795 (two changes, 10-26e #6 "too slow", #37) the
+  // operator kept 8-11 km/h beside the target lane and took the gaps. Single changes keep their crawl. Unset = the car.
+  static const double crawl_multi = nero_env("NERO_LC_MULTI_WAIT_CRAWL", -1.0);
+  const double crawl = (two_or_more && crawl_multi > 0.0) ? std::max(crawl_single, crawl_multi) : crawl_single;
   static const double roll = nero_env("NERO_LC_WAIT_ROLL", 0.0);
   if (decel <= 0.0 || !stop || path.points.size() < 2) {
     return;
   }
   const size_t stop_idx =
     autoware::motion_utils::findNearestIndex(path.points, stop->pose.position);
+  // NERO_LC_WAIT_COMFORT=<m/s^2> (routelc job 2026-10-26): the cap never asks more than this deceleration from ego's
+  // current speed. The cap is a profile back from the waiting stop, so a module that appears with ego already inside it
+  // at speed stepped the path's speed at ego down: the second of two changes, the cycle the first one succeeded (the
+  // crawl falls from the two-change 2.5 m/s to 1.2 m/s with the stop 10 m ahead) -> 2.6 -> 1.2 m/s at ego, the smoother
+  // braked at -2.6 (sim o37; the car the same: -2.61, = the field's 10-26e #6 -2.50 with no factor). Unset = the car.
+  static const double comfort = nero_env("NERO_LC_WAIT_COMFORT", -1.0);
+  std::vector<double> v_comfort(path.points.size(), 0.0);
+  if (comfort > 0.0) {
+    const size_t ego_idx = autoware::motion_utils::findNearestIndex(path.points, ego_position);
+    const double v0 = std::max(0.0, ego_velocity);
+    double s_ego = 0.0;
+    for (size_t i = 0; i < path.points.size(); ++i) {
+      if (i > ego_idx) s_ego += autoware_utils::calc_distance2d(path.points.at(i - 1), path.points.at(i));
+      v_comfort.at(i) = i <= ego_idx ? v0 : std::sqrt(std::max(0.0, v0 * v0 - 2.0 * comfort * s_ego));
+    }
+  }
   double s = 0.0;
   for (size_t i = stop_idx; i > 0; --i) {
     s += autoware_utils::calc_distance2d(path.points.at(i), path.points.at(i - 1));
-    const double v = std::sqrt(crawl * crawl + 2.0 * decel * std::max(0.0, s - roll));
+    const double v = std::max(std::sqrt(crawl * crawl + 2.0 * decel * std::max(0.0, s - roll)), v_comfort.at(i - 1));
     auto & pv = path.points.at(i - 1).point.longitudinal_velocity_mps;
     pv = std::min(pv, static_cast<float>(v));
   }
@@ -240,7 +275,46 @@ BehaviorModuleOutput LaneChangeInterface::planWaitingApproval()
   BehaviorModuleOutput out = module_type_->getTerminalLaneChangePath();
 
   module_type_->insert_stop_point(module_type_->get_current_lanes(), out.path, true);
-  nero_cap_waiting_velocity(out.path, module_type_->getStopPose(), module_type_->getDirection());
+  const auto * nlc_wait = dynamic_cast<const NormalLaneChange *>(module_type_.get());
+  nero_cap_waiting_velocity(
+    out.path, module_type_->getStopPose(), module_type_->getDirection(),
+    // NERO_LC_MULTI_ROLL: also the change that continues a double change made from the waiting place (the second of two
+    // right changes: it otherwise braked toward its own waiting stop while waiting for a target-lane follower, sim c28
+    // 9.8 -> 5.2 km/h)
+    nlc_wait != nullptr && (nlc_wait->nero_two_or_more_due() ||
+                            (nero_env("NERO_LC_MULTI_ROLL", 0.0) > 0.0 && nlc_wait->nero_continues_change())),
+    module_type_->getEgoPose().position,
+    module_type_->getEgoVelocity(),
+    nlc_wait != nullptr && (nlc_wait->nero_gap_wait() || nlc_wait->nero_continues_change()));
+  // NERO_LC_MULTI_ROLL (streamjoin): time the arrival at the waiting stop behind the passing target-lane cars (see
+  // NormalLaneChange::nero_roll_arrival_cap): the path from ego to the stop is capped at that average speed, never below
+  // 1.0 m/s (then the robot crawls up and waits), never above the crawl / the path, ramped down at 0.8 m/s2
+  static const bool nero_multi_roll = nero_env("NERO_LC_MULTI_ROLL", 0.0) > 0.0;
+  if (nlc_wait != nullptr && nero_multi_roll && module_type_->getStopPose() && out.path.points.size() >= 2) {
+    const auto & ego_pos = module_type_->getEgoPosition();
+    const double d_stop = autoware::motion_utils::calcSignedArcLength(
+      out.path.points, ego_pos, module_type_->getStopPose()->pose.position);
+    const double arr = nlc_wait->nero_roll_arrival_cap(d_stop);
+    if (arr >= 0.0) {
+      const double cap = std::max(1.0, arr);
+      constexpr double a_ease = 0.8;
+      const double v0 = std::max(0.0, module_type_->getEgoVelocity());
+      const size_t ego_idx = autoware::motion_utils::findNearestIndex(out.path.points, ego_pos);
+      double s_acc = 0.0;
+      for (size_t i = ego_idx; i < out.path.points.size(); ++i) {
+        if (i > ego_idx) s_acc += autoware_utils::calc_distance2d(out.path.points.at(i - 1), out.path.points.at(i));
+        const double lim = std::max(cap, std::sqrt(std::max(0.0, v0 * v0 - 2.0 * a_ease * s_acc)));
+        auto & pv = out.path.points.at(i).point.longitudinal_velocity_mps;
+        pv = std::min(pv, static_cast<float>(lim));
+      }
+      static double last_log = 0.0;
+      const double now = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+      if (std::getenv("NERO_LC_DEBUG") != nullptr && now - last_log > 0.5) {
+        last_log = now;
+        RCLCPP_INFO(getLogger(), "[NERO_LC_ROLL] stop %.1f m ahead: arrive at %.2f m/s (cap %.2f)", d_stop, arr, cap);
+      }
+    }
+  }
   if (const auto * nlc = dynamic_cast<const NormalLaneChange *>(module_type_.get())) {
     const double cap = nlc->nero_yield_cap();
     if (cap >= 0.0 && out.path.points.size() >= 2) {
@@ -278,6 +352,24 @@ BehaviorModuleOutput LaneChangeInterface::planWaitingApproval()
 
   if (!module_type_->isValidPath()) {
     path_candidate_ = std::make_shared<PathWithLaneId>();
+    // NERO_LC_FIX_10819=1: port of upstream #10819: with no valid path the RTC status is set to "waiting, unsafe"
+    // and the module's state is reset (incl. the blinker time). Before it, the status of the last valid path stayed
+    // un-updated; its entry dropped out after a few seconds and every new module instance then went RUNNING and was
+    // cancelled for "InvalidPath" at once, its stop behind ego (sim 1026-214449: the robot standing at the 93643
+    // waiting stop drove off straight on toward the lane end, the field's 10-26 #37). Unset = the car.
+    static const bool fix_10819 = [] {
+      const char * v = std::getenv("NERO_LC_FIX_10819");
+      return v != nullptr && std::atoi(v) > 0;
+    }();
+    if (fix_10819) {
+      updateRTCStatus(
+        std::numeric_limits<double>::lowest(), std::numeric_limits<double>::lowest(), false,
+        State::WAITING_FOR_EXECUTION);
+      module_type_->resetParameters();
+      if (const auto * nlc = dynamic_cast<const NormalLaneChange *>(module_type_.get())) {
+        nlc->nero_reset_signal_time();
+      }
+    }
     return out;
   }
 
@@ -333,6 +425,9 @@ bool LaneChangeInterface::canTransitSuccessState()
   }
 
   if (module_type_->hasFinishedLaneChange()) {
+    if (const auto * nlc = dynamic_cast<const NormalLaneChange *>(module_type_.get())) {
+      nlc->nero_note_finished();  // streamjoin: NERO_LC_SIGNALLED_PREPARE (the next change in this direction continues it)
+    }
     module_type_->resetParameters();
     log_debug_throttled("Lane change process has completed.");
     return true;

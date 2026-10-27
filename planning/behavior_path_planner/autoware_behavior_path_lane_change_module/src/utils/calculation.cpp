@@ -279,6 +279,18 @@ double calc_distance_buffer(const LCParamPtr & lc_param_ptr, const std::vector<d
          ((num_of_lane_changes - 1.0) * backward_buffer);
 }
 
+double nero_change_window(const CommonDataPtr & common_data_ptr, const lanelet::ConstLanelets & lanes)
+{
+  const auto & target_neighbor = common_data_ptr->lanes_ptr->target_neighbor;
+  const auto & first =
+    target_neighbor.empty() ? common_data_ptr->lanes_ptr->target.front() : target_neighbor.front();
+  if (first.centerline2d().size() < 2) {
+    return std::numeric_limits<double>::max();
+  }
+  return calc_dist_from_pose_to_terminal_end(
+    common_data_ptr, lanes, utils::to_geom_msg_pose(first.centerline2d().front(), first));
+}
+
 std::vector<double> calc_shift_intervals(
   const CommonDataPtr & common_data_ptr, const lanelet::ConstLanelets & lanes)
 {
@@ -289,7 +301,56 @@ std::vector<double> calc_shift_intervals(
   const auto & route_handler_ptr = common_data_ptr->route_handler_ptr;
   const auto direction = common_data_ptr->direction;
 
-  return route_handler_ptr->getLateralIntervalsToPreferredLane(lanes.back(), direction);
+  auto intervals = route_handler_ptr->getLateralIntervalsToPreferredLane(lanes.back(), direction);
+  // NERO_LC_ROUTE_GATE=1 (routelc job 2026-10-26, QUEUE KRS): upstream counts every lane change to the preferred lane
+  // as due before the end of the current lanes. Where the first target lane runs on in the route past that end (the
+  // KRS road: 91174 -> 93732 -> 93726 -> 47326 -> 42025 beside the preferred 93787 -> 93781 -> 47324 -> 42027), only
+  // the first change is due there: the others are due before the end of the target lane, and the module that makes
+  // them from the target lane has its own terminal. Then only the first interval counts (gate, waiting stop, the
+  // next-change stop and the blinker buffer of one change). Kept as upstream when the target lane ends too soon for
+  // the remaining changes (+ the stopping distance between them). Unset = upstream.
+  static const bool route_gate = [] {
+    const char * v = std::getenv("NERO_LC_ROUTE_GATE");
+    return v != nullptr && std::atoi(v) > 0;
+  }();
+  if (
+    !route_gate || intervals.size() < 2 || common_data_ptr->lc_type != LaneChangeModuleType::NORMAL ||
+    !common_data_ptr->is_lanes_available() || common_data_ptr->lanes_ptr->target.empty()) {
+    return intervals;
+  }
+  const auto & target_lanes = common_data_ptr->lanes_ptr->target;
+  const auto & ego_pose = common_data_ptr->get_ego_pose();
+  const auto rest_intervals =
+    route_handler_ptr->getLateralIntervalsToPreferredLane(target_lanes.back(), direction);
+  const auto rest_lengths = calc_min_lane_change_lengths(common_data_ptr->lc_param_ptr, rest_intervals);
+  const double rest_buffer =
+    rest_lengths.empty() ? 0.0 : calc_distance_buffer(common_data_ptr->lc_param_ptr, rest_lengths);
+  // how far the target lane runs on past the end of the current lanes (measured from that end point, so also right
+  // while ego is still behind the target lane's start)
+  const double dist_to_current_end = calc_dist_from_pose_to_terminal_end(common_data_ptr, lanes, ego_pose);
+  const auto & last = lanes.back();
+  const double dist_to_target_end =
+    last.centerline2d().size() < 2
+      ? 0.0
+      : calc_dist_from_pose_to_terminal_end(
+          common_data_ptr, target_lanes, utils::to_geom_msg_pose(last.centerline2d().back(), last));
+  const double need = rest_buffer + calc_stopping_distance(common_data_ptr->lc_param_ptr);
+  const bool first_only = dist_to_target_end >= need;
+  static double last_log = 0.0;
+  const double now = rclcpp::Clock(RCL_STEADY_TIME).now().seconds();
+  if (std::getenv("NERO_LC_DEBUG") != nullptr && now - last_log > 1.0) {
+    last_log = now;
+    RCLCPP_INFO(
+      get_logger(),
+      "[NERO_LC_ROUTE_GATE] %zu changes to the preferred lane from %ld; target %ld..%ld runs on %.1f m past the end of "
+      "the current lanes (%.1f m ahead), rest %zu (%.1f m) -> %s",
+      intervals.size(), lanes.back().id(), target_lanes.front().id(), target_lanes.back().id(), dist_to_target_end,
+      dist_to_current_end, rest_intervals.size(), rest_buffer, first_only ? "first change only" : "all (upstream)");
+  }
+  if (first_only) {
+    intervals.resize(1);
+  }
+  return intervals;
 }
 
 std::pair<MinMaxValue, MinMaxValue> calc_lc_length_and_dist_buffer(
@@ -303,8 +364,40 @@ std::pair<MinMaxValue, MinMaxValue> calc_lc_length_and_dist_buffer(
     calculation::calc_min_lane_change_lengths(common_data_ptr->lc_param_ptr, shift_intervals);
   const auto min_lc_length =
     !min_lc_lengths.empty() ? min_lc_lengths.front() : std::numeric_limits<double>::max();
-  const auto min_dist_buffer =
+  auto min_dist_buffer =
     calculation::calc_distance_buffer(common_data_ptr->lc_param_ptr, min_lc_lengths);
+  // NERO_LC_SHORT_WINDOW=1 (routelc job 2026-10-26, QUEUE LCE / 93699): with two or more changes due in a window (from
+  // where the target lane begins to the end of the current lanes) shorter than this buffer + the stop offset
+  // (backward_length_buffer_for_end_of_lane, 10 m on the car), the car can never plan a change there (93699: window
+  // 28.7 m < 32.4 + prepare; the robot stands at the lane end for good). There the room between the changes is the
+  // minimum stopping distance (v_min^2 / 2|a_min|, 2.0 m) instead of the 10 m buffer: 24.4 m for two changes. Single
+  // changes (the U-turn merge the 10 m was chosen for) and windows that fit are unchanged. Unset = the car.
+  static const bool short_window = [] {
+    const char * v = std::getenv("NERO_LC_SHORT_WINDOW");
+    return v != nullptr && std::atoi(v) > 0;
+  }();
+  if (
+    short_window && min_lc_lengths.size() >= 2 && common_data_ptr->lc_type == LaneChangeModuleType::NORMAL &&
+    common_data_ptr->is_lanes_available() && !common_data_ptr->lanes_ptr->target.empty()) {
+    const auto & lc_param = *common_data_ptr->lc_param_ptr;
+    const double window = nero_change_window(common_data_ptr, lanes);
+    const double stop_offset = calc_stopping_distance(common_data_ptr->lc_param_ptr);
+    if (window < min_dist_buffer + stop_offset) {
+      const double v_min = lc_param.trajectory.min_lane_changing_velocity;
+      const double min_stop = std::abs(v_min * v_min / (2.0 * lc_param.trajectory.min_longitudinal_acc));
+      const double shorter =
+        min_dist_buffer - (static_cast<double>(min_lc_lengths.size()) - 1.0) * (stop_offset - min_stop);
+      static double last_log = 0.0;
+      const double now = rclcpp::Clock(RCL_STEADY_TIME).now().seconds();
+      if (std::getenv("NERO_LC_DEBUG") != nullptr && now - last_log > 1.0) {
+        last_log = now;
+        RCLCPP_INFO(
+          get_logger(), "[NERO_LC_SHORT_WINDOW] %zu changes in a %.1f m window < %.1f + %.1f m: buffer %.1f -> %.1f m",
+          min_lc_lengths.size(), window, min_dist_buffer, stop_offset, min_dist_buffer, shorter);
+      }
+      min_dist_buffer = shorter;
+    }
+  }
 
   const auto max_lc_lengths =
     calculation::calc_max_lane_change_lengths(common_data_ptr, shift_intervals);

@@ -95,6 +95,33 @@ public:
   // NERO_LC_YIELD_FRONT (session 4): the speed cap while waiting (< 0: none). Non-virtual: no layout change.
   double nero_yield_cap() const;
 
+  // NERO_LC_FIX_10819 (routelc job): upstream #10819's blinker-time reset on a cycle with no valid path, kept out of
+  // resetParameters() (also called on exit / success) so the car is unchanged with the switch unset. Non-virtual.
+  void nero_reset_signal_time() const { set_signal_activation_time(true); }
+
+  // NERO_LC_MULTI_STOP_OFFSET (routelc job): the waiting stop's offset before the terminal start. Non-virtual.
+  double nero_stop_offset() const;
+  bool nero_two_or_more_due() const;  // the distance buffer holds two or more changes (non-virtual)
+  // streamjoin job: the car's rolling wait acts for this direction; this change starts from the robot standing at its
+  // waiting stop with two or more changes due (NERO_LC_MULTI_STAND_*). Non-virtual.
+  bool nero_rolling_wait_dir() const;
+  bool nero_stand_start() const;
+  void nero_note_finished() const;      // this change finished (time per direction)
+  bool nero_continues_change() const;   // a change in the same direction finished just before this one started
+  // NERO_LC_MULTI_ROLL: the speed at which ego reaches its waiting stop when the passing target-lane cars are the change's
+  // gap ahead of it (-1: none). Non-virtual.
+  double nero_roll_arrival_cap(const double dist_to_stop) const;
+  // streamjoin2: the time ego needs so that the passing target-lane cars are the change's front gap ahead of its nose at
+  // a stop dist_to_stop ahead (0: none passing); and "this change waits for a gap in a passing stream" (latched per module
+  // instance: unsafe while such cars pass). Non-virtual.
+  double nero_passing_need(const double dist_to_stop) const;
+  bool nero_gap_wait() const;
+  std::string nero_passing_behind() const;  // streamjoin2: passing cars not yet past ego's nose (ids, "" = none)
+
+  // NERO_LC_STOP_COMFORT (routelc job): a terminal stop never closer than v^2 / 2a ahead of the moving robot. Non-virtual.
+  double nero_comfort_stop_arc(
+    const double arc_length_to_stop, const PathWithLaneId & path, const double arc_length_hard_end) const;
+
   // NERO_LC_KEEP_RIGHT_GATE="<min_end_m>,<lead_dv>,<lead_m>,<lead_t>" (trips job 2026-10-24): a change to the RIGHT that
   // the route does not need soon (ego's current lanes go on > min_end_m: a keep-right change of NERO_KEEP_RIGHT_LANES) is
   // not requested while (a) a car ahead in the target lane slower than ego's maximum by > lead_dv is within lead_m, or
