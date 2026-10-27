@@ -36,6 +36,7 @@
 #include <lanelet2_core/primitives/Lanelet.h>
 
 #include <algorithm>
+#include <array>
 #include <limits>
 #include <memory>
 #include <set>
@@ -257,6 +258,8 @@ DecisionResult IntersectionModule::modifyPathVelocityDetail(PathWithLaneId * pat
       object_ttc_pub_->publish(object_ttc_time_array);
     }
   }
+  // NERO_IX_SIGHT (see scene_intersection_occlusion.cpp neroSightUpdate)
+  neroSightUpdate(interpolated_path_info, intersection_stoplines, *path, time_distance_array);
 
   for (const auto & object_info : object_info_manager_.attentionObjects()) {
     if (!object_info->unsafe_info()) {
@@ -271,7 +274,12 @@ DecisionResult IntersectionModule::modifyPathVelocityDetail(PathWithLaneId * pat
     detectCollision(is_over_1st_pass_judge_line, is_over_2nd_pass_judge_line);
   const std::string safety_diag =
     generateDetectionBlameDiagnosis(too_late_detect_objects, misjudge_objects);
-  const std::string occlusion_diag = formatOcclusionType(occlusion_status);
+  std::string occlusion_diag = formatOcclusionType(occlusion_status);
+  if (nero_sight_.unsafe) {  // NERO_IX_SIGHT
+    occlusion_diag += "\nnero_sight: unexplained vehicle reaches the conflict in " +
+                      std::to_string(nero_sight_.arrival) + " s, ego leaves the first attention lane in " +
+                      std::to_string(nero_sight_.ego_clear) + " s";
+  }
 
   if (is_permanent_go_) {
     // ==========================================================================================
@@ -315,7 +323,7 @@ DecisionResult IntersectionModule::modifyPathVelocityDetail(PathWithLaneId * pat
   const auto closest_idx = intersection_stoplines.closest_idx;
   const bool is_over_default_stopline = util::isOverTargetIndex(
     *path, closest_idx, planner_data_->current_odometry->pose, default_stopline_idx);
-  const auto collision_stopline_idx = is_over_default_stopline ? closest_idx : default_stopline_idx;
+  auto collision_stopline_idx = is_over_default_stopline ? closest_idx : default_stopline_idx;
 
   // ==========================================================================================
   // pseudo collision detection on green light
@@ -338,10 +346,82 @@ DecisionResult IntersectionModule::modifyPathVelocityDetail(PathWithLaneId * pat
   }
 
   collision_state_machine_.setStateWithMarginTime(
-    has_collision ? StateMachine::State::STOP : StateMachine::State::GO,
+    (has_collision || nero_sight_.unsafe) ? StateMachine::State::STOP : StateMachine::State::GO,
     logger_.get_child("collision state_machine"), *clock_);
   const bool has_collision_with_margin =
     collision_state_machine_.getState() == StateMachine::State::STOP;
+
+  // NERO_IX_SIGHT: ego stood at its line clear of the first attention lane and is moving off. The stock collision stop
+  // goes at ego's position, which the car's controller makes a docking stop (a_stop, then -3.4 m/s2 once 0.5 m past the
+  // point; QUEUE SMS): if that stop would end inside the first attention lane (b01: a car published just after the
+  // take-off stopped the robot ~1 m inside the priority lane and hit it there), ego goes through instead when it leaves
+  // that lane before the colliding car / blob arrives (+go_margin_s; ego at a_go up to the path's speed) and no
+  // colliding car is on a later attention lane;
+  // otherwise (it can stop before the lane, or going through would not clear) the stock stop stays
+  if (
+    nero_sight_.in_scope && nero_sight_stood_clear_ && has_collision_with_margin && is_over_default_stopline &&
+    planner_data_->current_velocity->twist.linear.x > 0.2) {
+    static const std::array<double, 4> ad = [] {
+      double q[9] = {-1.0, 1.5, 2.0, 0.8, 0.4, 3.0, 12.0, 0.5, 0.5};
+      if (const char * e = std::getenv("NERO_IX_SIGHT")) {
+        std::sscanf(
+          e, "%lf,%lf,%lf,%lf,%lf,%lf,%lf,%lf,%lf", &q[0], &q[1], &q[2], &q[3], &q[4], &q[5], &q[6], &q[7], &q[8]);
+      }
+      return std::array<double, 4>{q[3], q[4], q[7], q[8]};
+    }();
+    constexpr double strong_stop_acc = 3.4;  // the car's pid strong stop after a 0.5 m overrun of the stop point
+    // the stop the car really makes from here: for t_delay the robot keeps its current acceleration (the command
+    // ramps down jerk-limited: b03 ls3 0.60 -> 0.78 m/s after the decision), then the docking stop
+    const double v = planner_data_->current_velocity->twist.linear.x;
+    const double a0 = std::max(0.0, planner_data_->current_acceleration->accel.accel.linear.x);
+    const double d_touch = autoware::motion_utils::calcSignedArcLength(
+      path->points, planner_data_->current_odometry->pose.position, first_attention_stopline_idx);
+    const double v1 = v + a0 * ad[1];
+    const double d_soft = v1 * v1 / (2.0 * ad[0]);
+    const double d_need =
+      v * ad[1] + 0.5 * a0 * ad[1] * ad[1] +
+      (d_soft <= 0.5 ? d_soft : 0.5 + (v1 * v1 - 2.0 * ad[0] * 0.5) / (2.0 * strong_stop_acc));
+    // ego's time to leave the first attention lane if it goes on: from v at a_go up to the path's own speed
+    double t_go = 0.0;
+    {
+      double s_acc = 0.0;
+      double v_cur = std::max(v, 0.1);
+      const auto & pts = path->points;
+      for (size_t i = closest_idx; i + 1 < pts.size() && s_acc < nero_sight_.d_exit; ++i) {
+        const double ds = autoware_utils::calc_distance2d(pts.at(i), pts.at(i + 1));
+        const double v_cap = std::max(0.3, static_cast<double>(pts.at(i + 1).point.longitudinal_velocity_mps));
+        const double v_next = std::min(v_cap, std::sqrt(v_cur * v_cur + 2.0 * ad[2] * ds));
+        t_go += ds / std::max(0.1, 0.5 * (v_cur + v_next));
+        v_cur = v_next;
+        s_acc += ds;
+      }
+    }
+    // blobs count only while ego can stop short (see neroSightUpdate); here it cannot: the published cars decide
+    double arrival = nero_sight_.can_stop_short ? nero_sight_.arrival : std::numeric_limits<double>::infinity();
+    bool later_lane = false;  // a colliding car on a later attention lane: never go through toward it
+    for (const auto & object_info : object_info_manager_.attentionObjects()) {
+      if (const auto u = object_info->unsafe_info(); u) {
+        arrival = std::min(arrival, u.value().interval_time.first);
+        later_lane |= u.value().lane_position != CollisionInterval::LanePosition::FIRST;
+      }
+    }
+    if (d_touch < d_need && !later_lane && arrival >= t_go + ad[3]) {
+      is_permanent_go_ = true;
+      RCLCPP_INFO(
+        logger_,
+        "[NERO_IX] sight lane %ld: moving off at %.2f m/s %.2f m before the first attention lane (a stop needs "
+        "%.2f m): go through, ego leaves it in %.1f s, the car arrives in %.1f s",
+        lane_id_, v, d_touch, d_need, t_go, arrival);
+      return OverPassJudge{
+        "nero_sight: a stop would end inside the first attention lane, ego leaves it before the car arrives",
+        "go through"};
+    }
+    RCLCPP_INFO_THROTTLE(
+      logger_, *clock_, 500,
+      "[NERO_IX] sight lane %ld: moving off at %.2f m/s %.2f m before the first attention lane (a stop needs %.2f m), "
+      "the car arrives in %.1f s, ego would leave it in %.1f s%s: stock stop",
+      lane_id_, v, d_touch, d_need, arrival, t_go, later_lane ? ", a car on a later lane" : "");
+  }
 
   if (is_prioritized) {
     return FullyPrioritized{

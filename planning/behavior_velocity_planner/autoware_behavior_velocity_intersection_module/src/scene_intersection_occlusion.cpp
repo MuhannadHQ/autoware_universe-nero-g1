@@ -19,12 +19,20 @@
 #include <autoware_utils/geometry/geometry.hpp>
 #include <opencv2/imgproc.hpp>
 
+#include <boost/geometry/algorithms/convex_hull.hpp>
 #include <boost/geometry/algorithms/correct.hpp>
 #include <boost/geometry/algorithms/intersection.hpp>
 
 #include <lanelet2_core/geometry/Polygon.h>
+#include <tf2/utils.h>
 
 #include <algorithm>
+#include <array>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <deque>
+#include <string>
 #include <limits>
 #include <tuple>
 #include <utility>
@@ -449,5 +457,397 @@ IntersectionModule::OcclusionType IntersectionModule::detectOcclusion(
   }
   debug_data_.static_occlusion = true;
   return StaticallyOccluded{min_dist};
+}
+}  // namespace autoware::behavior_velocity_planner
+
+namespace autoware::behavior_velocity_planner
+{
+// NERO_IX_SIGHT=<D>,<v_min>,<margin_s>,<a_stop>,<t_delay>,<K>,<v_prior>,<a_go>,<go_margin_s> (leftsight, 2026-10-27;
+// QUEUE LTP, 10-26e #23): at a stop-line approach without a traffic light whose first attention lane begins within K m
+// past the default stop line (a turn across a priority lane right after the line), a vehicle the lidar sees but
+// perception has not published yet is treated as a car (on the first attention lane only). #23: the 9.4 m/s oncoming
+// car was first published 7.5 m away, 0.8 s before it reached the robot, which had left its line after the stop sign's
+// 0.1 s hold.
+// Upstream's occlusion check (#10868 / #10911 / #10947: stop at the peeking line until the attention lanes are seen
+// clear) counts only UNKNOWN cells; the grid's binary Bayes filter keeps a cell seen free "free" for ~2 s after it is
+// last seen (v_ratio 10: 21 frames to 43), so a car driving along a lane seen free casts no unknown shadow within its
+// first ~19 m (9.4 m/s) and the check sees it only ~36 m out of a 55 m clearance: too late for a robot that needs ~5 s
+// to cross. A car in the points is OCCUPIED within ~0.4 s. So: along the module's own attention lane divisions (the
+// occlusion check's, from where each crosses ego's path upstream to D m), occupied cells that no predicted object
+// explains (outside every object's box swept back 0.8 s along its velocity + 1 m, for 1 s after it was last
+// published), that the lidar can see now (not behind a published object >= 1 m tall, seen from ego) and that span >= 2
+// divisions are blobs; blobs are tracked cycle to cycle along the lane (a new one
+// approaches at v_prior until its own motion shows otherwise); once ego is at its line, one seen in >= 3 cycles and
+// approaching the conflict at >= v_min that passes it while ego is in the first attention lane (with margin_s after ego
+// leaves it) is a collision (the module's normal stop / hold applies), while ego stands or can still stop before that
+// lane (once it cannot, ego goes on as the car does today). Static occupied cells (kerbs, poles) never approach and are
+// ignored; published vehicles are left to the collision check.
+// With it, after ego has stood at its line clear of the first attention lane, a collision stop while it moves off whose
+// docking stop at ego (the current acceleration for t_delay [s] while the command ramps down, then a_stop [m/s2] and
+// the controller's -3.4 once 0.5 m past the point: QUEUE SMS) would end inside that lane becomes a go-through when ego
+// leaves the lane before the colliding car or blob arrives (+go_margin_s; ego from its speed at a_go [m/s2] up to the
+// path's speed: the field robot took off at ~0.55 m/s2, the module's own profile assumes <= 5 km/h through the
+// junction) and every colliding car is on that lane; otherwise the stock stop stays. On the car's stack a car first
+// published just after the take-off stopped the robot ~1 m inside the priority lane, where the car hit it (b01).
+// Unset = the car exactly.
+static const std::array<double, 9> & neroSightParam()
+{
+  static const std::array<double, 9> p = [] {
+    std::array<double, 9> q{-1.0, 1.5, 2.0, 0.8, 0.4, 3.0, 12.0, 0.5, 0.5};
+    const char * e = std::getenv("NERO_IX_SIGHT");
+    if (e != nullptr) {
+      std::sscanf(
+        e, "%lf,%lf,%lf,%lf,%lf,%lf,%lf,%lf,%lf", &q[0], &q[1], &q[2], &q[3], &q[4], &q[5], &q[6], &q[7], &q[8]);
+    }
+    return q;
+  }();
+  return p;
+}
+
+static bool neroSightDebug()
+{
+  static const bool d = [] {
+    const char * e = std::getenv("NERO_IX_SIGHT_DEBUG");
+    return e != nullptr && std::atoi(e) > 0;
+  }();
+  return d;
+}
+
+void IntersectionModule::neroSightUpdate(
+  const InterpolatedPathInfo & interpolated_path_info, const IntersectionStopLines & intersection_stoplines,
+  const autoware_internal_planning_msgs::msg::PathWithLaneId & path,
+  const TimeDistanceArray & time_distance_array)
+{
+  nero_sight_ = NeroSightStatus{};
+  const auto & prm = neroSightParam();
+  const double D = prm[0];
+  if (D <= 0.0 || has_traffic_light_ || !intersection_lanelets_ || !occlusion_attention_divisions_) {
+    return;
+  }
+  const auto & intersection_lanelets = intersection_lanelets_.value();
+  if (!intersection_lanelets.first_attention_area() || !intersection_stoplines.default_stopline) {
+    return;
+  }
+  const auto first_attention_area = intersection_lanelets.first_attention_area().value();
+  const auto default_stopline_idx = intersection_stoplines.default_stopline.value();
+  const auto first_attention_stopline_idx = intersection_stoplines.first_attention_stopline.value_or(0);
+  // scope (once): a map stop line, the first attention lane within K m past the default stop line
+  if (!nero_sight_scope_) {
+    const auto & assigned_lanelet =
+      planner_data_->route_handler_->getLaneletMapPtr()->laneletLayer.get(lane_id_);
+    const bool map_stopline = getStopLineIndexFromMap(interpolated_path_info, assigned_lanelet).has_value();
+    const double gap = autoware::motion_utils::calcSignedArcLength(
+      path.points, default_stopline_idx, first_attention_stopline_idx);
+    nero_sight_scope_ = map_stopline && gap <= prm[5];
+    RCLCPP_INFO(
+      logger_,
+      "[NERO_IX] sight lane %ld: %s (map stop line %d, first attention lane %.2f m past the default stop line)",
+      lane_id_, nero_sight_scope_.value() ? "in scope" : "not in scope", map_stopline, gap);
+  }
+  if (!nero_sight_scope_.value()) {
+    return;
+  }
+  nero_sight_.in_scope = true;
+  const auto & current_pose = planner_data_->current_odometry->pose;
+  const double now = clock_->now().seconds();
+
+  // ego stood at its line, footprint clear of the first attention area (latched for this module)
+  if (!nero_sight_stood_clear_ && planner_data_->isVehicleStopped()) {
+    const double past =
+      autoware::motion_utils::calcSignedArcLength(path.points, default_stopline_idx, current_pose.position);
+    const auto local_footprint = planner_data_->vehicle_info_.createFootprint(0.0, 0.0);
+    const auto fp = autoware_utils::transform_vector(local_footprint, autoware_utils::pose2transform(current_pose));
+    if (past > -1.5 && past < 1.5 && !bg::intersects(fp, lanelet::utils::to2D(first_attention_area).basicPolygon())) {
+      nero_sight_stood_clear_ = true;
+      RCLCPP_INFO(logger_, "[NERO_IX] sight lane %ld: ego stands %.2f m past the default stop line, clear of the "
+                  "first attention lane", lane_id_, past);
+    }
+  }
+
+  // ego's time to leave the first attention area (footprint), from the module's own ego profile
+  {
+    const auto local_footprint = planner_data_->vehicle_info_.createFootprint(0.0, 0.0);
+    const auto area2d = lanelet::utils::to2D(first_attention_area).basicPolygon();
+    std::optional<size_t> exit_idx;
+    bool inside = false;
+    for (size_t i = std::max<size_t>(intersection_stoplines.closest_idx, first_attention_stopline_idx);
+         i < path.points.size(); ++i) {
+      const auto fp = autoware_utils::transform_vector(
+        local_footprint, autoware_utils::pose2transform(path.points.at(i).point.pose));
+      const bool in = bg::intersects(fp, area2d);
+      if (in) inside = true;
+      if (inside && !in) {
+        exit_idx = i;
+        break;
+      }
+    }
+    const double d_exit = exit_idx ? autoware::motion_utils::calcSignedArcLength(
+                                       path.points, intersection_stoplines.closest_idx, exit_idx.value())
+                                   : 0.0;
+    nero_sight_.d_exit = d_exit;
+    const double d_enter = std::max(
+      0.0, autoware::motion_utils::calcSignedArcLength(
+             path.points, intersection_stoplines.closest_idx, first_attention_stopline_idx));
+    nero_sight_.ego_clear = time_distance_array.empty() ? 0.0 : time_distance_array.back().first;
+    for (const auto & [t, d] : time_distance_array) {
+      if (d >= d_exit) {
+        nero_sight_.ego_clear = t;
+        break;
+      }
+    }
+    nero_sight_.ego_enter = 0.0;
+    for (const auto & [t, d] : time_distance_array) {
+      if (d >= d_enter) {
+        nero_sight_.ego_enter = t;
+        break;
+      }
+    }
+  }
+
+  // unexplained occupied cells along the attention lane divisions
+  const auto & occ_grid = *planner_data_->occupancy_grid;
+  const int width = occ_grid.info.width;
+  const int height = occ_grid.info.height;
+  const double resolution = occ_grid.info.resolution;
+  const auto & origin = occ_grid.info.origin.position;
+  // a published object explains the cells within 1 m of its box swept back along its velocity by 0.8 s (the grid's
+  // filter lags a moving object by ~0.3-0.4 s: in the #1 "nice!" replay a 7-8 m/s car's cells trailed its box by ~3 m
+  // and held the robot 3.5 s), and for 1 s after it was last published (its cells decay after the track ends)
+  for (const auto & object : planner_data_->predicted_objects->objects) {
+    const auto box = autoware_utils::to_polygon2d(object);
+    const auto & tw = object.kinematics.initial_twist_with_covariance.twist.linear;
+    const double yaw = tf2::getYaw(object.kinematics.initial_pose_with_covariance.pose.orientation);
+    const double bx = -(tw.x * std::cos(yaw) - tw.y * std::sin(yaw)) * 0.8;
+    const double by = -(tw.x * std::sin(yaw) + tw.y * std::cos(yaw)) * 0.8;
+    std::vector<std::pair<double, double>> pts;
+    for (const auto & q : box.outer()) {
+      pts.emplace_back(q.x(), q.y());
+      pts.emplace_back(q.x() + bx, q.y() + by);
+    }
+    std::string key(object.object_id.uuid.begin(), object.object_id.uuid.end());
+    nero_sight_explained_[key] = {now, pts};
+  }
+  std::vector<Polygon2d> explained;
+  for (auto it = nero_sight_explained_.begin(); it != nero_sight_explained_.end();) {
+    if (now - it->second.first > 1.0) {
+      it = nero_sight_explained_.erase(it);
+      continue;
+    }
+    Polygon2d cloud;
+    for (const auto & [x, y] : it->second.second) cloud.outer().emplace_back(x, y);
+    Polygon2d hull;
+    bg::convex_hull(cloud, hull);
+    explained.push_back(hull);
+    ++it;
+  }
+  // cells the lidar cannot see now (behind a published object from ego: its body blocks every ray behind it) are stale
+  // and no evidence of a car: on the car's pointcloud grid a published car coming head-on leaves its own trail in its
+  // shadow (never seen free, it decays only through the grid's filter, ~1.7 s); the trail's leading edge followed the
+  // car ~8 m behind and read as a car following it (mr66508g stays: 62 UNSAFE cycles, the robot left 1.2 s later than
+  // the car's stack at a must-go). A real car hidden there is hidden from the lidar too; out of the shadow it is a new
+  // blob (v_prior). Low objects (a flat UNKNOWN) block no ray at the lidar's height.
+  struct NeroShadow
+  {
+    double a0, lo, hi, rmin;
+  };
+  std::vector<NeroShadow> shadows;
+  const Point2d ego2d(current_pose.position.x, current_pose.position.y);
+  for (const auto & object : planner_data_->predicted_objects->objects) {
+    if (object.shape.dimensions.z < 1.0) continue;
+    const auto box = autoware_utils::to_polygon2d(object);
+    const double rmin = bg::distance(ego2d, box);
+    if (rmin < 0.5) continue;
+    const auto & op = object.kinematics.initial_pose_with_covariance.pose.position;
+    const double a0 = std::atan2(op.y - ego2d.y(), op.x - ego2d.x());
+    double lo = 0.0;
+    double hi = 0.0;
+    for (const auto & q : box.outer()) {
+      const double rel = autoware_utils::normalize_radian(std::atan2(q.y() - ego2d.y(), q.x() - ego2d.x()) - a0);
+      lo = std::min(lo, rel);
+      hi = std::max(hi, rel);
+    }
+    shadows.push_back({a0, lo, hi, rmin});
+  }
+  int n_shadowed = 0;
+  const auto & path_ip = interpolated_path_info.path;
+  const auto & lane_interval_ip = interpolated_path_info.lane_id_interval.value();
+  const auto first_inside_ip = util::getFirstPointInsidePolygon(path_ip, lane_interval_ip, first_attention_area);
+  const size_t lane_start_idx = first_inside_ip ? first_inside_ip.value() : std::get<0>(lane_interval_ip);
+  const size_t lane_end_idx = std::get<1>(lane_interval_ip);
+  LineString2d path_linestring;
+  for (auto i = lane_start_idx; i <= lane_end_idx && i < path_ip.points.size(); ++i) {
+    const auto & p = path_ip.points.at(i).point.pose.position;
+    path_linestring.emplace_back(p.x, p.y);
+  }
+  const auto first_area2d = lanelet::utils::to2D(first_attention_area).basicPolygon();
+  std::vector<double> starts;  // nearest distance of each occupied run along a division
+  if (path_linestring.size() >= 2) {
+    for (const auto & division : occlusion_attention_divisions_.value()) {
+      if (division.size() < 2) continue;
+      LineString2d division_linestring;
+      for (const auto & p : division) division_linestring.emplace_back(p.x(), p.y());
+      std::vector<Point2d> ips;
+      bg::intersection(division_linestring, path_linestring, ips);
+      if (ips.empty()) continue;
+      // only the first attention lane (the priority lane right after the line): a blob on a later lane must not
+      // make ego go through toward it (the move-off rule)
+      if (!bg::within(ips.front(), first_area2d)) continue;
+      // nearest division point to the crossing, then upstream (divisions run from the conflict upstream)
+      auto it0 = division.begin();
+      double best = std::numeric_limits<double>::infinity();
+      for (auto it = division.begin(); it != division.end(); ++it) {
+        const double dd = std::hypot(it->x() - ips.front().x(), it->y() - ips.front().y());
+        if (dd < best) {
+          best = dd;
+          it0 = it;
+        }
+      }
+      double acc = 0.0;
+      bool prev_occ = false;
+      auto prev_it = it0;
+      for (auto it = it0; it != division.end() && acc <= D; ++it) {
+        acc += std::hypot(it->x() - prev_it->x(), it->y() - prev_it->y());
+        prev_it = it;
+        const int ix = static_cast<int>((it->x() - origin.x) / resolution);
+        const int iy = static_cast<int>((it->y() - origin.y) / resolution);
+        bool occ = false;
+        if (ix >= 0 && ix < width && iy >= 0 && iy < height) {
+          const int v = occ_grid.data.at(iy * width + ix);
+          occ = v >= planner_param_.occlusion.occupied_min;
+        }
+        if (occ) {
+          const Point2d pt(it->x(), it->y());
+          for (const auto & poly : explained) {
+            if (bg::distance(pt, poly) <= 1.0) {
+              occ = false;
+              break;
+            }
+          }
+        }
+        if (occ) {
+          const double r = std::hypot(it->x() - ego2d.x(), it->y() - ego2d.y());
+          const double a = std::atan2(it->y() - ego2d.y(), it->x() - ego2d.x());
+          for (const auto & sh : shadows) {
+            const double rel = autoware_utils::normalize_radian(a - sh.a0);
+            if (r > sh.rmin + 0.5 && rel >= sh.lo && rel <= sh.hi) {
+              occ = false;
+              ++n_shadowed;
+              break;
+            }
+          }
+        }
+        if (occ && !prev_occ) starts.push_back(acc);
+        prev_occ = occ;
+      }
+    }
+  }
+  // blobs: run starts within 2 m of each other, seen on >= 2 divisions (a kerb / pole at the lane edge is on one)
+  std::sort(starts.begin(), starts.end());
+  std::vector<double> blobs;
+  for (size_t i = 0; i < starts.size();) {
+    size_t j = i;
+    while (j + 1 < starts.size() && starts.at(j + 1) - starts.at(j) <= 2.0) ++j;
+    if (j > i) blobs.push_back(starts.at(i));
+    i = j + 1;
+  }
+  // track blobs along the lane: alpha-beta on (distance, approach speed); a new blob starts at the prior approach speed
+  // v_prior (a vehicle until its own motion shows otherwise: the grid's leading edge jitters 1-3 m per cycle at
+  // 50-60 m, b03 ls3: a regression over the first cycles kept restarting and reached 8.4 m/s of the true 9.4 only 2.3 s
+  // after the car was in the grid); a blob that does not come closer slows its speed to 0 within ~1 s
+  const double v_prior = prm[6];
+  const double dt = nero_sight_last_t_ > 0.0 ? std::clamp(now - nero_sight_last_t_, 0.02, 0.5) : 0.1;
+  nero_sight_last_t_ = now;
+  constexpr double alpha = 0.5;
+  constexpr double beta = 0.1;
+  std::vector<bool> used(blobs.size(), false);
+  for (auto & tr : nero_sight_tracks_) {
+    const double pred = tr.d - tr.v * dt;
+    int best = -1;
+    double best_err = 2.0 + 0.3 * std::fabs(tr.v);
+    for (size_t k = 0; k < blobs.size(); ++k) {
+      if (used.at(k)) continue;
+      const double err = std::fabs(blobs.at(k) - pred);
+      if (err <= best_err) {
+        best_err = err;
+        best = static_cast<int>(k);
+      }
+    }
+    if (best < 0) {
+      ++tr.misses;
+      tr.d = std::max(0.0, pred);
+      continue;
+    }
+    used.at(best) = true;
+    tr.misses = 0;
+    const double r = blobs.at(best) - pred;
+    tr.d = std::max(0.0, pred + alpha * r);
+    tr.v = std::clamp(tr.v - beta * r / dt, -25.0, 25.0);
+    tr.hist.emplace_back(now, tr.d);
+    while (!tr.hist.empty() && now - tr.hist.front().first > 1.2) tr.hist.pop_front();
+  }
+  nero_sight_tracks_.erase(
+    std::remove_if(nero_sight_tracks_.begin(), nero_sight_tracks_.end(), [](const auto & tr) { return tr.misses > 3; }),
+    nero_sight_tracks_.end());
+  for (size_t k = 0; k < blobs.size(); ++k) {
+    if (!used.at(k)) {
+      NeroSightTrack tr;
+      tr.d = blobs.at(k);
+      tr.v = v_prior;
+      tr.hist.emplace_back(now, tr.d);
+      nero_sight_tracks_.push_back(tr);
+    }
+  }
+  // the earliest approaching blob; a conflict when it passes the conflict (front at arrival, its ~8 m of car + lane
+  // after) while ego is in the first attention lane, with margin_s after ego leaves it and 1 s before ego enters.
+  // Judged only once ego is at its line (within 2 m before the default stop line or past it): on the approach the
+  // stop line holds ego anyway, and a car passing long before ego gets there is no conflict (ls3 held the robot 3.5 s
+  // on the approach for 2df5)
+  const double v_min = prm[1];
+  const double margin = prm[2];
+  double pass_end = -1.0;
+  for (const auto & tr : nero_sight_tracks_) {
+    if (tr.v < v_min || tr.hist.size() < 3) continue;  // a blob counts once it has been seen in 3 cycles
+    const double a = tr.d / tr.v;
+    if (a < nero_sight_.arrival) {
+      nero_sight_.arrival = a;
+      pass_end = a + 8.0 / tr.v;
+    }
+  }
+  const double past_default =
+    autoware::motion_utils::calcSignedArcLength(path.points, default_stopline_idx, current_pose.position);
+  // only while ego stands or can still stop before the first attention lane (the car's real stop: the current
+  // acceleration for t_delay while the command ramps down, then the docking stop): a blob seen once ego can no longer
+  // stop short would only make it stop inside or at the edge of that lane (b07 vs b08: a 9.4 m/s car seen 0.6 s after
+  // the take-off on its 12 m/s prior: the stop left the robot's corner at the lane edge, the car 0.07 m away; the car's
+  // stack, blind to it, crossed 1.2 s ahead): then ego goes on as the car does today
+  {
+    const double v = std::max(0.0, planner_data_->current_velocity->twist.linear.x);
+    const double a0 = std::max(0.0, planner_data_->current_acceleration->accel.accel.linear.x);
+    const double td = prm[4];
+    const double v1 = v + a0 * td;
+    const double d_soft = v1 * v1 / (2.0 * prm[3]);
+    const double d_need =
+      v * td + 0.5 * a0 * td * td + (d_soft <= 0.5 ? d_soft : 0.5 + (v1 * v1 - 2.0 * prm[3] * 0.5) / (2.0 * 3.4));
+    const double d_touch = autoware::motion_utils::calcSignedArcLength(
+      path.points, current_pose.position, first_attention_stopline_idx);
+    nero_sight_.can_stop_short = planner_data_->isVehicleStopped() || d_touch >= d_need;
+  }
+  nero_sight_.unsafe = nero_sight_.can_stop_short && past_default > -2.0 &&
+                       nero_sight_.arrival < nero_sight_.ego_clear + margin &&
+                       pass_end > nero_sight_.ego_enter - 1.0;
+  if (neroSightDebug() || (nero_sight_.unsafe && nero_sight_.arrival < 1e8)) {
+    std::string tracks;
+    for (const auto & tr : nero_sight_tracks_) {
+      tracks += " " + std::to_string(static_cast<int>(tr.d * 10) / 10.0).substr(0, 5) + "@" +
+                std::to_string(static_cast<int>(tr.v * 10) / 10.0).substr(0, 4) + (tr.misses ? "m" : "");
+    }
+    RCLCPP_INFO(
+      logger_,
+      "[NERO_IX] sight lane %ld: %s blobs %zu tracks [%s ] arrival %.1f s, ego in %.1f..%.1f s (+%.1f), %.1f m past "
+      "the default stop line%s, %d cells in shadows",
+      lane_id_, nero_sight_.unsafe ? "UNSAFE" : "clear", blobs.size(), tracks.c_str(), nero_sight_.arrival,
+      nero_sight_.ego_enter, nero_sight_.ego_clear, margin, past_default, nero_sight_stood_clear_ ? " stood" : "",
+      n_shadowed);
+  }
 }
 }  // namespace autoware::behavior_velocity_planner

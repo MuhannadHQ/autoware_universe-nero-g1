@@ -35,6 +35,8 @@
 #include <lanelet2_routing/Forward.h>
 
 #include <map>
+#include <deque>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <set>
@@ -389,6 +391,34 @@ private:
 
   //! associative(sibling) lanelets ids
   const std::set<lanelet::Id> associative_ids_;
+
+  //! NERO_IX_SIGHT (leftsight, 2026-10-27): see scene_intersection_occlusion.cpp (neroSightUpdate)
+  struct NeroSightTrack
+  {
+    double d{0.0};                                //! nearest distance along the attention lanes [m]
+    double v{0.0};                                //! approach speed toward the conflict [m/s]
+    int misses{0};                                //! cycles without a measurement
+    std::deque<std::pair<double, double>> hist;   //! (time [s], d)
+  };
+  struct NeroSightStatus
+  {
+    bool in_scope{false};
+    bool unsafe{false};                           //! an unexplained approaching blob within reach
+    bool can_stop_short{true};                    //! ego stands or can still stop before the first attention lane
+    double arrival{std::numeric_limits<double>::infinity()};  //! the blob's time to the conflict [s]
+    double ego_enter{0.0};                        //! ego's time to enter the first attention lane [s]
+    double ego_clear{0.0};                        //! ego's time to leave the first attention lane [s]
+    double d_exit{0.0};                           //! path length from ego to where it has left that lane [m]
+    std::string report;
+  };
+  std::optional<bool> nero_sight_scope_{std::nullopt};
+  std::vector<NeroSightTrack> nero_sight_tracks_;
+  double nero_sight_last_t_{-1.0};
+  //! ego stood at its line with its footprint clear of the first attention area
+  bool nero_sight_stood_clear_{false};
+  NeroSightStatus nero_sight_;
+  //! published objects' boxes swept back along their velocity (outline points), by uuid, with the time last seen
+  std::map<std::string, std::pair<double, std::vector<std::pair<double, double>>>> nero_sight_explained_;
 
   //! turn_direction of this lane
   const std::string turn_direction_;
@@ -823,6 +853,7 @@ private:
    * intersection_lanelets.first_attention_area(), occlusion_attention_divisions_
    */
   OcclusionType detectOcclusion(const InterpolatedPathInfo & interpolated_path_info) const;
+
   /** @} */
 
 private:
@@ -867,6 +898,16 @@ private:
    */
   bool isUnknownObjectCollisionTarget(
     const autoware_perception_msgs::msg::PredictedObject & object) const;
+
+  /**
+   * @brief NERO_IX_SIGHT: unexplained occupied cells moving along the attention lanes toward the conflict (a vehicle
+   * in the lidar points that perception has not published), the scope check and ego's time to leave the first
+   * attention lane; fills nero_sight_
+   */
+  void neroSightUpdate(
+    const InterpolatedPathInfo & interpolated_path_info, const IntersectionStopLines & intersection_stoplines,
+    const autoware_internal_planning_msgs::msg::PathWithLaneId & path,
+    const TimeDistanceArray & time_distance_array);
 
   /**
    * @brief Nero c3 (wrong_way_watch): true if the object (moving at >= wrong_way_watch.min_speed)
