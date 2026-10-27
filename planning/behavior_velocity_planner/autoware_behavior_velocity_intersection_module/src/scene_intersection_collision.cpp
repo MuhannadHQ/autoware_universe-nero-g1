@@ -489,6 +489,60 @@ namespace autoware::behavior_velocity_planner
 {
 namespace bg = boost::geometry;
 
+// NERO_IX_UNKNOWN_FLAT=<h>[,<v>] (ixghost job, 2026-10-26): an UNKNOWN whose reported height has stayed below <h> m
+// since its track appeared, and that reports less than <v> m/s now, is not a collision target of this module
+// (obstacle_stop still brakes for it on the path). The field's UNKNOWN polygons carry the robot's own yaw (tracker
+// convex hulls), so a flat ground return (a speed bump, broken surface: 0.03-0.07 m) inside a turn lane that merges into
+// / diverges from ego's lane passes the attention lane's heading test; standing (or in its track's first cycle) in ego's
+// lane, or drifting into it, its passage covered ego's whole window and one cycle became a CollisionStop held 1.5 s on
+// the priority road (10-26 #5 / #6 / #14). No vehicle is reported that flat (field: 97k vehicle-class samples up to
+// 60 m, none below 0.5 m); a track that was ever >= <h> stays a target for good, and a flat one reporting >= <v> m/s
+// counts in that cycle (a fast real car whose first cycles are reported flat: no later reaction; field ghosts report
+// 0.1 m/s median, >= 3.5 m/s in 0.3 % of their samples). <v> omitted = any speed. Unset = the car.
+struct NeroUnknownFlatParam
+{
+  double h{0.0};
+  double v{std::numeric_limits<double>::infinity()};
+};
+const NeroUnknownFlatParam & nero_unknown_flat()
+{
+  static const NeroUnknownFlatParam p = [] {
+    NeroUnknownFlatParam r;
+    if (const char * e = std::getenv("NERO_IX_UNKNOWN_FLAT")) {
+      double h = 0.0, v = 0.0;
+      const int n = std::sscanf(e, "%lf,%lf", &h, &v);
+      r.h = n >= 1 ? std::max(0.0, h) : 0.0;
+      if (n >= 2 && v > 0.0) r.v = v;
+    }
+    return r;
+  }();
+  return p;
+}
+struct NeroUnknownFlatSeen
+{
+  double max_h{0.0};
+  double last{0.0};
+  std::vector<int64_t> logged_lanes{};
+};
+// the object's track (keyed by uuid, forgotten 2 s after it was last seen): its tallest reported height so far
+NeroUnknownFlatSeen & nero_unknown_flat_seen(const autoware_perception_msgs::msg::PredictedObject & o)
+{
+  static std::unordered_map<std::string, NeroUnknownFlatSeen> seen;
+  static double last_prune = 0.0;
+  const double t =
+    std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+  if (t - last_prune > 1.0) {
+    last_prune = t;
+    for (auto it = seen.begin(); it != seen.end();) {
+      if (t - it->second.last > 2.0) it = seen.erase(it); else ++it;
+    }
+  }
+  auto & s = seen[uuidKey(o.object_id)];
+  s.max_h = std::max(s.max_h, static_cast<double>(o.shape.dimensions.z));
+  s.last = t;
+  return s;
+}
+
 bool IntersectionModule::isTargetCollisionVehicleType(
   const autoware_perception_msgs::msg::PredictedObject & object) const
 {
@@ -514,6 +568,27 @@ bool IntersectionModule::isTargetCollisionVehicleType(
     return true;
   }
   if (label == autoware_perception_msgs::msg::ObjectClassification::UNKNOWN && p.unknown) {
+    const auto & flat = nero_unknown_flat();
+    if (flat.h > 0.0) {  // NERO_IX_UNKNOWN_FLAT: a flat, slow UNKNOWN is left to obstacle_stop
+      auto & seen = nero_unknown_flat_seen(object);
+      const auto & tw = object.kinematics.initial_twist_with_covariance.twist.linear;
+      if (seen.max_h < flat.h && std::hypot(tw.x, tw.y) < flat.v) {
+        if (
+          std::find(seen.logged_lanes.begin(), seen.logged_lanes.end(), lane_id_) ==
+          seen.logged_lanes.end()) {
+          seen.logged_lanes.push_back(lane_id_);
+          const auto & pos = object.kinematics.initial_pose_with_covariance.pose.position;
+          RCLCPP_INFO(
+            logger_,
+            "[NERO_IX] unknown_flat: lane %ld, UNKNOWN %02x%02x at (%.1f, %.1f) %.2f x %.2f x %.2f m, v %.2f: not a "
+            "collision target (never >= %.2f m tall, < %.1f m/s); obstacle_stop keeps it",
+            lane_id_, object.object_id.uuid[0], object.object_id.uuid[1], pos.x, pos.y,
+            object.shape.dimensions.x, object.shape.dimensions.y, object.shape.dimensions.z,
+            std::hypot(tw.x, tw.y), flat.h, flat.v);
+        }
+        return false;
+      }
+    }
     // Nero c3 (unknown_filter): with the filter on, an UNKNOWN is a target only if it is big or
     // has been moving fast for a while (small/static UNKNOWN blobs such as curbs, bushes or ghost
     // points no longer make ego yield). Filter off = stock behaviour.
