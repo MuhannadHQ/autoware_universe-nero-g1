@@ -420,6 +420,30 @@ private:
   //! published objects' boxes swept back along their velocity (outline points), by uuid, with the time last seen
   std::map<std::string, std::pair<double, std::vector<std::pair<double, double>>>> nero_sight_explained_;
 
+  //! NERO_IX_CROSSING_HOLD (crosshold, 2026-10-28): see scene_intersection_nero_crossing.cpp (neroCrossingHold)
+  struct NeroCrossingCause
+  {
+    std::string id;
+    std::string cls;
+    double v{0.0};    //! the object's speed [m/s]
+    double t{0.0};    //! ego's time in its passage where the gap is short [s]
+    double tau{0.0};  //! the object's time there [s]
+    double s{0.0};    //! ego's arc length there [m]
+    double gap{0.0};  //! the footprint gap there [m]
+  };
+  void neroCrossingHold(PathWithLaneId * path);
+  bool nero_xh_holding_{false};
+  bool nero_xh_scope_logged_{false};
+  double nero_xh_last_conflict_{-1e9};
+  double nero_xh_hold_since_{0.0};
+  NeroCrossingCause nero_xh_cause_;
+  //! objects ego went on for (stopping would have left it closer to them), by uuidKey(); cleared when ego stands
+  std::set<std::string> nero_xh_committed_;
+  //! speed history of the target objects, uuidKey() -> (objects stamp, speed)
+  std::map<std::string, std::deque<std::pair<double, double>>> nero_xh_vhist_;
+  //! position history of slow vehicles, uuidKey() -> (objects stamp, x, y)
+  std::map<std::string, std::deque<std::tuple<double, double, double>>> nero_xh_phist_;
+
   //! turn_direction of this lane
   const std::string turn_direction_;
 

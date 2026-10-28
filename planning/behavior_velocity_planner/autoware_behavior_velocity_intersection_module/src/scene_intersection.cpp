@@ -119,6 +119,12 @@ bool IntersectionModule::modifyPathVelocity(PathWithLaneId * path)
 
   reactRTCApproval(decision_result, path);
 
+  // NERO_IX_CROSSING_HOLD: a stop-sign lane where this module has no attention lane (InternalError) holds ego for
+  // crossing traffic on roads the map lacks (scene_intersection_nero_crossing.cpp)
+  if (std::holds_alternative<InternalError>(decision_result)) {
+    neroCrossingHold(path);
+  }
+
   return true;
 }
 
