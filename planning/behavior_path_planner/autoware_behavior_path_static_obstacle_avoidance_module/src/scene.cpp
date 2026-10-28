@@ -804,6 +804,67 @@ void StaticObstacleAvoidanceModule::fillFundamentalData(
   utils::static_obstacle_avoidance::compensateLostTargetObjects(
     registered_objects_, data, clock_->now(), planner_data_, parameters_);
 
+  // NERO_SOA_ROUTE_LC=<m> (lca job 2026-10-28): a target this module would pass by shifting toward the side the route's
+  // own lane change goes (the route's preferred lane lies on that side of the object's lane), with less than <m> per
+  // change still due between its far end and the end of the current lanes, is left to the lane change module: it is no
+  // avoidance target here (other_objects, IS_NOT_TARGET_OBJECT). After avoid-and-return the changes need the return
+  // (~11 m at the module's nominal speed), their own buffer (11.2 m for one, 32.4 m for two) and a window to find a gap
+  // (~5 s at the 2.5 m/s two-change crawl): 28 m per change. Sim: a car parked 47.8 m before the end kept by this module
+  // stood the robot for good past its terminal start (S1 park_s20 at 22 m per change); one 61.8 m before it (abl base, a
+  // dense stream) handed over stood the robot behind it at the junction exit for good (at 80 m from the lane end). The lane change module keeps its waiting place behind such an object with room to change
+  // (upstream #5236, "maintain distance to front object") and changes at the first safe gap; obstacle_stop still stops
+  // for it. 10-27 #6 / 10-25 #29 / #30: the shift round a car parked near the end of 93795 made this module a waiting,
+  // launch-locked candidate (exclusive in slot 2) for ~30 s, so lane_change_left was never asked until past its
+  // terminal start; then the module returned the robot into the lane that ends (stuck there, the operator took over).
+  // An object the module already shifts for (in its registered lines) is never handed over. Unset = the car.
+  {
+    static const double route_lc_m = [] {
+      const char * v = std::getenv("NERO_SOA_ROUTE_LC");
+      const double m = v != nullptr ? std::atof(v) : -1.0;
+      if (m > 0.0) {
+        std::fprintf(stderr, "[NERO_SOA] route_lc=%.1f\n", m);
+      }
+      return m;
+    }();
+    if (route_lc_m > 0.0 && !data.target_objects.empty() && !data.current_lanelets.empty()) {
+      const auto & rh = planner_data_->route_handler;
+      const double dist_to_end = utils::getDistanceToEndOfLane(getEgoPose(), data.current_lanelets);
+      const auto registered = generator_.getRawRegisteredShiftLine();
+      static std::unordered_map<std::string, double> last_log;
+      ObjectDataArray kept;
+      for (auto & o : data.target_objects) {
+        const bool shifting_for_it = std::any_of(registered.begin(), registered.end(), [&](const auto & al) {
+          return al.object.object.object_id == o.object.object_id;
+        });
+        lanelet::ConstLanelet lane;
+        const bool has_lane =
+          lanelet::utils::query::getClosestLanelet(data.current_lanelets, o.getPose(), &lane);
+        const int num = has_lane ? rh->getNumLaneToPreferredLane(lane) : 0;
+        const bool on_right = utils::static_obstacle_avoidance::isOnRight(o);
+        const bool toward_route_lc = (num > 0 && on_right) || (num < 0 && !on_right);
+        const double room_after = dist_to_end - (o.longitudinal + o.length);
+        if (!shifting_for_it && toward_route_lc && room_after < route_lc_m * std::abs(num)) {
+          o.info = ObjectInfo::IS_NOT_TARGET_OBJECT;
+          data.other_objects.push_back(o);
+          const auto id = to_hex_string(o.object.object_id).substr(0, 8);
+          const double now = clock_->now().seconds();
+          if (now - last_log[id] > 2.0) {
+            last_log[id] = now;
+            RCLCPP_INFO(
+              getLogger(),
+              "[NERO_SOA_ROUTE_LC] %s left to the lane change module: %d change(s) to the %s from lane %ld, "
+              "%.1f m ahead, %.1f m from its far end to the end of the current lanes (< %.1f)",
+              id.c_str(), std::abs(num), num > 0 ? "left" : "right", lane.id(), o.longitudinal, room_after,
+              route_lc_m * std::abs(num));
+          }
+          continue;
+        }
+        kept.push_back(o);
+      }
+      data.target_objects = kept;
+    }
+  }
+
   // once an object filtered for boundary clipping, this module keeps the information until the end
   // of execution.
   utils::static_obstacle_avoidance::updateClipObject(clip_objects_, data);

@@ -94,6 +94,41 @@ bool nero_lc_debug_every(const std::string & key, const int period_ms)
   return true;
 }
 
+// NERO_LC_DEBUG (log only, lca job 2026-10-28): what became of every candidate of one search (path shifter or frenet),
+// printed once per 0.5 s per module and direction: the 10-27 #6 phase-A question (why no change into a gap) had no
+// record on the car. Counts: prepare samples used / failed, lane-changing samples, candidates rejected while built,
+// unsafe, safety check thrown; the first message / unsafe object of each kind.
+struct NeroSearchCount
+{
+  int prep{0};
+  int prep_fail{0};
+  int lc{0};
+  int no_lc{0};
+  int skip{0};
+  int rej{0};
+  int unsafe{0};
+  int thrown{0};
+  std::string rej_msg{"-"};
+  std::string unsafe_msg{"-"};
+  std::string thrown_msg{"-"};
+};
+
+std::string nero_first_unsafe(
+  const autoware::behavior_path_planner::utils::path_safety_checker::CollisionCheckDebugMap & objs)
+{
+  for (const auto & [uuid, d] : objs) {
+    if (d.is_safe) continue;
+    char b[200];
+    std::snprintf(
+      b, sizeof(b), "%s %s front %d rss %.1f min_lon %.1f gap %.1f",
+      boost::uuids::to_string(uuid).substr(0, 6).c_str(), d.unsafe_reason.c_str(), d.is_front ? 1 : 0,
+      d.rss_longitudinal, d.inter_vehicle_distance,
+      autoware_utils::calc_distance2d(d.expected_ego_pose, d.expected_obj_pose));
+    return b;
+  }
+  return "?";
+}
+
 // streamjoin (2026-10-27): per module instance, "this change starts from the robot standing at its waiting stop with two
 // or more changes due" (set while waiting, kept from the approval on until the instance ends). Kept outside the class so
 // its layout (inherited by avoidance_by_lane_change) is unchanged.
@@ -784,20 +819,36 @@ bool NormalLaneChange::isLaneChangeRequired()
   const auto ego_dist_to_target_start =
     calculation::calc_ego_dist_to_lanes_start(common_data_ptr_, current_lanes, target_lanes);
   const auto max_prepare_length = calculation::calc_maximum_prepare_length(common_data_ptr_);
+  // NERO_LC_DEBUG (log only, lca job): which condition keeps the module from being requested (once per 0.5 s)
+  const auto nero_req_log = [&](const char * why) {
+    const std::string key = std::string("req_") + typeid(*this).name() + (direction_ == Direction::LEFT ? "L" : "R");
+    if (!nero_lc_debug_every(key, 500)) return;
+    const bool only_tl = getStopTime() >= lane_change_parameters_->th_stop_time;
+    RCLCPP_INFO(
+      logger_, "[NERO_LC_REQ] %s %s | cur %ld tgt %ld | to_tgt_start %.1f max_prep %.1f to_reg %.1f near_term %d",
+      direction_ == Direction::LEFT ? "L" : (direction_ == Direction::RIGHT ? "R" : "-"), why,
+      current_lanes.front().id(), target_lanes.front().id(), ego_dist_to_target_start, max_prepare_length,
+      utils::lane_change::get_distance_to_next_regulatory_element(common_data_ptr_, only_tl, only_tl),
+      common_data_ptr_->transient_data.is_ego_near_current_terminal_start ? 1 : 0);
+  };
 
   if (ego_dist_to_target_start > max_prepare_length) {
+    nero_req_log("no: target start beyond max prepare");
     return false;
   }
 
   if (is_near_regulatory_element()) {
     RCLCPP_DEBUG(logger_, "Ego is close to regulatory element, don't run LC module");
+    nero_req_log("no: near regulatory element");
     return false;
   }
 
   if (nero_keep_right_gate_blocks()) {
+    nero_req_log("no: keep-right gate");
     return false;
   }
 
+  nero_req_log("yes");
   return true;
 }
 
@@ -2166,6 +2217,21 @@ bool NormalLaneChange::get_path_using_frenet(
     logger_, "Generated %lu candidate paths in %2.2f[us]", frenet_candidates.size(),
     stop_watch_.toc(__func__));
 
+  NeroSearchCount nc;
+  const auto nero_report = [&](const char * outcome) {
+    const std::string key = std::string("frenet_") + typeid(*this).name() + (direction_ == Direction::LEFT ? "L" : "R");
+    if (!nero_lc_debug_every(key, 500)) return;
+    const auto & td = common_data_ptr_->transient_data;
+    RCLCPP_INFO(
+      logger_,
+      "[NERO_LC_FRENET] %s %s | v %.2f to_term_start %.1f to_term_end %.1f next_buf %.1f objs %zu | cands %zu "
+      "from %zu prep | rej %d unsafe %d thrown %d | rej: %s | unsafe: %s | thrown: %s",
+      direction_ == Direction::LEFT ? "L" : "R", outcome, common_data_ptr_->get_ego_speed(),
+      td.dist_to_terminal_start, td.dist_to_terminal_end, td.next_dist_buffer.min,
+      target_objects.leading.size() + target_objects.trailing.size(), frenet_candidates.size(),
+      prepare_metrics.size(), nc.rej, nc.unsafe, nc.thrown, nc.rej_msg.c_str(), nc.unsafe_msg.c_str(),
+      nc.thrown_msg.c_str());
+  };
   candidate_paths.reserve(frenet_candidates.size());
   lane_change_debug_.frenet_states.clear();
   lane_change_debug_.frenet_states.reserve(frenet_candidates.size());
@@ -2185,6 +2251,7 @@ bool NormalLaneChange::get_path_using_frenet(
     } catch (const std::exception & e) {
       RCLCPP_DEBUG(logger_, "%s", e.what());
       if (nero_lc_debug_tick("frenet_cand")) RCLCPP_INFO(logger_, "[NERO_LC] frenet candidate rejected: %s", e.what());
+      if (nc.rej++ == 0) nc.rej_msg = e.what();
     }
 
     if (!candidate_path_opt) {
@@ -2199,12 +2266,15 @@ bool NormalLaneChange::get_path_using_frenet(
         utils::lane_change::append_target_ref_to_candidate(
           *candidate_path_opt, common_data_ptr_->lc_param_ptr->frenet.th_curvature_smoothing);
         candidate_paths.push_back(*candidate_path_opt);
+        nero_report("ACCEPT");
         return found_safe_path;
       }
       if (nero_lc_debug_tick("frenet_unsafe")) RCLCPP_INFO(logger_, "[NERO_LC] frenet candidate unsafe");
+      if (nc.unsafe++ == 0) nc.unsafe_msg = nero_first_unsafe(lane_change_debug_.collision_check_objects);
     } catch (const std::exception & e) {
       RCLCPP_DEBUG(logger_, "%s", e.what());
       if (nero_lc_debug_tick("frenet_safety")) RCLCPP_INFO(logger_, "[NERO_LC] frenet safety check threw: %s", e.what());
+      if (nc.thrown++ == 0) nc.thrown_msg = e.what();
     }
 
     // appending all paths affect performance
@@ -2216,6 +2286,7 @@ bool NormalLaneChange::get_path_using_frenet(
   RCLCPP_DEBUG(
     logger_, "No safe path after %lu candidate(s). Total time: %2.2f[us]", frenet_candidates.size(),
     stop_watch_.toc(__func__));
+  nero_report("none");
   return !found_safe_path;
 }
 
@@ -2247,6 +2318,22 @@ bool NormalLaneChange::get_path_using_path_shifter(
       return lc_diff > lane_change_parameters_->trajectory.th_lane_changing_length_diff;
     };
 
+  NeroSearchCount nc;
+  const auto nero_report = [&](const char * outcome) {
+    const std::string key = std::string("shifter_") + typeid(*this).name() + (direction_ == Direction::LEFT ? "L" : "R");
+    if (!nero_lc_debug_every(key, 500)) return;
+    const auto & td = common_data_ptr_->transient_data;
+    RCLCPP_INFO(
+      logger_,
+      "[NERO_LC_SHIFTER] %s %s | v %.2f to_term_start %.1f to_term_end %.1f next_buf %.1f objs %zu | prep %zu used %d "
+      "fail %d | lc %d no_lc %d skip %d rej %d unsafe %d thrown %d | rej: %s | unsafe: %s | thrown: %s",
+      direction_ == Direction::LEFT ? "L" : "R", outcome, common_data_ptr_->get_ego_speed(),
+      td.dist_to_terminal_start, td.dist_to_terminal_end, td.next_dist_buffer.min,
+      target_objects.leading.size() + target_objects.trailing.size(), prepare_metrics.size(), nc.prep,
+      nc.prep_fail, nc.lc, nc.no_lc, nc.skip, nc.rej, nc.unsafe, nc.thrown, nc.rej_msg.c_str(),
+      nc.unsafe_msg.c_str(), nc.thrown_msg.c_str());
+  };
+
   for (const auto & prep_metric : prepare_metrics) {
     const auto debug_print = [&](const std::string & s) {
       RCLCPP_DEBUG(
@@ -2264,12 +2351,15 @@ bool NormalLaneChange::get_path_using_path_shifter(
       if (!utils::lane_change::get_prepare_segment(
             common_data_ptr_, prev_module_output_.path, prep_metric.length, prepare_segment)) {
         debug_print("Reject: failed to get valid prepare segment!");
+        ++nc.prep_fail;
         continue;
       }
     } catch (const std::exception & e) {
       debug_print(e.what());
+      ++nc.prep_fail;
       break;
     }
+    ++nc.prep;
 
     debug_print("Prepare path satisfy constraints");
 
@@ -2289,12 +2379,15 @@ bool NormalLaneChange::get_path_using_path_shifter(
     // metrics rely on the prepare segment's original velocity as max_path_velocity.
     utils::lane_change::set_prepare_velocity(
       prepare_segment, common_data_ptr_->get_ego_speed(), prep_metric.velocity);
+    if (lane_changing_metrics.empty()) ++nc.no_lc;
 
     for (const auto & lc_metric : lane_changing_metrics) {
       if (stop_watch_.toc(__func__) >= lane_change_parameters_->time_limit) {
         RCLCPP_DEBUG(logger_, "Time limit reached and no safe path was found.");
+        nero_report("time_limit");
         return false;
       }
+      ++nc.lc;
 
       debug_metrics.lc_metrics.emplace_back(lc_metric, -1);
 
@@ -2306,6 +2399,7 @@ bool NormalLaneChange::get_path_using_path_shifter(
 
       if (!check_length_diff(prep_metric.length, lc_metric.length, true)) {
         RCLCPP_DEBUG(logger_, "Skip: Change in lane changing length is less than threshold.");
+        ++nc.skip;
         continue;
       }
 
@@ -2315,6 +2409,7 @@ bool NormalLaneChange::get_path_using_path_shifter(
           common_data_ptr_, prep_metric, lc_metric, prepare_segment, sorted_lane_ids, shift_length);
       } catch (const std::exception & e) {
         debug_print_lat(std::string("Reject: ") + e.what());
+        if (nc.rej++ == 0) nc.rej_msg = e.what();
         continue;
       }
 
@@ -2324,18 +2419,30 @@ bool NormalLaneChange::get_path_using_path_shifter(
       try {
         if (check_candidate_path_safety(candidate_path, target_objects)) {
           debug_print_lat("ACCEPT!!!: it is valid and safe!");
+          nero_report("ACCEPT");
           return true;
         }
       } catch (const std::exception & e) {
         debug_print_lat(std::string("Reject: ") + e.what());
+        ++nc.thrown;
+        nc.thrown_msg = e.what();
+        nero_report("thrown");
         return false;
       }
 
+      if (nc.unsafe++ == 0) {
+        char b[96];
+        std::snprintf(
+          b, sizeof(b), "T %.1f/%.1f v_prep %.2f: ", prep_metric.duration, lc_metric.duration,
+          candidate_path.info.velocity.prepare);
+        nc.unsafe_msg = b + nero_first_unsafe(lane_change_debug_.collision_check_objects);
+      }
       debug_print_lat("Reject: sampled path is not safe.");
     }
   }
 
   RCLCPP_DEBUG(logger_, "No safety path found.");
+  nero_report("none");
   return false;
 }
 
@@ -2615,7 +2722,33 @@ double NormalLaneChange::nero_yield_cap() const
 bool NormalLaneChange::nero_in_hold_mode() const
 {
   const auto & h = nero_hold();
-  if (h.v <= 0.0 || getEgoVelocity() > h.v) {
+  // NERO_LC_MULTI_HOLD_V=<m/s>[,<room m>] (lca job 2026-10-28): for the changes of a double change (two or more due, or the change
+  // continuing one) the hold below applies up to this speed instead of NERO_LC_HOLD_V: until the robot's body leaves its
+  // lane, an approved change goes on only while it would still be approved (the strict check). Sim S1 (10-27 #6): the
+  // change was approved behind bb521a with the target lane empty; 0.3 s later bf651d turned into it 17 m behind at
+  // 3.4 m/s and ran up to 6.8 m/s; the robot rolled at the 2.5 m/s two-change crawl, a hair above NERO_LC_HOLD_V 2.5,
+  // so only the loose abort check ran and the change went on in front of it (bf651d had to brake; the car's stack
+  // without the parked car the same, 0.01 m). Unset = the car.
+  // ,<room m> (default 3): only while the robot can still stop and then start the change from standstill before its
+  // terminal start (dist_to_terminal_start > v^2 / 2 m/s2 + room): a hold closer than that cancels the change for good
+  // (sim o04: held 2.9 m before it, cancelled, no prepare room left -> stood 50 s nosed 0.5 m toward the line; S1 park_s20
+  // the same at the terminal start); there the car's own check decides as before.
+  static const std::pair<double, double> multi_hold = [] {
+    double v = -1.0, room = 3.0;
+    if (const char * e = std::getenv("NERO_LC_MULTI_HOLD_V")) {
+      std::sscanf(e, "%lf,%lf", &v, &room);
+    }
+    return std::make_pair(v, room);
+  }();
+  const double ego_v = std::max(0.0, getEgoVelocity());
+  const bool multi_hold_room =
+    common_data_ptr_ &&
+    common_data_ptr_->transient_data.dist_to_terminal_start > ego_v * ego_v / 2.0 + multi_hold.second;
+  const double hold_v = (multi_hold.first > h.v && h.v > 0.0 && multi_hold_room &&
+                         (nero_two_or_more_due() || nero_continues_change()))
+                          ? multi_hold.first
+                          : h.v;
+  if (h.v <= 0.0 || getEgoVelocity() > hold_v) {
     return false;
   }
   // NERO_LC_HOLD_DIR=1 (session 5): hold only LEFT lane changes (the merge before the U-turn, which has no other lane

@@ -97,6 +97,19 @@ void LaneChangeInterface::updateData()
       module_type_->updateLaneChangeStatus();
     }
   }
+  // NERO_LC_DEBUG (log only, lca job): the instance's state each 0.5 s (is the path search running at all?)
+  {
+    static std::unordered_map<std::string, double> last;
+    const double now = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    double & l = last[name()];
+    if (std::getenv("NERO_LC_DEBUG") != nullptr && now - l > 0.5) {
+      l = now;
+      RCLCPP_INFO(
+        getLogger(), "[NERO_LC_STATE] %s status %d waiting %d abort %d valid %d safe %d", name().c_str(),
+        static_cast<int>(getCurrentStatus()), isWaitingApproval() ? 1 : 0, module_type_->isAbortState() ? 1 : 0,
+        module_type_->isValidPath() ? 1 : 0, module_type_->isSafe() ? 1 : 0);
+    }
+  }
 
   module_type_->resetStopPose();
   updateDebugMarker();
