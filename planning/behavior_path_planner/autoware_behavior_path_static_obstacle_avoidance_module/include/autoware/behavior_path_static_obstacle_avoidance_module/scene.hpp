@@ -475,7 +475,7 @@ private:
   // the pause starts: the path holds `target_shift` (signed) from `ease_distance` ahead on (RC1 freezeShift)
   void neroFreezeShift(
     const AvoidancePlanningData & data, double target_shift, double ease_distance, double return_start = -1.0,
-    double return_length = 0.0);
+    double return_length = 0.0, double return_to = 0.0);
   // NERO_SOA_ONCOMING_COMMITTED: beside / past the targets with an oncoming car: return into the lane as soon as the
   // rear has cleared them, at the module's sharpest lateral jerk at ego's own speed (RC1's oncoming return)
   void neroOncomingReturn(AvoidancePlanningData & data);
@@ -534,6 +534,59 @@ private:
   std::string neroStartYieldObject(bool front, bool rear) const;
   // NERO_SOA_RETURN_AWAY: the new shift lines only return ego toward its lane centre, away from every unsafe object
   bool neroReturnAwayOnly(const AvoidancePlanningData & data) const;
+
+  // ---- nero (2026-10-27, corridor job, QUEUE NWC): NERO_SOA_CORRIDOR_GIVEWAY. A vehicle ahead coming / standing
+  // against ego in the free width of a narrow street (scene.cpp, namespace nero_cgw): ego keeps right and stops where
+  // the car can pass it, holds until it has passed (or has stood still long enough to be a parked car).
+  struct NeroCgwCar
+  {
+    std::string id;
+    double s_near{0.0};    // its nearest point along the reference path from ego
+    double lat_lo{0.0};    // its box's lateral extent from the reference path
+    double lat_hi{0.0};
+    double lo_pred{0.0};   // its lowest edge where it meets ego (a coming car pushed over by its own parked row)
+    double v{0.0};         // toward ego (>= 0)
+    double width{0.0};
+  };
+  // beside = also a car level with ego (while holding: released only once it is behind ego's rear)
+  std::optional<NeroCgwCar> neroCgwFindCar(const AvoidancePlanningData & data, bool beside) const;
+  bool neroCorridorGiveway(AvoidancePlanningData & data) const;
+  void neroInsertCgwStop(ShiftedPath & shifted_path) const;
+  mutable bool nero_cgw_active_{false};
+  mutable double nero_cgw_plan_t_{-1.0};      // the last (re-)plan
+  mutable bool nero_cgw_pass_{false};        // a coming car clears ego's keep-right body: keep right, pass slowly
+  mutable std::unordered_map<std::string, std::deque<std::array<double, 4>>> nero_cgw_hist_;  // UNKNOWN: t, x, y, v
+  mutable bool nero_cgw_start_{false};       // install the keep-right line this cycle
+  mutable double nero_cgw_shift_{0.0};       // keep-right shift (signed, from the reference path)
+  mutable double nero_cgw_ease_{0.0};        // over this distance from ego
+  mutable std::optional<geometry_msgs::msg::Pose> nero_cgw_stop_pose_;  // the wait place (base_link)
+  mutable std::string nero_cgw_id_;
+  mutable double nero_cgw_gone_since_{-1.0};
+  mutable double nero_cgw_still_since_{-1.0};  // the car and ego both standing since
+  mutable double nero_cgw_until_{-1.0};        // after a release for a parked car: no new give-way for it until then
+  mutable std::string nero_cgw_released_id_;
+  // passing: past the meeting a second line to this shift (standing objects there need ego further left), from
+  // nero_cgw_on_start_ (arc length from ego when planned) over nero_cgw_on_len_; < -1e8: none
+  mutable double nero_cgw_on_{-1e9};
+  mutable double nero_cgw_on_start_{-1.0};
+  mutable double nero_cgw_on_len_{0.0};
+  mutable bool nero_cgw_back_{false};          // the car passed: going back to the lane centre before the hold ends
+  mutable double nero_cgw_back_until_{-1.0};
+  // standing objects on ego's right seen while holding (the module plans no line for them meanwhile): map-frame box
+  // corners and obstacle_stop's lateral margin; one no longer published at the end is cleared by the way back
+  struct NeroCgwSeen
+  {
+    std::vector<geometry_msgs::msg::Point> corners;
+    double margin;
+  };
+  mutable std::unordered_map<std::string, NeroCgwSeen> nero_cgw_seen_;
+  mutable double nero_cgw_seen_t_{-1.0};
+  mutable std::optional<std::vector<geometry_msgs::msg::Point>> nero_cgw_back_past_;  // the way back holds until
+                                                                                   // ego's rear is past this box
+  void neroCgwRemember(const AvoidancePlanningData & data) const;
+  // a box's s0, s1 (arc length from ego) and lo, hi (lateral) on the reference path, every corner on its centre's segment
+  std::array<double, 4> neroCgwBox(
+    const AvoidancePlanningData & data, const std::vector<geometry_msgs::msg::Point> & corners) const;
 
   auto getTurnSignal(const ShiftedPath & spline_shift_path, const ShiftedPath & linear_shift_path)
     -> TurnSignalInfo;
