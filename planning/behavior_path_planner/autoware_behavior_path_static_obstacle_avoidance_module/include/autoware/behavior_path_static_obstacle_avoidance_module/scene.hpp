@@ -705,6 +705,18 @@ private:
 
   bool force_deactivated_{false};
   rclcpp::Time last_deactivation_triggered_time_;
+
+  // ---- nero (2026-10-28, pathstep job, QUEUE SPS): NERO_SOA_PATH_FROM_EGO. A plan whose change at / right in front of
+  // the robot it cannot follow (a freeze that drops the line ego is on and eases flat from ego, a re-based path when
+  // lines pass) is blended into the output from the previous output (from the robot's real place when it is off that)
+  // over a length the module's maximum lateral jerk allows at ego's speed, anchored on the map (scene.cpp, nero_pfe)
+  void neroPathFromEgo(const AvoidancePlanningData & data, ShiftedPath & shifted_path);
+  bool nero_pfe_active_{false};
+  geometry_msgs::msg::Point nero_pfe_start_;  // where the blend starts (on the reference path)
+  double nero_pfe_length_{0.0};
+  std::vector<double> nero_pfe_fs_, nero_pfe_fv_;  // the profile it starts from: arc length from the start, shift
+  PathShifter nero_pfe_shifter_;                    // the module's plan (lines, base offset) of the previous cycle
+  bool nero_pfe_have_{false};
 };
 
 }  // namespace autoware::behavior_path_planner

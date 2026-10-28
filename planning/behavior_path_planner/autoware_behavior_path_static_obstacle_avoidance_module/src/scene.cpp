@@ -32,6 +32,7 @@
 #include <autoware_lanelet2_extension/utility/utilities.hpp>
 #include <autoware_utils/geometry/geometry.hpp>
 #include <autoware_utils/math/normalization.hpp>
+#include <magic_enum.hpp>
 #include <tf2/utils.h>
 #include <lanelet2_core/geometry/LineString.h>
 #include <lanelet2_core/primitives/BasicRegulatoryElements.h>
@@ -42,6 +43,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <iomanip>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -473,6 +475,79 @@ constexpr double MIN_EASE_DISTANCE = 2.0;
 constexpr double BESIDE_MARGIN = 1.0;
 constexpr double STOP_DECEL = 2.5;
 }  // namespace nero_ovl
+
+namespace nero_ps
+{
+// NERO_SOA_PATHSTEP_DEBUG=1 (2026-10-28, pathstep job, QUEUE SPS; log only): one line per cycle with ego's real lateral
+// place on the reference path, the shift the previous / new output path has at ego, the registered and new shift
+// lines, the module's flags and the targets ahead ([NERO_SOA_PS]); a WARN line when the output path at ego moves
+// more than 0.2 m in one cycle ([NERO_SOA_PS] STEP)
+bool debug()
+{
+  static const bool r = [] {
+    const char * v = std::getenv("NERO_SOA_PATHSTEP_DEBUG");
+    return v && std::atoi(v) > 0;
+  }();
+  return r;
+}
+}  // namespace nero_ps
+
+namespace nero_pfe
+{
+// NERO_SOA_PATH_FROM_EGO="tol_m,off_m" (car: "0.1,0.3"; 2026-10-28, pathstep job, QUEUE SPS, captures 10-26e #17 "why" (MRM) / #24 "what
+// happened this is critical!!"): the planned path stepped sideways under the robot (#17: 1.83 m at 1.8 m/s, -0.36 rad,
+// AEB -> MRM; #24: 0.76 m at 3.4 m/s, a 23 deg snap). The module's NERO freezes (overtake v6's pause incl.
+// LANE_BLOCKED, RETURN_CLEAR, the corridor give-way: neroFreezeShift) drop the line ego is on and ease flat from ego,
+// from the previous path's shift at ego and not the robot's place or sideways motion; when registered lines pass,
+// the path at the robot is re-based. Sim on the car (c06s truck19: 0.57-0.83 m at 3.7 m/s, steer reversed to -0.23 rad;
+// #17's placement: the pause pulled the plan into the truck beside the robot, stranded for good). Upstream #11627
+// (isValidShiftLine: a new line's path within 0.1 m of ego's real position) guards new stock lines only.
+// Each cycle the new plan is compared with the module's previous plan around the robot (S_BACK behind to S_FRONT
+// ahead, exactly: the previous lines drawn over this reference): when it moved there by more than tol_m, it is blended in from the previous output (moved onto the robot's real place when
+// that is more than off_m off it, and continued along the robot's heading) over the length the module's maximum lateral
+// jerk allows at ego's speed, anchored on the map (a smooth S, slope-continuous at the robot). Stock lines start after
+// the prepare distance (>= 1 m) and never trigger it. Overtake v6's pause (and LANE_BLOCKED's) also checks its way back into the lane
+// against standing objects with obstacle_stop's margins: one it runs into that holding ego's shift clears makes it hold
+// the shift (LANE_BLOCKED, never further out) or not pause (an oncoming car: v6 decides as when no way back fits).
+struct Env
+{
+  bool on{false};
+  double tol{0.1};  // a jump at the robot (m); a kink is SLOPE_TOL
+  double off{0.3};  // the robot this far off the new plan: the blend starts from the robot's place (m)
+};
+const Env & env()
+{
+  static const Env e = [] {
+    Env r;
+    const char * v = std::getenv("NERO_SOA_PATH_FROM_EGO");
+    if (v && *v && std::string(v) != "0") {
+      r.on = true;
+      double a = 0.0, b = 0.0;
+      const int n = std::sscanf(v, "%lf,%lf", &a, &b);
+      if (n >= 1 && a > 0.0) r.tol = a;
+      if (n >= 2 && b > 0.0) r.off = b;
+    }
+    std::fprintf(stderr, "[NERO_SOA] path_from_ego=%d tol=%.2f off=%.2f\n", r.on, r.tol, r.off);
+    return r;
+  }();
+  return e;
+}
+constexpr double S_BACK = 6.0;     // the stretch around ego checked for a change: from this far behind (the planned
+                                   // trajectory starts ~5 m behind ego: a path re-based behind a lagging robot moves it
+                                   // at the robot, e.g. RETURN_CLEAR's hold dropping the passed line) ...
+constexpr double S_FRONT = 0.5;    // ... to this far ahead (stock lines start after the prepare distance, >= 1 m)
+constexpr double S_FAR = 40.0;     // how far the start profile is kept
+constexpr double MIN_LEN = 2.0;
+constexpr double V_MIN = 1.0;      // the module's lowest speed in its jerk map
+constexpr double MAX_DPSI = 0.3;   // the robot's heading against the reference, at most (rad)
+constexpr double MAX_EXTRA = 0.2;  // its sideways rate against the profile it was led along, at most (m per m)
+constexpr double ACC_SCALE = 1.5;  // the blend's lateral acceleration bound over the module's (comfort) maximum: a
+                                   // give-way's keep-right that turns the robot back from moving out stays as prompt
+                                   // as the module asks (corridor_1027's c24 late: 0.62 m instead of 0.79 at 1.0)
+constexpr double SLOPE_TOL = 0.1;  // a kink at the robot in the plan (m per m, ~6 deg) the robot cannot follow
+constexpr double CHANGED = 0.02;   // the plan changed in front of the robot (m): then a jump / kink / robot off decides
+constexpr double MAX_S_H = 6.0;    // how far that sideways motion is carried on, at most (m)
+}  // namespace nero_pfe
 
 StaticObstacleAvoidanceModule::StaticObstacleAvoidanceModule(
   const std::string & name, rclcpp::Node & node, std::shared_ptr<AvoidanceParameters> parameters,
@@ -1760,6 +1835,29 @@ bool StaticObstacleAvoidanceModule::neroOncomingPause(AvoidancePlanningData & da
     if (room >= needed) {
       hold = h;
       break;
+    }
+  }
+  // NERO_SOA_PATH_FROM_EGO: a way back into the lane that runs into a standing object beside / ahead (the truck ego is
+  // passing: #17's placement) which holding ego's shift clears is no way back
+  if (hold && nero_pfe::env().on) {
+    const auto & ref = data.reference_path.points;
+    std::vector<geometry_msgs::msg::Pose> back_poses, hold_poses;
+    for (size_t i = data.ego_closest_path_index; i < ref.size() && i < data.arclength_from_ego.size(); ++i) {
+      const double s = data.arclength_from_ego.at(i);
+      if (s > back + planner_data_->parameters.base_link2front) break;
+      const double x = std::clamp(s / std::max(back, 0.1), 0.0, 1.0);
+      const double lat = actual + (hold.value() - actual) * x * x * (3.0 - 2.0 * x);
+      back_poses.push_back(autoware_utils::calc_offset_pose(ref.at(i).point.pose, 0.0, sign * lat, 0.0));
+      hold_poses.push_back(autoware_utils::calc_offset_pose(ref.at(i).point.pose, 0.0, sign * actual, 0.0));
+    }
+    const auto blocker = neroBlocker(back_poses, data, false);
+    if (!blocker.empty() && neroBlocker(hold_poses, data, false).empty()) {
+      RCLCPP_WARN_THROTTLE(
+        getLogger(), *clock_, 500,
+        "[NERO_SOA_PFE] %s: the way back into the lane (%.2f -> %.2f m over %.1f m) runs into the standing %s beside: no "
+        "way back",
+        why.c_str(), actual, hold.value(), back, blocker.c_str());
+      hold.reset();
     }
   }
   if (!hold && nero_lane_block_ && !nero_onc_ && room > planner_data_->parameters.base_link2front) {
@@ -3869,6 +3967,46 @@ BehaviorModuleOutput StaticObstacleAvoidanceModule::plan()
   const auto success_linear_path_generation =
     path_shifter_.generate(&linear_shift_path, true, SHIFT_TYPE::LINEAR);
 
+  if (nero_ps::debug() && success_spline_path_generation && !spline_shift_path.path.points.empty()) {
+    const auto & pts = spline_shift_path.path.points;
+    const auto ego_pos = getEgoPosition();
+    const size_t i_ego = planner_data_->findEgoIndex(pts);
+    const double out_shift = spline_shift_path.shift_length.at(i_ego);
+    const double prev_shift = helper_->getEgoShift();
+    const double ego_lat = autoware::motion_utils::calcLateralOffset(data.reference_path.points, ego_pos);
+    std::ostringstream ss;
+    ss << std::fixed << std::setprecision(2) << "[NERO_SOA_PS] v " << getEgoSpeed() << " ego_lat " << ego_lat
+       << " prev " << prev_shift << " out " << out_shift << " base " << path_shifter_.getBaseOffset() << " state "
+       << static_cast<int>(data.state) << " valid " << data.valid << " safe " << data.safe << " comf "
+       << data.comfortable << " yield " << data.yield_required << " act " << isActivated() << " | reg:";
+    for (const auto & sl : path_shifter_.getShiftLines()) {
+      ss << " [" << autoware::motion_utils::calcSignedArcLength(pts, ego_pos, sl.start.position) << ">"
+         << autoware::motion_utils::calcSignedArcLength(pts, ego_pos, sl.end.position) << " " << sl.start_shift_length
+         << ">" << sl.end_shift_length << "]";
+    }
+    ss << " | new:";
+    for (const auto & sl : data.new_shift_line) {
+      ss << " [" << sl.start_longitudinal << ">" << sl.end_longitudinal << " " << sl.start_shift_length << ">"
+         << sl.end_shift_length << "]";
+    }
+    ss << " | safe_sl " << data.safe_shift_line.size() << " | tg:";
+    int n = 0;
+    for (const auto & o : data.target_objects) {
+      if (++n > 5) break;
+      ss << " " << std::hex << static_cast<int>(o.object.object_id.uuid[0]) << static_cast<int>(o.object.object_id.uuid[1])
+         << std::dec << ":" << magic_enum::enum_name(o.info) << (o.is_avoidable ? ":A" : ":a") << ":lon "
+         << o.longitudinal << ":m " << (o.avoid_margin ? o.avoid_margin.value() : -1.0);
+    }
+    RCLCPP_INFO(getLogger(), "%s", ss.str().c_str());
+    static bool nero_ps_first = true;  // the first cycle has no previous output path
+    if (!nero_ps_first && std::abs(out_shift - prev_shift) > 0.2) {
+      RCLCPP_WARN(
+        getLogger(), "[NERO_SOA_PS] STEP the output path at ego moved %.2f m in one cycle (prev %.2f -> %.2f, ego %.2f)",
+        out_shift - prev_shift, prev_shift, out_shift, ego_lat);
+    }
+    nero_ps_first = false;
+  }
+
   // set previous data
   if (success_spline_path_generation && success_linear_path_generation) {
     helper_->setPreviousLinearShiftPath(linear_shift_path);
@@ -3876,6 +4014,12 @@ BehaviorModuleOutput StaticObstacleAvoidanceModule::plan()
     helper_->setPreviousReferencePath(path_shifter_.getReferencePath());
   } else {
     spline_shift_path = helper_->getPreviousSplineShiftPath();
+  }
+
+  // NERO_SOA_PATH_FROM_EGO: the output only; the module keeps its own plan as its previous path (its decisions, e.g.
+  // RETURN_CLEAR's hold of the shift at ego, stay on its plan)
+  if (nero_pfe::env().on && success_spline_path_generation && success_linear_path_generation) {
+    neroPathFromEgo(data, spline_shift_path);
   }
 
   BehaviorModuleOutput output;
@@ -3950,6 +4094,233 @@ BehaviorModuleOutput StaticObstacleAvoidanceModule::plan()
   }
 
   return output;
+}
+
+void StaticObstacleAvoidanceModule::neroPathFromEgo(
+  const AvoidancePlanningData & data, ShiftedPath & shifted_path)
+{
+  const auto & ref = data.reference_path.points;
+  const auto & prev = helper_->getPreviousSplineShiftPath();
+  const auto & arc = data.arclength_from_ego;
+  const ShiftedPath raw = shifted_path;  // the module's own plan this cycle
+  const bool usable = ref.size() >= 2 && shifted_path.path.points.size() == ref.size() &&
+                      shifted_path.shift_length.size() == ref.size() && arc.size() == ref.size() &&
+                      prev.path.points.size() >= 2;
+  // the module's plan unchanged since the previous cycle (the same lines and base offset): nothing moved (most cycles)
+  const auto same_plan = [&] {
+    const auto & a = nero_pfe_shifter_.getShiftLines();
+    const auto & b = path_shifter_.getShiftLines();
+    if (!nero_pfe_have_ || a.size() != b.size() ||
+        std::abs(nero_pfe_shifter_.getBaseOffset() - path_shifter_.getBaseOffset()) > 1.0e-4) {
+      return false;
+    }
+    for (size_t k = 0; k < a.size(); ++k) {
+      if (
+        autoware_utils::calc_distance2d(a.at(k).start, b.at(k).start) > 1.0e-3 ||
+        autoware_utils::calc_distance2d(a.at(k).end, b.at(k).end) > 1.0e-3 ||
+        std::abs(a.at(k).end_shift_length - b.at(k).end_shift_length) > 1.0e-4) {
+        return false;
+      }
+    }
+    return true;
+  }();
+  // the previous cycle's plan (its lines and base offset) drawn over this cycle's reference path: exact, no geometry
+  // (drawn over the previous cycle's own reference, which it was output on: a line starting before this cycle's
+  // reference would be squeezed into its first point), read at this cycle's reference points along the lane; NaN where
+  // that reference did not reach
+  std::optional<std::vector<double>> old;
+  if (usable && nero_pfe_have_ && same_plan) {
+    old = raw.shift_length;  // the same plan: no move (only an active blend is applied below)
+  } else if (usable && nero_pfe_have_) {
+    auto sh = nero_pfe_shifter_;
+    const auto & op = sh.getReferencePath().points;
+    ShiftedPath o = utils::static_obstacle_avoidance::toShiftedPath(sh.getReferencePath());
+    if (op.size() >= 2 && sh.generate(&o, true, SHIFT_TYPE::SPLINE) && o.shift_length.size() == op.size()) {
+      std::vector<double> v(ref.size(), std::numeric_limits<double>::quiet_NaN());
+      for (size_t i = 0; i < ref.size(); ++i) {
+        if (arc.at(i) < -nero_pfe::S_BACK - 1.0) continue;
+        if (arc.at(i) > nero_pfe::S_FAR) break;
+        const auto & p = ref.at(i).point.pose.position;
+        const size_t seg = autoware::motion_utils::findNearestSegmentIndex(op, p);
+        const double len = autoware_utils::calc_distance2d(op.at(seg), op.at(seg + 1));
+        if (len < 1.0e-3) continue;
+        const double lon = autoware::motion_utils::calcLongitudinalOffsetToSegment(op, seg, p);
+        if ((seg == 0 && lon < -0.05) || (seg + 2 == op.size() && lon > len + 0.05)) continue;
+        if (std::abs(autoware::motion_utils::calcLateralOffset(op, p, seg)) > 0.3) continue;  // not the same line
+        const double r = std::clamp(lon / len, 0.0, 1.0);
+        v.at(i) = o.shift_length.at(seg) + r * (o.shift_length.at(seg + 1) - o.shift_length.at(seg));
+      }
+      old = v;
+    }
+  }
+  nero_pfe_shifter_ = path_shifter_;
+  nero_pfe_have_ = true;
+  if (!usable || !old) {
+    nero_pfe_active_ = false;
+    return;
+  }
+  const auto & e = nero_pfe::env();
+  const auto ego = getEgoPosition();
+  const double v = std::max(getEgoSpeed(), nero_pfe::V_MIN);
+  const double jerk = std::max(helper_->getLateralMaxJerkLimit(), 0.1);
+  const auto smooth = [](const double x) {
+    const double c = std::clamp(x, 0.0, 1.0);
+    return c * c * (3.0 - 2.0 * c);
+  };
+  const auto from_at = [&](const double s) {  // the stored start profile at arc length s from the blend start
+    const auto & fs = nero_pfe_fs_;
+    if (fs.empty()) return 0.0;
+    if (s <= fs.front()) return nero_pfe_fv_.front();
+    if (s >= fs.back()) return nero_pfe_fv_.back();
+    const size_t k = std::upper_bound(fs.begin(), fs.end(), s) - fs.begin();
+    const double r = (s - fs.at(k - 1)) / std::max(fs.at(k) - fs.at(k - 1), 1.0e-6);
+    return nero_pfe_fv_.at(k - 1) + r * (nero_pfe_fv_.at(k) - nero_pfe_fv_.at(k - 1));
+  };
+  // what the robot was led along last cycle at reference point i: the old plan, blended as the active blend did
+  const double s_bs = nero_pfe_active_ ? autoware::motion_utils::calcSignedArcLength(ref, ego, nero_pfe_start_) : 0.0;
+  const auto led = [&](const size_t i) {
+    const double p_old = std::isfinite(old->at(i)) ? old->at(i) : raw.shift_length.at(i);
+    if (!nero_pfe_active_) return p_old;
+    const double s_rel = arc.at(i) - s_bs;
+    if (s_rel >= nero_pfe_length_) return p_old;
+    const double f = from_at(s_rel);
+    return f + (p_old - f) * smooth(s_rel / nero_pfe_length_);
+  };
+  // the module's plan moved around the robot (against its own plan of the previous cycle)
+  const size_t i0 = data.ego_closest_path_index;
+  double moved = 0.0, moved_behind = 0.0;  // at / in front of the robot; behind it only
+  for (size_t i = 0; i < ref.size(); ++i) {
+    if (arc.at(i) < -nero_pfe::S_BACK) continue;
+    if (arc.at(i) > nero_pfe::S_FRONT) break;
+    if (!std::isfinite(old->at(i))) continue;
+    const double d = std::abs(raw.shift_length.at(i) - old->at(i));
+    if (arc.at(i) < 0.0) {
+      moved_behind = std::max(moved_behind, d);
+    } else {
+      moved = std::max(moved, d);
+    }
+  }
+  // at the robot: the new plan against what it was led along (value and slope), and the robot against the new plan
+  const size_t j = std::min(i0, ref.size() - 2);
+  const double ds = std::max(arc.at(j + 1) - arc.at(j), 1.0e-3);
+  const double r_ego = std::clamp(-arc.at(j) / ds, 0.0, 1.0);
+  const double led_ego = led(j) + (led(j + 1) - led(j)) * r_ego;
+  const double led_slope = (led(j + 1) - led(j)) / ds;
+  const double raw_ego = raw.shift_length.at(j) + (raw.shift_length.at(j + 1) - raw.shift_length.at(j)) * r_ego;
+  const double raw_slope = (raw.shift_length.at(j + 1) - raw.shift_length.at(j)) / ds;
+  const double e_real = autoware::motion_utils::calcLateralOffset(ref, ego);
+  // a change the robot can follow (it starts at the robot's place and direction: a stock line ahead, a freeze easing
+  // flat from where a robot driving straight is) is the module's own; a jump, a kink, or a robot off the new plan is not
+  const bool jump = std::abs(raw_ego - led_ego) > e.tol || std::abs(raw_slope - led_slope) > nero_pfe::SLOPE_TOL ||
+                    (std::isfinite(e_real) && std::abs(e_real - raw_ego) > e.off);
+  if (!jump || moved <= nero_pfe::CHANGED) {
+    moved = 0.0;  // nothing to blend in front of the robot (behind it: below)
+  }
+  if (moved <= nero_pfe::CHANGED && moved_behind > e.tol) {
+    // the plan was re-based only behind the robot (passed lines dropped, a freeze's flat start from the plan's own shift
+    // at ego): keep what the robot was led along behind it, the module's plan from the robot on; during a blend, the
+    // blend goes on from where it has led the robot (else the robot, still on the blend, would be off the plan at once)
+    const double rem = nero_pfe_active_ ? nero_pfe_length_ + s_bs : 0.0;  // the active blend's length still ahead
+    const double s_keep = rem > 0.0 ? nero_pfe::S_FAR : nero_pfe::S_FRONT;
+    std::vector<double> fs, fv;
+    for (size_t i = 0; i < ref.size(); ++i) {
+      if (arc.at(i) < -nero_pfe::S_BACK - 1.0) continue;
+      if (arc.at(i) > s_keep) break;
+      fs.push_back(arc.at(i) - arc.at(i0));
+      fv.push_back(led(i));
+    }
+    if (fs.size() >= 2) {
+      nero_pfe_fs_ = fs;
+      nero_pfe_fv_ = fv;
+      nero_pfe_length_ = rem > 0.0 ? std::max(nero_pfe::MIN_LEN, rem) : 0.01;
+      nero_pfe_start_ = ref.at(i0).point.pose.position;
+      nero_pfe_active_ = true;
+      RCLCPP_INFO(
+        getLogger(), "[NERO_SOA_PFE] the plan moved %.2f m behind the robot only (v %.2f): the old part kept behind it",
+        moved_behind, getEgoSpeed());
+    }
+  } else if (moved > nero_pfe::CHANGED) {
+    // the profile the robot was led along, moved onto the robot when it is more than off_m off it, and continued along
+    // the robot's heading against the reference (slope-continuous with its sideways motion)
+    const double c = std::isfinite(e_real) && std::abs(e_real - led_ego) > e.off ? e_real - led_ego : 0.0;
+    const double ref_yaw = tf2::getYaw(ref.at(j).point.pose.orientation);
+    const double dpsi = std::clamp(
+      autoware_utils::normalize_radian(tf2::getYaw(getEgoPose().orientation) - ref_yaw), -nero_pfe::MAX_DPSI,
+      nero_pfe::MAX_DPSI);
+    // the robot's sideways rate beyond the profile's (per metre); it carries on only as far as the module's maximum
+    // lateral acceleration needs to cancel it: h(s) = extra s (1 - s / 2 s_h) up to s_h = |extra| v^2 / a, then flat
+    double extra = std::clamp(std::tan(dpsi) - led_slope, -nero_pfe::MAX_EXTRA, nero_pfe::MAX_EXTRA);
+    if (std::abs(extra) < 0.03) extra = 0.0;
+    const double s_h = std::min(
+      nero_pfe::MAX_S_H, std::abs(extra) * v * v / std::max(helper_->getLateralMaxAccelLimit(), 0.1));
+    const auto carry = [&](const double s) {
+      if (s <= 0.0 || s_h < 1.0e-3) return 0.0;
+      const double q = std::min(s, s_h);
+      return extra * q * (1.0 - q / (2.0 * s_h));
+    };
+    std::vector<double> fs, fv;
+    for (size_t i = 0; i < ref.size(); ++i) {
+      if (arc.at(i) < -nero_pfe::S_BACK - 1.0) continue;
+      if (arc.at(i) > nero_pfe::S_FAR) break;
+      fs.push_back(arc.at(i) - arc.at(i0));
+      fv.push_back(led(i) + c + carry(arc.at(i)));
+    }
+    if (fs.size() >= 2) {
+      nero_pfe_fs_ = fs;
+      nero_pfe_fv_ = fv;
+      // the blend length: a smooth S (w = 3x^2 - 2x^3) whose lateral jerk dmax * 12 v^3 / L^3 and lateral acceleration
+      // v^2 (dmax * 6 / L^2 + sigma * 3 / L) stay within the module's maxima at ego's speed; dmax = the largest change
+      // over it, sigma = the slope the robot must turn away from at its start (its sideways motion against the plan)
+      const double acc = nero_pfe::ACC_SCALE * std::max(helper_->getLateralMaxAccelLimit(), 0.1);
+      const size_t k = std::min(i0 + 1, ref.size() - 1);
+      const double dk = std::max(arc.at(k) - arc.at(i0), 1.0e-3);
+      const double sigma = std::abs(
+        ((raw.shift_length.at(k) - from_at(arc.at(k) - arc.at(i0))) -
+         (raw.shift_length.at(i0) - from_at(0.0))) / dk);
+      double len = nero_pfe::MIN_LEN, dmax = 0.0;
+      for (int it = 0; it < 6; ++it) {
+        dmax = 0.0;
+        for (size_t i = i0; i < ref.size(); ++i) {
+          const double s_rel = arc.at(i) - arc.at(i0);
+          if (s_rel > len) break;
+          dmax = std::max(dmax, std::abs(raw.shift_length.at(i) - from_at(s_rel)));
+        }
+        const double by_jerk = v * std::cbrt(12.0 * dmax / jerk);
+        const double b = 3.0 * sigma * v * v;
+        const double by_acc = (b + std::sqrt(b * b + 24.0 * acc * dmax * v * v)) / (2.0 * acc);
+        len = std::max({len, by_jerk, by_acc});
+      }
+      nero_pfe_length_ = len;
+      nero_pfe_start_ = ref.at(i0).point.pose.position;
+      nero_pfe_active_ = true;
+      RCLCPP_WARN(
+        getLogger(),
+        "[NERO_SOA_PFE] the plan moved %.2f m around the robot (v %.2f): blended in from %s (robot %.2f m off it, "
+        "%.2f sideways) over %.1f m (largest change %.2f m, slope %.2f, jerk %.2f, acc %.2f)",
+        moved, getEgoSpeed(), std::abs(c) > 0.0 ? "the robot's place" : "where the robot was led", e_real - led_ego,
+        extra, nero_pfe_length_, dmax, sigma, jerk, acc);
+    }
+  }
+  if (!nero_pfe_active_) return;
+  const double s_start = autoware::motion_utils::calcSignedArcLength(ref, ego, nero_pfe_start_);  // < 0: behind ego
+  if (-s_start > nero_pfe_length_ + nero_pfe::S_BACK) {
+    nero_pfe_active_ = false;  // ego is past the blend by the trajectory's backward reach: the module's plan as it is
+    return;
+  }
+  bool changed = false;
+  for (size_t i = 0; i < ref.size(); ++i) {
+    const double s_rel = arc.at(i) - s_start;
+    if (s_rel >= nero_pfe_length_) break;
+    if (s_rel < -nero_pfe::S_BACK - 1.0) continue;
+    const double f = from_at(s_rel);
+    const double out = f + (raw.shift_length.at(i) - f) * smooth(s_rel / nero_pfe_length_);
+    shifted_path.shift_length.at(i) = out;
+    shifted_path.path.points.at(i).point.pose = autoware_utils::calc_offset_pose(ref.at(i).point.pose, 0.0, out, 0.0);
+    changed = true;
+  }
+  if (changed) {
+    autoware::motion_utils::insertOrientation(shifted_path.path.points, true);
+  }
 }
 
 CandidateOutput StaticObstacleAvoidanceModule::planCandidate() const
