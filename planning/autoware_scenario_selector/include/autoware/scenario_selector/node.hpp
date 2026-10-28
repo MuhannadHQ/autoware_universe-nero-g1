@@ -137,6 +137,34 @@ private:
 
   // processing time
   autoware_utils::StopWatch<std::chrono::milliseconds> stop_watch;
+
+  // [nero] far-stop comfort ceiling (NERO_SCSEL_FAR_STOP): a stop the comfort deceleration can still make from the
+  // plan's state is approached at a constant, tapered deceleration; any other stop is the car's (unset = a relay)
+  struct FarStop
+  {
+    bool on{false};
+    double a_c{0.6};      // plateau deceleration for a stop seen far enough, at v_ref [m/s^2]
+    double a_max{0.9};    // a stop needing more is left to the car as it is
+    double v_taper{1.0};  // below this speed the deceleration tapers ...
+    double a_end{0.35};   // ... down to this at the stop
+    double j_ramp{1.0};   // jerk the plan needs to ramp into the plateau [m/s^3]
+    double v_ref{0.0};    // > 0: the plateau is a_c * v / v_ref (at least a_end) at the plan's speed v
+    double k_need{0.0};   // > 0: a stop first decided close gets at least k_need * v^2 / (2 d) (up to a_close)
+    double n_hand{0.0};   // > 0: a stop first decided with v^2 / (2 d) above n_hand * v_ref / v keeps the car's braking
+    double a_close{0.0};  // the cap of k_need's plateau (unset / out of range = a_c)
+    // latch of the current stop
+    bool has_stop{false};
+    bool car{false};
+    double a_use{0.0};
+    double a_log{0.0};
+    double sx{0.0}, sy{0.0};
+    double seen_s{0.0};
+    double rest_s{-1.0};
+  } far_stop_;
+  rclcpp::Subscription<autoware_planning_msgs::msg::Trajectory>::SharedPtr sub_far_stop_plan_;
+  autoware_planning_msgs::msg::Trajectory::ConstSharedPtr far_stop_plan_;
+  autoware_planning_msgs::msg::Trajectory::ConstSharedPtr shapeFarStop(
+    const autoware_planning_msgs::msg::Trajectory::ConstSharedPtr & msg);
 };
 }  // namespace autoware::scenario_selector
 #endif  // AUTOWARE__SCENARIO_SELECTOR__NODE_HPP_

@@ -24,7 +24,14 @@
 #include <lanelet2_core/geometry/Point.h>
 #include <lanelet2_core/geometry/Polygon.h>
 
+#include <tf2/utils.h>
+
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <deque>
+#include <limits>
 #include <memory>
 #include <string>
 #include <utility>
@@ -125,6 +132,52 @@ bool isStopped(
     }
   }
   return true;
+}
+
+// [nero] far-stop comfort ceiling: the speed profile of a stop braked at a_use, tapering linearly in speed below
+// v_taper to a_end at the stop: v dv/dd = a_end + k v (k = (a_use - a_end) / v_taper)
+double farStopTaperDist(const double v, const double a_use, const double v_taper, const double a_end)
+{
+  const double k = (a_use - a_end) / v_taper;
+  if (k < 1e-6) return v * v / (2.0 * a_use);
+  return v / k - a_end / (k * k) * std::log1p(k * v / a_end);
+}
+
+// distance the profile needs to stop from v
+double farStopDist(const double v, const double a_use, const double v_taper, const double a_end)
+{
+  if (v <= v_taper) return farStopTaperDist(v, a_use, v_taper, a_end);
+  return farStopTaperDist(v_taper, a_use, v_taper, a_end) +
+         (v * v - v_taper * v_taper) / (2.0 * a_use);
+}
+
+// the profile's speed d before the stop
+double farStopCeiling(const double d, const double a_use, const double v_taper, const double a_end)
+{
+  if (d <= 0.0) return 0.0;
+  const double d_t = farStopTaperDist(v_taper, a_use, v_taper, a_end);
+  if (d >= d_t) return std::sqrt(v_taper * v_taper + 2.0 * a_use * (d - d_t));
+  double lo = 0.0, hi = v_taper;
+  for (int i = 0; i < 30; ++i) {
+    const double mid = 0.5 * (lo + hi);
+    (farStopTaperDist(mid, a_use, v_taper, a_end) < d ? lo : hi) = mid;
+  }
+  return lo;
+}
+
+// distance the plan (v, a0) needs to stop: a jerk-limited ramp from a0 into -a_use, then the profile
+double farStopNeed(
+  const double v, const double a0, const double a_use, const double v_taper, const double a_end,
+  const double j_ramp)
+{
+  constexpr double dt = 0.02;
+  double s = 0.0, vv = v, a = a0;
+  while (a > -a_use && vv > 0.0) {
+    a = std::max(a - j_ramp * dt, -a_use);
+    s += vv * dt;
+    vv += a * dt;
+  }
+  return s + farStopDist(std::max(vv, 0.0), a_use, v_taper, a_end);
 }
 
 }  // namespace
@@ -406,7 +459,7 @@ void ScenarioSelectorNode::onLaneDrivingTrajectory(
     return;
   }
 
-  publishTrajectory(msg);
+  publishTrajectory(far_stop_.on ? shapeFarStop(msg) : msg);
 }
 
 void ScenarioSelectorNode::onParkingTrajectory(
@@ -419,6 +472,153 @@ void ScenarioSelectorNode::onParkingTrajectory(
   }
 
   publishTrajectory(msg);
+}
+
+autoware_planning_msgs::msg::Trajectory::ConstSharedPtr ScenarioSelectorNode::shapeFarStop(
+  const autoware_planning_msgs::msg::Trajectory::ConstSharedPtr & msg)
+{
+  auto & f = far_stop_;
+  const auto & pts = msg->points;
+  if (!current_pose_ || pts.size() < 2) return msg;
+  const double now_s = this->now().seconds();
+  const auto & ego = current_pose_->pose.pose;
+  const double ego_yaw = tf2::getYaw(ego.orientation);
+  const double v_odom = current_pose_->twist.twist.linear.x;
+
+  // ego on the trajectory: the nearest segment heading the same way
+  std::vector<double> s(pts.size(), 0.0);
+  for (size_t i = 1; i < pts.size(); ++i) {
+    s[i] = s[i - 1] + autoware_utils::calc_distance2d(pts[i - 1], pts[i]);
+  }
+  size_t k = 0;
+  double s_ego = 0.0, best = std::numeric_limits<double>::max();
+  for (size_t i = 0; i + 1 < pts.size(); ++i) {
+    const auto & p = pts[i].pose.position;
+    const auto & q = pts[i + 1].pose.position;
+    const double dx = q.x - p.x, dy = q.y - p.y, l2 = dx * dx + dy * dy;
+    if (l2 < 1e-9 || std::cos(std::atan2(dy, dx) - ego_yaw) < 0.0) continue;
+    const double t =
+      std::clamp(((ego.position.x - p.x) * dx + (ego.position.y - p.y) * dy) / l2, 0.0, 1.0);
+    const double e = std::hypot(p.x + t * dx - ego.position.x, p.y + t * dy - ego.position.y);
+    if (e < best) {
+      best = e;
+      k = i;
+      s_ego = s[i] + t * (s[i + 1] - s[i]);
+    }
+  }
+  if (best > 3.0) return msg;
+
+  // the first stop ahead of ego
+  size_t j = k + 1;
+  while (j < pts.size() && pts[j].longitudinal_velocity_mps >= 0.01) ++j;
+  if (j >= pts.size()) {
+    if (f.has_stop && now_s - f.seen_s > 1.5) f.has_stop = false;
+    return msg;
+  }
+  const double d = s[j] - s_ego;
+  const auto & sp = pts[j].pose.position;
+
+  // the same stop as the last cycle (within 2 m) keeps its decision; ego resting 1 s re-decides
+  if (!f.has_stop || std::hypot(sp.x - f.sx, sp.y - f.sy) > 2.0 || now_s - f.seen_s > 1.5) {
+    f.has_stop = true;
+    f.car = false;
+    f.a_use = 0.0;
+  }
+  f.sx = sp.x;
+  f.sy = sp.y;
+  f.seen_s = now_s;
+  if (std::abs(v_odom) < 0.05) {
+    if (f.rest_s < 0.0) f.rest_s = now_s;
+    if (now_s - f.rest_s > 1.0) {
+      f.car = false;
+      f.a_use = 0.0;
+      f.rest_s = std::numeric_limits<double>::max();  // once per rest
+    }
+  } else {
+    f.rest_s = -1.0;
+  }
+  if (f.car) return msg;
+
+  // the plan's own state at ego (the smoother plans open loop from it); the robot's speed if there is none
+  double v_e = v_odom, a_e = 0.0;
+  if (
+    far_stop_plan_ && !far_stop_plan_->points.empty() &&
+    (this->now() - rclcpp::Time(far_stop_plan_->header.stamp)).seconds() < 1.0) {
+    double e_min = std::numeric_limits<double>::max();
+    for (const auto & p : far_stop_plan_->points) {
+      const double e = autoware_utils::calc_distance2d(p.pose.position, ego.position);
+      if (e < e_min) {
+        e_min = e;
+        v_e = p.longitudinal_velocity_mps;
+        a_e = p.acceleration_mps2;
+      }
+    }
+    if (e_min > 3.0) {
+      v_e = v_odom;
+      a_e = 0.0;
+    }
+  }
+  v_e = std::max(v_e, 0.0);
+
+  // the comfort plateau grows with the plan's speed (a_c at v_ref: about the car's own stopping time at every speed)
+  const double a_lo =
+    f.v_ref > 0.0 ? std::clamp(f.a_c * std::min(v_e, f.v_ref) / f.v_ref, f.a_end, f.a_c) : f.a_c;
+  // the gentlest plateau in [lo0, a_max] that makes the stop from the plan's state; none = the car's braking
+  const auto need = [&](const double lo0) {
+    const auto dist = [&](const double a) {
+      return farStopNeed(v_e, a_e, a, f.v_taper, f.a_end, f.j_ramp);
+    };
+    if (dist(lo0) <= d) return lo0;
+    if (dist(f.a_max) > d) return f.a_max + 1.0;
+    double lo = lo0, hi = f.a_max;
+    for (int i = 0; i < 20; ++i) {
+      const double mid = 0.5 * (lo + hi);
+      (dist(mid) <= d ? hi : lo) = mid;
+    }
+    return hi;
+  };
+  const bool decide = f.a_use <= 0.0;
+  if (decide || v_e > farStopCeiling(d, f.a_use, f.v_taper, f.a_end) + 0.15) {
+    // a stop that is already close when it is first decided (an object appearing, not a stop line known from far):
+    // at least k_need times its constant-deceleration need, up to a_close (the car's own plan is firm and quick there;
+    // a plateau that follows only the speed would cost more time than the car's stop, a higher one would brake later)
+    const double n0 = v_e * v_e / (2.0 * std::max(d, 0.1));
+    const double a_first = decide && f.k_need > 0.0 ? std::min(f.k_need * n0, f.a_close) : 0.0;
+    // a stop first decided with a constant-deceleration need above n_hand (at v_ref; the time a gentler profile costs
+    // grows with the speed, so the limit is n_hand * v_ref / v): no profile within the comfort limits stops there in
+    // about the car's time (the car's own stop is firm and quick) -> the car's braking, unchanged
+    const double n_lim = f.v_ref > 0.0 ? f.n_hand * f.v_ref / std::max(v_e, 0.1) : f.n_hand;
+    const double a = decide && f.n_hand > 0.0 && n0 > n_lim ? f.a_max + 1.0 : need(std::max(a_lo, a_first));
+    if (a > f.a_max) {
+      f.car = true;
+      RCLCPP_INFO(
+        get_logger(), "[nero far-stop] stop %.1f m ahead (%.1f, %.1f), plan v %.2f a %.2f: the car's braking",
+        d, sp.x, sp.y, v_e, a_e);
+      return msg;
+    }
+    f.a_use = std::max(f.a_use, a);
+    f.a_log = f.a_use;
+    RCLCPP_INFO(
+      get_logger(), "[nero far-stop] stop %.1f m ahead (%.1f, %.1f), plan v %.2f a %.2f: %s %.2f", d, sp.x,
+      sp.y, v_e, a_e, decide ? "comfort" : "raised to", f.a_use);
+  } else if (a_lo > f.a_use) {
+    // the plan sped up toward the stop (a launch): its plateau follows (never lower for the same stop)
+    f.a_use = a_lo;
+    if (f.a_use > f.a_log + 0.05) {
+      f.a_log = f.a_use;
+      RCLCPP_INFO(
+        get_logger(), "[nero far-stop] stop %.1f m ahead, plan v %.2f: comfort %.2f", d, v_e, f.a_use);
+    }
+  }
+
+  auto out = std::make_shared<autoware_planning_msgs::msg::Trajectory>(*msg);
+  for (size_t i = 0; i < j; ++i) {
+    auto & v = out->points[i].longitudinal_velocity_mps;
+    if (v <= 0.0) continue;
+    v = std::min(
+      v, static_cast<float>(farStopCeiling(s[j] - s[i], f.a_use, f.v_taper, f.a_end)));
+  }
+  return out;
 }
 
 void ScenarioSelectorNode::publishTrajectory(
@@ -450,6 +650,32 @@ ScenarioSelectorNode::ScenarioSelectorNode(const rclcpp::NodeOptions & node_opti
 {
   lane_driving_stop_time_ = {};
   empty_parking_trajectory_time_ = {};
+
+  // [nero] far-stop comfort ceiling:
+  //   NERO_SCSEL_FAR_STOP=<a_c>,<a_max>,<v_taper>,<a_end>[,<j_ramp>[,<v_ref>[,<k_need>[,<n_hand>[,<a_close>]]]]]
+  if (const char * e = std::getenv("NERO_SCSEL_FAR_STOP"); e && *e) {
+    auto & f = far_stop_;
+    f.a_close = -1.0;
+    const int n = std::sscanf(
+      e, "%lf,%lf,%lf,%lf,%lf,%lf,%lf,%lf,%lf", &f.a_c, &f.a_max, &f.v_taper, &f.a_end, &f.j_ramp, &f.v_ref,
+      &f.k_need, &f.n_hand, &f.a_close);
+    if (f.a_close <= 0.0 || f.a_close > f.a_c) f.a_close = f.a_c;
+    f.on = n >= 1 && f.a_c > 0.0 && f.a_max >= f.a_c && f.v_taper > 0.0 && f.a_end > 0.0 &&
+           f.a_end <= f.a_c && f.j_ramp > 0.0;
+    if (f.on) {
+      sub_far_stop_plan_ = this->create_subscription<autoware_planning_msgs::msg::Trajectory>(
+        "/planning/scenario_planning/trajectory", rclcpp::QoS{1},
+        [this](const autoware_planning_msgs::msg::Trajectory::ConstSharedPtr msg) {
+          far_stop_plan_ = msg;
+        });
+    }
+    RCLCPP_INFO(
+      get_logger(),
+      "[nero far-stop] %s: a_c %.2f a_max %.2f v_taper %.2f a_end %.2f j_ramp %.2f v_ref %.2f k_need %.2f "
+      "n_hand %.2f a_close %.2f",
+      f.on ? "on" : "off (bad value)", f.a_c, f.a_max, f.v_taper, f.a_end, f.j_ramp, f.v_ref, f.k_need, f.n_hand,
+      f.a_close);
+  }
 
   // Input
   sub_lane_driving_trajectory_ = this->create_subscription<autoware_planning_msgs::msg::Trajectory>(
