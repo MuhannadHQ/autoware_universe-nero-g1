@@ -587,6 +587,23 @@ private:
   // a box's s0, s1 (arc length from ego) and lo, hi (lateral) on the reference path, every corner on its centre's segment
   std::array<double, 4> neroCgwBox(
     const AvoidancePlanningData & data, const std::vector<geometry_msgs::msg::Point> & corners) const;
+  // ---- nero (2026-10-29, twoway job, QUEUE CGWO): NERO_SOA_CORRIDOR_GIVEWAY_TWOWAY. The give-way on an ordinary two-way
+  // street (scene.cpp, namespace nero_tw): the pass speed follows the room the coming car leaves ego's keep-right body
+  // (< 0: no cap), and only a real parked row pushes a coming car into ego's lane
+  mutable double nero_tw_cap_{-1.0};
+  mutable bool nero_tw_street_{false};  // the coming car has its own lane's room where it meets ego (not a corridor)
+  mutable std::string nero_tw_plan_id_;  // the coming car of the last plan
+  // standing UNKNOWNs of a solid height: when / where first seen standing still (t first, x, y, t last)
+  mutable std::unordered_map<std::string, std::array<double, 4>> nero_tw_still_;
+  void neroTwStillUpdate() const;
+  // ego's planned shift s metres ahead (the previous cycle's shift path; nero_cgw_shift_ without one)
+  double neroTwShiftAt(double s) const;
+  bool neroTwRowObject(const autoware_perception_msgs::msg::PredictedObject & q) const;
+  // NERO_SOA_CORRIDOR_GIVEWAY_DEBUG=1 (log only): one line per coming candidate and cycle
+  void neroTwDebugCand(
+    const AvoidancePlanningData & data, const autoware_perception_msgs::msg::PredictedObject & o,
+    const std::string & id, double s_near, double lo, double hi, double v, double lane_left, double e_hi,
+    bool beside) const;
 
   auto getTurnSignal(const ShiftedPath & spline_shift_path, const ShiftedPath & linear_shift_path)
     -> TurnSignalInfo;
