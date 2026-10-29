@@ -14,6 +14,8 @@
 
 #include "autoware/external_velocity_limit_selector/external_velocity_limit_selector_node.hpp"
 
+#include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <ostream>
 #include <string>
@@ -118,6 +120,14 @@ ExternalVelocityLimitSelectorNode::ExternalVelocityLimitSelectorNode(
 : Node("external_velocity_limit_selector", node_options)
 {
   using std::placeholders::_1;
+  // [nero] NERO_VEL_LIMIT_CLEAR_DEFAULT=1: a clear before any limit was set publishes max_vel (upstream #11463)
+  if (const char * e = std::getenv("NERO_VEL_LIMIT_CLEAR_DEFAULT"); e && *e) {
+    nero_clear_default_ = std::strcmp(e, "1") == 0;
+    RCLCPP_INFO(
+      get_logger(), "[nero vel-limit clear default] %s: a clear on an empty table publishes max_vel",
+      nero_clear_default_ ? "on" : "off (bad value)");
+  }
+
   // Input
   sub_external_velocity_limit_from_api_ = this->create_subscription<VelocityLimit>(
     "input/velocity_limit_from_api", rclcpp::QoS{1}.transient_local(),
@@ -228,6 +238,13 @@ void ExternalVelocityLimitSelectorNode::clearVelocityLimit(const std::string & s
 {
   if (velocity_limit_table_.empty()) {
     RCLCPP_WARN(get_logger(), "no velocity limit has been set from internal.");
+    // [nero] upstream #11463 (68975e75d): max_vel, not the never-set hardest_limit_ (0 m/s)
+    if (nero_clear_default_) {
+      updateVelocityLimit();
+      RCLCPP_INFO(
+        get_logger(), "[nero vel-limit clear default] clear from '%s' on an empty table: %.2f m/s",
+        sender.c_str(), hardest_limit_.max_velocity);
+    }
     return;
   }
 

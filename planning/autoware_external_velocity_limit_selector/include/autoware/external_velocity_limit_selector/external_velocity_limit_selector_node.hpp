@@ -64,6 +64,7 @@ private:
   std::shared_ptr<::external_velocity_limit_selector::ParamListener> param_listener_;
   VelocityLimit hardest_limit_{};
   VelocityLimitTable velocity_limit_table_;
+  bool nero_clear_default_{false};  // [nero] NERO_VEL_LIMIT_CLEAR_DEFAULT
 };
 }  // namespace autoware::external_velocity_limit_selector
 

@@ -26,6 +26,10 @@ if(BUILD_TESTING)
     test/test_external_velocity_limit_selector_node_launch.py
     TIMEOUT "30"
   )
+  add_launch_test(
+    test/test_external_velocity_limit_selector_nero_vlz_launch.py
+    TIMEOUT "30"
+  )
 endif()
 
 ament_auto_package(INSTALL_TO_SHARE
