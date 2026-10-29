@@ -41,6 +41,28 @@
 // first <occ_depth> m past the line within <occ_t> s (within 0.5 m of its footprint there: no
 // creeping toward a passer, even one that would pass before ego gets there). Unset = the car
 // (nothing runs). NERO_IX_CROSSING_HOLD_DEBUG=1: one line per cycle while in scope (log only).
+//
+// NERO_IX_CROSSING_HOLD_YIELD=<stood s>,<approach m>[,<near m>] (crosswait job, 2026-10-29, QUEUE
+// STK1846): the slow-mover wait above ends for a vehicle that is letting ego go. 10-28 18:46 at
+// 62867 it held a standing ego 10 s after the last crosser, with no end, for a car stopping beside
+// / behind ego into the other lane of its own road (pointing away) and a truck waiting at the mouth
+// for ego (a mutual wait) until the operator drove off. With this switch a slow mover does not hold
+// a standing ego (1) while it is within <near> m of ego's way, wholly behind ego's nose, points
+// backward relative to ego and has not moved forward along ego's heading by <approach> in the last
+// <stood> s (it cannot come into ego's way ahead without turning around), or (2) once ego has stood
+// <stood> s, while it is within <near> m of ego's way and has not come <approach> m closer to it in
+// the last <stood> s (it
+// stopped at the mouth, or moves along / away; one manoeuvring further off keeps holding as before:
+// Ahmed 10-24, a driver slowing down and waiting is the signal for the robot to go; Apollo's
+// stop-sign STOP stage waits only for vehicles that arrived first and drops the wait after
+// stop_timeout_sec). Both are re-judged every cycle from the vehicle's motion, and a vehicle that
+// let ego go and then moves again (>= <v_min> two samples in a row, not away from ego's way: the
+// crazy driver who pulls out after all) no longer lets it go, at any speed: it
+// holds ego standing with its nose up to <occ_depth> past the line, and stops a moving ego whose
+// comfortable stop (0.3 s + 1 m/s2 + 0.3 m) still ends within <occ_depth> (else ego is committed
+// for it, as for a crosser), until it is behind ego, leaves the way or has stood again. The
+// crosser / no-start rules are unchanged (a vehicle >= <v_min> whose path comes into ego's way
+// holds it whatever this switch says). Unset = the above exactly.
 
 #include "scene_intersection.hpp"
 
@@ -62,6 +84,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <deque>
+#include <iterator>
 #include <limits>
 #include <map>
 #include <string>
@@ -112,6 +135,32 @@ const NeroCrossingHoldParam & nero_crossing_hold_param()
     r.occ_t = std::max(0.0, v[9]);
     r.occ_depth = std::max(0.0, v[10]);
     r.v_slow = std::max(0.0, v[11]);
+    return r;
+  }();
+  return p;
+}
+
+struct NeroCrossingYieldParam
+{
+  bool on{false};
+  double stood{2.0};
+  double approach{0.5};
+  double near{12.0};
+};
+
+const NeroCrossingYieldParam & nero_crossing_yield_param()
+{
+  static const NeroCrossingYieldParam p = [] {
+    NeroCrossingYieldParam r;
+    const char * e = std::getenv("NERO_IX_CROSSING_HOLD_YIELD");
+    if (e == nullptr || std::string(e).empty()) return r;
+    double v[3] = {r.stood, r.approach, r.near};
+    const int n = std::sscanf(e, "%lf,%lf,%lf", &v[0], &v[1], &v[2]);
+    if (n < 1) return r;
+    r.on = true;
+    r.stood = std::max(0.5, v[0]);
+    r.approach = std::max(0.0, v[1]);
+    r.near = std::max(0.0, v[2]);
     return r;
   }();
   return p;
@@ -190,6 +239,11 @@ void IntersectionModule::neroCrossingHold(PathWithLaneId * path)
     }
     nero_xh_holding_ = false;
     nero_xh_committed_.clear();
+    nero_xh_ego_stand_since_ = -1.0;
+    nero_xh_letgo_.clear();
+    nero_xh_revoked_.clear();
+    nero_xh_again_stop_.reset();
+    nero_xh_again_held_ = false;
   };
   // scope: a stop-sign lane where this module has no attention lane to check (it returned
   // InternalError)
@@ -217,6 +271,14 @@ void IntersectionModule::neroCrossingHold(PathWithLaneId * path)
       "below %.1f m/s",
       lane_id_, lines.front().id(), p.gap, p.depth, p.early, p.late, p.v_min, p.release, p.delay,
       p.acc, p.slow_r, p.occ_depth, p.occ_t, p.v_slow);
+    if (nero_crossing_yield_param().on) {
+      RCLCPP_INFO(
+        logger_,
+        "[NERO_IX] crossing_hold: lane %ld slow movers within %.0f m of its way yield: "
+        "behind ego's nose pointing back, or not %.1f m closer to it in %.1f s once ego stood",
+        lane_id_, nero_crossing_yield_param().near, nero_crossing_yield_param().approach,
+        nero_crossing_yield_param().stood);
+    }
   }
   if (path->points.size() < 2) return reset();
   const auto & ego_pose = planner_data_->current_odometry->pose;
@@ -325,6 +387,15 @@ void IntersectionModule::neroCrossingHold(PathWithLaneId * path)
 
   // the objects' speed history (for their observed deceleration)
   const double t_obj = rclcpp::Time(planner_data_->predicted_objects->header.stamp).seconds();
+  const auto & yp = nero_crossing_yield_param();
+  if (!standing) {
+    nero_xh_ego_stand_since_ = -1.0;
+  } else if (nero_xh_ego_stand_since_ < 0.0) {
+    nero_xh_ego_stand_since_ = t_obj;
+  }
+  const double ego_stood = standing ? t_obj - nero_xh_ego_stand_since_ : 0.0;
+  const bool dbg_wait = yp.on && nero_crossing_hold_debug();
+  std::string dbg_slow, dbg_hold;
   for (auto it = nero_xh_vhist_.begin(); it != nero_xh_vhist_.end();) {
     if (it->second.empty() || t_obj - it->second.back().first > 2.0)
       it = nero_xh_vhist_.erase(it);
@@ -336,6 +407,14 @@ void IntersectionModule::neroCrossingHold(PathWithLaneId * path)
       it = nero_xh_phist_.erase(it);
     else
       ++it;
+  }
+  for (auto * set : {&nero_xh_letgo_, &nero_xh_revoked_}) {
+    for (auto it = set->begin(); it != set->end();) {
+      if (nero_xh_phist_.count(*it) == 0)
+        it = set->erase(it);
+      else
+        ++it;
+    }
   }
 
   using Conflict = NeroCrossingCause;
@@ -381,9 +460,61 @@ void IntersectionModule::neroCrossingHold(PathWithLaneId * path)
         if (ph.empty() || t_obj - std::get<0>(ph.back()) > 0.05)
           ph.emplace_back(t_obj, opose.position.x, opose.position.y);
         while (!ph.empty() && t_obj - std::get<0>(ph.front()) > 5.0) ph.pop_front();
+        // NERO_IX_CROSSING_HOLD_YIELD: the vehicle's motion against ego's way: its distance to it
+        // now and 5 s ago, how much closer it came in the last <stood> s, whether it is wholly
+        // behind ego's nose pointing backward (and not moving forward along ego's heading), and its
+        // speed toward the nearest point of the way
+        struct YieldView
+        {
+          double d_way{0.0}, d_then{0.0}, approach{0.0}, closing{0.0};
+          bool behind{false};
+        };
+        auto yield_view = [&]() {
+          YieldView y;
+          const double x0 = std::get<1>(ph.front()), y0 = std::get<2>(ph.front());
+          const auto ref = std::find_if(ph.begin(), ph.end(), [&](const auto & h) {
+            return t_obj - std::get<0>(h) <= yp.stood;
+          });
+          const double rx = std::get<1>(*ref), ry = std::get<2>(*ref);
+          double d_ref = std::numeric_limits<double>::infinity();
+          y.d_way = y.d_then = d_ref;
+          geometry_msgs::msg::Point near;
+          for (const auto & e : ego) {
+            const double d = std::hypot(opose.position.x - e.c.x, opose.position.y - e.c.y);
+            if (d < y.d_way) {
+              y.d_way = d;
+              near = e.c;
+            }
+            y.d_then = std::min(y.d_then, std::hypot(x0 - e.c.x, y0 - e.c.y));
+            d_ref = std::min(d_ref, std::hypot(rx - e.c.x, ry - e.c.y));
+          }
+          y.approach = d_ref - y.d_way;
+          const double eyaw = tf2::getYaw(ego_pose.orientation);
+          const double ux = std::cos(eyaw), uy = std::sin(eyaw);
+          const double nx = ego_pos.x + front * ux, ny = ego_pos.y + front * uy;
+          double ahead = -std::numeric_limits<double>::infinity();
+          for (const auto & q : autoware_utils::to_polygon2d(opose, object.shape).outer()) {
+            ahead = std::max(ahead, (q.x() - nx) * ux + (q.y() - ny) * uy);
+          }
+          const double dyaw =
+            autoware_utils::normalize_radian(tf2::getYaw(opose.orientation) - eyaw);
+          const double fwd = (opose.position.x - rx) * ux + (opose.position.y - ry) * uy;
+          // (within <near> m too: at a left turn into a through road a car 19 m behind-left, in a
+          // parking area by the road, can still drive into ego's way: 59721 scene B's 31aa / 4654)
+          y.behind = ahead < 0.0 && std::cos(dyaw) < 0.0 && fwd < yp.approach && y.d_way <= yp.near;
+          if (y.d_way > 1e-3) {
+            const double vdir = tf2::getYaw(opose.orientation) + std::atan2(tw.y, tw.x);
+            y.closing = v *
+                        (std::cos(vdir) * (near.x - opose.position.x) +
+                         std::sin(vdir) * (near.y - opose.position.y)) /
+                        y.d_way;
+          }
+          return y;
+        };
+        bool evaluated = false;
         if (
           standing && nose_past <= 2.5 && v < p.v_slow && t_obj - std::get<0>(ph.front()) >= 2.5 &&
-          !conflict) {
+          (!conflict || dbg_wait)) {
           const double x0 = std::get<1>(ph.front()), y0 = std::get<2>(ph.front());
           const double moved = std::hypot(opose.position.x - x0, opose.position.y - y0);
           double d_way = std::numeric_limits<double>::infinity(), d_then = d_way;
@@ -392,7 +523,87 @@ void IntersectionModule::neroCrossingHold(PathWithLaneId * path)
             d_then = std::min(d_then, std::hypot(x0 - e.c.x, y0 - e.c.y));
           }
           if (moved >= 1.0 && d_way <= p.slow_r && d_way <= d_then + 1.0) {
-            conflict = Conflict{id, "slow", v, 0.0, 0.0, 0.0, d_way};
+            // NERO_IX_CROSSING_HOLD_YIELD: a vehicle letting ego go does not hold it: (1) wholly
+            // behind ego's nose pointing back, (2) ego stood <stood> s and it has not come
+            // <approach> m closer to ego's way since
+            const char * yields = nullptr;
+            double approach = 0.0;
+            if (yp.on) {
+              evaluated = true;
+              const auto yv = yield_view();
+              approach = yv.approach;
+              if (yv.behind) {
+                yields = "behind";
+              } else if (
+                ego_stood >= yp.stood && yv.approach < yp.approach && yv.d_way <= yp.near) {
+                // (a vehicle manoeuvring further off, e.g. in a parking area 17-24 m from the 59721
+                // mouth, is not waiting for ego: it keeps holding as before)
+                yields = "stood";
+              }
+              if (yields) {
+                nero_xh_letgo_.insert(key);
+                nero_xh_revoked_.erase(key);
+              }
+            }
+            if (dbg_wait) {
+              char b[96];
+              std::snprintf(
+                b, sizeof(b), " %s(d %.1f appr %+.2f v %.1f %s)", id.c_str(), d_way, approach, v,
+                yields ? yields : "HOLD");
+              dbg_slow += b;
+            }
+            if (!yields && !conflict) conflict = Conflict{id, "slow", v, 0.0, 0.0, 0.0, d_way};
+          }
+        }
+        // NERO_IX_CROSSING_HOLD_YIELD: a vehicle that let ego go and moves again (>= <v_min> two
+        // samples in a row, not away from ego's way) no longer lets it go, at any
+        // speed and also while ego moves: it holds ego standing with its nose up to <occ_depth>
+        // past the line, and stops a moving ego whose comfortable stop is still within <occ_depth>
+        // (else ego is committed for it), until it is behind ego, leaves the way or stood again
+        const bool letgo = nero_xh_letgo_.count(key) > 0;
+        bool revoked = nero_xh_revoked_.count(key) > 0;
+        if (yp.on && !evaluated && (letgo || revoked)) {
+          const auto yv = yield_view();
+          // moving again: reported >= <v_min> in its last two samples, and not away from the way (a
+          // truck pulling out along a line parallel to ego's exit lane closes on it only a little)
+          const bool moving_again = hist.size() >= 2 && std::prev(hist.end())->second >= p.v_min &&
+                                    std::prev(hist.end(), 2)->second >= p.v_min;
+          if (!revoked && !yv.behind && moving_again && yv.closing > 0.05) {
+            nero_xh_letgo_.erase(key);
+            nero_xh_revoked_.insert(key);
+            revoked = true;
+            RCLCPP_INFO(
+              logger_,
+              "[NERO_IX] crossing_hold: lane %ld %s moves toward ego's way again (%.1f m/s, "
+              "closing %.2f m/s, %.1f m off; ego v %.2f, nose %+.2f): it no longer lets ego go",
+              lane_id_, id.c_str(), v, yv.closing, yv.d_way, v0, nose_past);
+          }
+          if (revoked) {
+            const bool leaving = yv.d_way > p.slow_r || yv.d_way > yv.d_then + 1.0;
+            const bool stood =
+              standing && ego_stood >= yp.stood && yv.approach < yp.approach && yv.d_way <= yp.near;
+            const char * what = "again";
+            if (yv.behind || leaving || stood) {
+              nero_xh_revoked_.erase(key);
+              if (!leaving) nero_xh_letgo_.insert(key);
+              what = yv.behind ? "behind" : (leaving ? "leaving" : "stood");
+            } else if (
+              !nero_xh_again_held_ &&
+              (standing ? nose_past > p.occ_depth : nose_past + d_stop > p.occ_depth)) {
+              what = "committed";
+            } else {
+              // stop / hold for it (once decided, until the hold ends: the stop's run-on can carry
+              // ego past <occ_depth>)
+              nero_xh_again_held_ = true;
+              if (!conflict) conflict = Conflict{id, "again", v, 0.0, 0.0, 0.0, yv.d_way};
+            }
+            if (dbg_wait) {
+              char b[96];
+              std::snprintf(
+                b, sizeof(b), " %s(d %.1f appr %+.2f close %+.2f v %.1f %s)", id.c_str(), yv.d_way,
+                yv.approach, yv.closing, v, what);
+              dbg_slow += b;
+            }
           }
         }
       }
@@ -535,6 +746,13 @@ void IntersectionModule::neroCrossingHold(PathWithLaneId * path)
       }
     }
     if (!c_obj) continue;
+    if (dbg_wait) {
+      char b[96];
+      std::snprintf(
+        b, sizeof(b), " %s(%s gap %.2f t %.1f)", id.c_str(), c_obj->cls == "occ" ? "occ" : "cross",
+        c_obj->gap, c_obj->t);
+      dbg_hold += b;
+    }
     if (!standing && gap_stop < gap_go) {
       // stopping would leave ego closer to it than going on: committed for this object
       nero_xh_committed_.insert(key);
@@ -561,6 +779,7 @@ void IntersectionModule::neroCrossingHold(PathWithLaneId * path)
     (now - nero_xh_last_conflict_ >= p.release || (!standing && n_committed > 0))) {
     nero_xh_holding_ = false;
   }
+  if (!nero_xh_holding_) nero_xh_again_held_ = false;
   if (nero_xh_holding_ != was) {
     if (nero_xh_holding_) {
       nero_xh_hold_since_ = now;
@@ -587,6 +806,12 @@ void IntersectionModule::neroCrossingHold(PathWithLaneId * path)
       "%zu (to %.1f s) %s",
       lane_id_, nose_past, v0, n_targets, n_committed, ego.size(), t_end, what.c_str());
   }
+  if (dbg_wait) {
+    RCLCPP_INFO(
+      logger_, "[NERO_IX] crossing_wait dbg: lane %ld ego stood %.1f s | crossers:%s | slow:%s",
+      lane_id_, ego_stood, dbg_hold.empty() ? " none" : dbg_hold.c_str(),
+      dbg_slow.empty() ? " none" : dbg_slow.c_str());
+  }
   char txt[200];
   if (nero_xh_holding_) {
     std::snprintf(
@@ -598,10 +823,25 @@ void IntersectionModule::neroCrossingHold(PathWithLaneId * path)
       nose_past, n_targets, n_committed);
   }
   internal_debug_data_.decision_type += txt;
+  if (!nero_xh_holding_ || nero_xh_cause_.cls != "again" || standing) nero_xh_again_stop_.reset();
   if (!nero_xh_holding_) return;
 
   // hold: at the stop line (base_link where the nose meets it), or where ego is if it is past that
-  const double s_stop = std::max(0.0, s_line.value() - front);
+  double s_stop = std::max(0.0, s_line.value() - front);
+  if (nero_xh_cause_.cls == "again" && !standing) {
+    // NERO_IX_CROSSING_HOLD_YIELD: a moving ego stops for a vehicle that no longer lets it go where
+    // its comfortable stop ends (latched), not at once
+    if (!nero_xh_again_stop_) {
+      const auto pose = autoware::motion_utils::calcLongitudinalOffsetPose(
+        path->points, ego_pos, std::max(s_stop, d_stop));
+      if (pose) nero_xh_again_stop_ = pose->position;
+    }
+    if (nero_xh_again_stop_) {
+      s_stop = std::max(
+        s_stop,
+        autoware::motion_utils::calcSignedArcLength(path->points, ego_pos, *nero_xh_again_stop_));
+    }
+  }
   const auto stop_pose =
     autoware::motion_utils::calcLongitudinalOffsetPose(path->points, ego_pos, s_stop);
   if (!stop_pose) return;

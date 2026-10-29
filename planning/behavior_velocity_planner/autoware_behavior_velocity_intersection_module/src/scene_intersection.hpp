@@ -443,6 +443,15 @@ private:
   std::map<std::string, std::deque<std::pair<double, double>>> nero_xh_vhist_;
   //! position history of slow vehicles, uuidKey() -> (objects stamp, x, y)
   std::map<std::string, std::deque<std::tuple<double, double, double>>> nero_xh_phist_;
+  //! NERO_IX_CROSSING_HOLD_YIELD (crosswait, 2026-10-29): objects stamp since which ego stands in the hold zone (< 0:
+  //! it moves / is out of the zone)
+  double nero_xh_ego_stand_since_{-1.0};
+  //! vehicles the slow-mover wait let ego go for (behind / stood), and those that moved toward ego's way again
+  std::set<std::string> nero_xh_letgo_, nero_xh_revoked_;
+  //! where a moving ego stops for a vehicle that no longer lets it go (latched while it stops)
+  std::optional<geometry_msgs::msg::Point> nero_xh_again_stop_;
+  //! ego is stopping / held for such a vehicle (the decision stands until the hold ends)
+  bool nero_xh_again_held_{false};
 
   //! turn_direction of this lane
   const std::string turn_direction_;
