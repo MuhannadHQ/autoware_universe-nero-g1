@@ -17,6 +17,8 @@
 #include "autoware/behavior_path_planner_common/utils/utils.hpp"
 #include "autoware/behavior_path_static_obstacle_avoidance_module/utils.hpp"
 
+#include "nero_proj.hpp"
+
 #include <magic_enum.hpp>
 
 #include <algorithm>
@@ -186,6 +188,9 @@ std::optional<std::pair<double, double>> nero_return_window(
   };
   std::vector<Pt> pts;
   size_t n_obj = 0;
+  // NERO_SOA_PROJ_FAST: the same projection without a path copy per sample (nero_proj.hpp)
+  std::optional<nero_proj::Proj<std::decay_t<decltype(points)>>> proj;
+  if (nero_proj::fast()) proj.emplace(points);
   const auto add = [&](const ObjectData & o) {
     const auto type = utils::getHighestProbLabel(o.object.classification);
     const auto & op = parameters->object_parameters.at(type);
@@ -209,12 +214,14 @@ std::optional<std::pair<double, double>> nero_return_window(
         geometry_msgs::msg::Point p;
         p.x = a.x() + (b.x() - a.x()) * k / n_step;
         p.y = a.y() + (b.y() - a.y()) * k / n_step;
-        const size_t seg = autoware::motion_utils::findNearestSegmentIndex(points, p);
+        const size_t seg =
+          proj ? proj->nearestSegment(p) : autoware::motion_utils::findNearestSegmentIndex(points, p);
         const double s = data.arclength_from_ego.at(seg) +
-                         autoware::motion_utils::calcLongitudinalOffsetToSegment(points, seg, p);
+                         (proj ? proj->lonToSegment(seg, p)
+                               : autoware::motion_utils::calcLongitudinalOffsetToSegment(points, seg, p));
         if (s < -rear - LON_MARGIN || s > limit + front) continue;
         pts.push_back(
-          {s, autoware::motion_utils::calcLateralOffset(points, p, seg),
+          {s, proj ? proj->lateral(p, seg) : autoware::motion_utils::calcLateralOffset(points, p, seg),
            half_w + op.lateral_hard_margin + LAT_EXTRA, half_w + (vehicle ? 0.1 : 0.3), id, n_obj});
       }
     }

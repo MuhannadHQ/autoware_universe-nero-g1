@@ -14,6 +14,8 @@
 
 #include "autoware/behavior_path_static_obstacle_avoidance_module/scene.hpp"
 
+#include "nero_proj.hpp"
+
 #include "autoware/behavior_path_planner_common/interface/scene_module_visitor.hpp"
 #include "autoware/behavior_path_planner_common/utils/drivable_area_expansion/static_drivable_area.hpp"
 #include "autoware/behavior_path_planner_common/utils/path_safety_checker/objects_filtering.hpp"
@@ -438,9 +440,10 @@ constexpr double STEP = 0.5;
 // the path's segment nearest to p, stepped off a degenerate one (two equal points: the offsets divide by its length;
 // sim c24 squeeze v16 gave a box 1.2e19 m ahead, v20 lost the kerb fragment 8866c2 that way)
 template <class T>
-size_t seg_of(const T & points, const geometry_msgs::msg::Point & p)
+size_t seg_of(const T & points, const geometry_msgs::msg::Point & p, const nero_proj::Proj<T> * proj = nullptr)
 {
-  const size_t i = autoware::motion_utils::findNearestSegmentIndex(points, p);
+  // NERO_SOA_PROJ_FAST: the same segment without a path copy (nero_proj.hpp)
+  const size_t i = proj ? proj->nearestSegment(p) : autoware::motion_utils::findNearestSegmentIndex(points, p);
   const auto ok = [&](const size_t k) {
     return k + 1 < points.size() && autoware_utils::calc_distance2d(points.at(k), points.at(k + 1)) >= 1.0e-3;
   };
@@ -2695,6 +2698,10 @@ std::optional<StaticObstacleAvoidanceModule::NeroCgwCar> StaticObstacleAvoidance
     return std::nullopt;
   }
   const double lane_left = left_room.value() + half_w;
+  // NERO_SOA_PROJ_FAST: the same projections without a path copy per call (nero_proj.hpp)
+  std::optional<nero_proj::Proj<std::decay_t<decltype(ref)>>> proj;
+  if (nero_proj::fast()) proj.emplace(ref);
+  const auto * pj = proj ? &proj.value() : nullptr;
   // an object's extent in the reference path's frame (corners projected on its centre's segment)
   struct Ext
   {
@@ -2706,8 +2713,9 @@ std::optional<StaticObstacleAvoidanceModule::NeroCgwCar> StaticObstacleAvoidance
     for (const auto & q : poly.outer()) {
       const auto p = autoware_utils::create_point(q.x(), q.y(), 0.0);
       const double s =
-        data.arclength_from_ego.at(seg) + autoware::motion_utils::calcLongitudinalOffsetToSegment(ref, seg, p);
-      const double l = autoware::motion_utils::calcLateralOffset(ref, p, seg);
+        data.arclength_from_ego.at(seg) +
+        (pj ? pj->lonToSegment(seg, p) : autoware::motion_utils::calcLongitudinalOffsetToSegment(ref, seg, p));
+      const double l = pj ? pj->lateral(p, seg) : autoware::motion_utils::calcLateralOffset(ref, p, seg);
       x.s_near = std::min(x.s_near, s);
       x.s_far = std::max(x.s_far, s);
       x.lo = std::min(x.lo, l);
@@ -2737,9 +2745,10 @@ std::optional<StaticObstacleAvoidanceModule::NeroCgwCar> StaticObstacleAvoidance
     char buf[8];
     std::snprintf(buf, sizeof(buf), "%02x%02x", o.object_id.uuid[0], o.object_id.uuid[1]);
     const std::string id(buf);
-    const size_t seg = nero_cgw::seg_of(ref, c);
+    const size_t seg = nero_cgw::seg_of(ref, c, pj);
     const double s_c =
-      data.arclength_from_ego.at(seg) + autoware::motion_utils::calcLongitudinalOffsetToSegment(ref, seg, c);
+      data.arclength_from_ego.at(seg) +
+      (pj ? pj->lonToSegment(seg, c) : autoware::motion_utils::calcLongitudinalOffsetToSegment(ref, seg, c));
     if (s_c < (beside ? -6.0 : 0.0)) continue;
     const double path_yaw = tf2::getYaw(ref.at(seg).point.pose.orientation);
     if (std::abs(autoware_utils::normalize_radian(yaw_obj - path_yaw)) <= 0.75 * M_PI) continue;
@@ -2790,7 +2799,7 @@ std::optional<StaticObstacleAvoidanceModule::NeroCgwCar> StaticObstacleAvoidance
         if (std::hypot(qt.x, qt.y) >= nero_cgw::STANDING_V) continue;
         const auto & qc = q.kinematics.initial_pose_with_covariance.pose.position;
         if (std::hypot(qc.x - getEgoPosition().x, qc.y - getEgoPosition().y) > x.s_near + 10.0) continue;
-        const auto qx = extent(q, nero_cgw::seg_of(ref, qc));
+        const auto qx = extent(q, nero_cgw::seg_of(ref, qc, pj));
         if (0.5 * (qx.lo + qx.hi) <= lane_left || qx.s_far < 0.0 || qx.s_near > x.s_near) continue;
         lo_pred = std::min(lo_pred, qx.lo - o.shape.dimensions.y - nero_cgw::SQUEEZE_M);
       }
@@ -3022,6 +3031,10 @@ bool StaticObstacleAvoidanceModule::neroCorridorGiveway(AvoidancePlanningData & 
   const double s_meet0 = car->v > 0.0 ? std::max(0.0, car->s_near * v_ego / std::max(v_ego + car->v, 0.1)) : 0.0;
   const double s_end = std::max(s_stop + vp.base_link2front + 6.0,
                                 car->v > 0.0 ? s_meet0 + vp.base_link2front + nero_cgw::PASS_LOOK_M : 0.0);
+  // NERO_SOA_PROJ_FAST: the same projections without a path copy per call (nero_proj.hpp)
+  std::optional<nero_proj::Proj<std::decay_t<decltype(ref)>>> proj;
+  if (nero_proj::fast()) proj.emplace(ref);
+  const auto * pj = proj ? &proj.value() : nullptr;
   for (const auto & o : planner_data_->dynamic_object->objects) {
     const auto & tw = o.kinematics.initial_twist_with_covariance.twist.linear;
     if (std::hypot(tw.x, tw.y) >= nero_cgw::STANDING_V) continue;
@@ -3030,13 +3043,14 @@ bool StaticObstacleAvoidanceModule::neroCorridorGiveway(AvoidancePlanningData & 
     if (car->id == buf) continue;
     const auto & c = o.kinematics.initial_pose_with_covariance.pose.position;
     if (std::hypot(c.x - getEgoPosition().x, c.y - getEgoPosition().y) > s_end + 10.0) continue;
-    const size_t seg = nero_cgw::seg_of(ref, c);
+    const size_t seg = nero_cgw::seg_of(ref, c, pj);
     const auto poly = autoware_utils::to_polygon2d(o.kinematics.initial_pose_with_covariance.pose, o.shape);
     Obj b{1e9, -1e9, 1e9, -1e9, 0.0};
     for (const auto & q : poly.outer()) {
       const auto p = autoware_utils::create_point(q.x(), q.y(), 0.0);
-      const double s = arc.at(seg) + autoware::motion_utils::calcLongitudinalOffsetToSegment(ref, seg, p);
-      const double l = autoware::motion_utils::calcLateralOffset(ref, p, seg);
+      const double s =
+        arc.at(seg) + (pj ? pj->lonToSegment(seg, p) : autoware::motion_utils::calcLongitudinalOffsetToSegment(ref, seg, p));
+      const double l = pj ? pj->lateral(p, seg) : autoware::motion_utils::calcLateralOffset(ref, p, seg);
       b.s0 = std::min(b.s0, s);
       b.s1 = std::max(b.s1, s);
       b.lo = std::min(b.lo, l);
@@ -3270,6 +3284,10 @@ void StaticObstacleAvoidanceModule::neroCgwRemember(const AvoidancePlanningData 
   const auto & arc = data.arclength_from_ego;
   if (ref.size() < 2 || arc.size() != ref.size() || !planner_data_->dynamic_object) return;
   const auto & vp = planner_data_->parameters;
+  // NERO_SOA_PROJ_FAST: the same projections without a path copy per call (nero_proj.hpp)
+  std::optional<nero_proj::Proj<std::decay_t<decltype(ref)>>> proj;
+  if (nero_proj::fast()) proj.emplace(ref);
+  const auto * pj = proj ? &proj.value() : nullptr;
   for (const auto & o : planner_data_->dynamic_object->objects) {
     const auto & tw = o.kinematics.initial_twist_with_covariance.twist.linear;
     if (std::hypot(tw.x, tw.y) >= nero_cgw::STANDING_V) continue;
@@ -3278,9 +3296,10 @@ void StaticObstacleAvoidanceModule::neroCgwRemember(const AvoidancePlanningData 
     if (nero_cgw_id_ == buf) continue;
     const auto & c = o.kinematics.initial_pose_with_covariance.pose.position;
     if (std::hypot(c.x - getEgoPosition().x, c.y - getEgoPosition().y) > nero_cgw::HORIZON) continue;
-    const size_t seg = nero_cgw::seg_of(ref, c);
-    const double lat_c = autoware::motion_utils::calcLateralOffset(ref, c, seg);
-    const double s_c = arc.at(seg) + autoware::motion_utils::calcLongitudinalOffsetToSegment(ref, seg, c);
+    const size_t seg = nero_cgw::seg_of(ref, c, pj);
+    const double lat_c = pj ? pj->lateral(c, seg) : autoware::motion_utils::calcLateralOffset(ref, c, seg);
+    const double s_c =
+      arc.at(seg) + (pj ? pj->lonToSegment(seg, c) : autoware::motion_utils::calcLongitudinalOffsetToSegment(ref, seg, c));
     if (lat_c >= 0.0 || s_c < -vp.base_link2rear) continue;
     NeroCgwSeen m;
     // the polygon held in a variable: a range-for over .outer() of the temporary read freed memory (the corners were
@@ -4198,16 +4217,21 @@ void StaticObstacleAvoidanceModule::neroPathFromEgo(
     ShiftedPath o = utils::static_obstacle_avoidance::toShiftedPath(sh.getReferencePath());
     if (op.size() >= 2 && sh.generate(&o, true, SHIFT_TYPE::SPLINE) && o.shift_length.size() == op.size()) {
       std::vector<double> v(ref.size(), std::numeric_limits<double>::quiet_NaN());
+      // NERO_SOA_PROJ_FAST: the same projections without a path copy per point (nero_proj.hpp)
+      std::optional<nero_proj::Proj<std::decay_t<decltype(op)>>> proj;
+      if (nero_proj::fast()) proj.emplace(op);
       for (size_t i = 0; i < ref.size(); ++i) {
         if (arc.at(i) < -nero_pfe::S_BACK - 1.0) continue;
         if (arc.at(i) > nero_pfe::S_FAR) break;
         const auto & p = ref.at(i).point.pose.position;
-        const size_t seg = autoware::motion_utils::findNearestSegmentIndex(op, p);
+        const size_t seg = proj ? proj->nearestSegment(p) : autoware::motion_utils::findNearestSegmentIndex(op, p);
         const double len = autoware_utils::calc_distance2d(op.at(seg), op.at(seg + 1));
         if (len < 1.0e-3) continue;
-        const double lon = autoware::motion_utils::calcLongitudinalOffsetToSegment(op, seg, p);
+        const double lon =
+          proj ? proj->lonToSegment(seg, p) : autoware::motion_utils::calcLongitudinalOffsetToSegment(op, seg, p);
         if ((seg == 0 && lon < -0.05) || (seg + 2 == op.size() && lon > len + 0.05)) continue;
-        if (std::abs(autoware::motion_utils::calcLateralOffset(op, p, seg)) > 0.3) continue;  // not the same line
+        const double lat_p = proj ? proj->lateral(p, seg) : autoware::motion_utils::calcLateralOffset(op, p, seg);
+        if (std::abs(lat_p) > 0.3) continue;  // not the same line
         const double r = std::clamp(lon / len, 0.0, 1.0);
         v.at(i) = o.shift_length.at(seg) + r * (o.shift_length.at(seg + 1) - o.shift_length.at(seg));
       }
