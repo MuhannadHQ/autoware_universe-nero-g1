@@ -38,9 +38,13 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <functional>
 #include <iomanip>
+#include <random>
 #include <thread>
+#include <utility>
 
 namespace autoware::ndt_scan_matcher
 {
@@ -1101,6 +1105,31 @@ std::tuple<geometry_msgs::msg::PoseWithCovarianceStamped, double> NDTScanMatcher
   };
   const std::vector<double> sample_stddev{stddev_x, stddev_y, stddev_z, stddev_roll, stddev_pitch};
 
+  // NERO_NDT_ALIGN_YAW_WINDOW=<max yaw variance rad2>,<half window deg> (unset = upstream: yaw over the whole
+  // circle): a request that carries a heading (yaw variance up to the first value; the AD API set-pose adaptor sends
+  // 1.0 rad2, a GNSS init 10 rad2) samples yaw within +-half window of it, and the best particle is taken among the
+  // results that stay inside the window.
+  static const std::pair<double, double> nero_yaw_window = []() {
+    const char * env = std::getenv("NERO_NDT_ALIGN_YAW_WINDOW");
+    double var = 0.0;
+    double deg = 0.0;
+    if (env && std::sscanf(env, "%lf,%lf", &var, &deg) == 2 && var > 0.0 && deg > 0.0) {
+      return std::make_pair(var, deg * M_PI / 180.0);
+    }
+    return std::make_pair(0.0, 0.0);
+  }();
+  static std::mt19937_64 nero_engine(0);
+  const bool nero_window = nero_yaw_window.second > 0.0 && covariance(5, 5) <= nero_yaw_window.first;
+  std::uniform_real_distribution<double> nero_yaw_dist(-nero_yaw_window.second, nero_yaw_window.second);
+  const auto nero_off_window = [&](const double yaw) {
+    return std::abs(std::remainder(yaw - base_rpy.z, 2.0 * M_PI)) > nero_yaw_window.second;
+  };
+  if (nero_window) {
+    RCLCPP_INFO(
+      get_logger(), "[NERO_NDT_ALIGN_YAW_WINDOW] yaw within +-%.0f deg of %.1f deg (request yaw variance %.2f)",
+      nero_yaw_window.second * 180.0 / M_PI, base_rpy.z * 180.0 / M_PI, covariance(5, 5));
+  }
+
   // Optimizing (x, y, z, roll, pitch, yaw) 6 dimensions.
   TreeStructuredParzenEstimator tpe(
     TreeStructuredParzenEstimator::Direction::MAXIMIZE,
@@ -1115,7 +1144,10 @@ std::tuple<geometry_msgs::msg::PoseWithCovarianceStamped, double> NDTScanMatcher
   const int64_t publish_interval = param_.initial_pose_estimation.particles_num / publish_num;
 
   for (int64_t i = 0; i < param_.initial_pose_estimation.particles_num; i++) {
-    const TreeStructuredParzenEstimator::Input input = tpe.get_next_input();
+    TreeStructuredParzenEstimator::Input input = tpe.get_next_input();
+    if (nero_window && nero_off_window(input[5])) {
+      input[5] = base_rpy.z + nero_yaw_dist(nero_engine);
+    }
 
     geometry_msgs::msg::Pose initial_pose;
     initial_pose.position.x = input[0];
@@ -1166,6 +1198,16 @@ std::tuple<geometry_msgs::msg::PoseWithCovarianceStamped, double> NDTScanMatcher
   auto best_particle_ptr = std::max_element(
     std::begin(particle_array), std::end(particle_array),
     [](const Particle & lhs, const Particle & rhs) { return lhs.score < rhs.score; });
+  if (nero_window) {
+    auto best_in_window = std::end(particle_array);
+    for (auto it = std::begin(particle_array); it != std::end(particle_array); ++it) {
+      if (nero_off_window(autoware::localization_util::get_rpy(it->result_pose).z)) continue;
+      if (best_in_window == std::end(particle_array) || best_in_window->score < it->score) {
+        best_in_window = it;
+      }
+    }
+    if (best_in_window != std::end(particle_array)) best_particle_ptr = best_in_window;
+  }
 
   geometry_msgs::msg::PoseWithCovarianceStamped result_pose_with_cov_msg;
   result_pose_with_cov_msg.header.stamp = initial_pose_with_cov.header.stamp;

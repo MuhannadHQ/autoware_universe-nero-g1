@@ -18,12 +18,19 @@
 #include "ekf_localization_trigger_module.hpp"
 #include "gnss_module.hpp"
 #include "localization_module.hpp"
+#include "nero_init_gate.hpp"
 #include "ndt_localization_trigger_module.hpp"
 #include "pose_error_check_module.hpp"
 #include "stop_check_module.hpp"
 
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <memory>
 #include <sstream>
+#include <thread>
 #include <vector>
 
 namespace autoware::pose_initializer
@@ -65,6 +72,38 @@ PoseInitializer::PoseInitializer(const rclcpp::NodeOptions & options)
     pose_error_check_ = std::make_unique<PoseErrorCheckModule>(this);
   }
   logger_configure_ = std::make_unique<autoware_utils::LoggerLevelConfigure>(this);
+
+  if (const char * env = std::getenv("NERO_POSE_INIT_GATE"); env && *env) {
+    double a = 0.0, b = 0.0, c = 0.0;
+    const int n = std::sscanf(env, "%lf,%lf,%lf", &a, &b, &c);
+    if (n >= 2 && a > 0.0 && b >= 0.0) {
+      nero_gate_.enabled = true;
+      nero_gate_.healthy_nvtl = a;
+      nero_gate_.margin = b;
+      if (n >= 3 && c > 0.0) nero_gate_.window_s = c;
+    }
+    RCLCPP_INFO(
+      get_logger(), "[NERO_POSE_INIT_GATE] %s (healthy NVTL %.2f, margin %.2f, score age <= %.1f s)",
+      nero_gate_.enabled ? "on" : "malformed, off", nero_gate_.healthy_nvtl, nero_gate_.margin,
+      nero_gate_.window_s);
+  }
+  if (nero_gate_.enabled) {
+    nero_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+    rclcpp::SubscriptionOptions opt;
+    opt.callback_group = nero_group_;
+    // the EKF's own output (what the robot uses as its pose) and NDT's public diagnostics
+    nero_sub_pose_ = create_subscription<PoseWithCovarianceStamped>(
+      "/localization/pose_with_covariance", rclcpp::QoS(1),
+      [this](const PoseWithCovarianceStamped::ConstSharedPtr msg) {
+        std::lock_guard<std::mutex> lock(nero_mutex_);
+        nero_last_pose_ = *msg;
+      },
+      opt);
+    nero_sub_diag_ = create_subscription<diagnostic_msgs::msg::DiagnosticArray>(
+      "/diagnostics", rclcpp::QoS(100),
+      [this](const diagnostic_msgs::msg::DiagnosticArray::ConstSharedPtr msg) { nero_on_diag(msg); },
+      opt);
+  }
 
   change_state(State::Message::UNINITIALIZED);
 
@@ -155,11 +194,19 @@ void PoseInitializer::on_initialize(
   }
   try {
     if (req->method == Initialize::Service::Request::AUTO) {
+      // NERO_POSE_INIT_GATE: the running localization before it is switched off for the align
+      const NeroSnapshot nero_before = nero_gate_.enabled ? nero_snapshot() : NeroSnapshot{};
       change_state(State::Message::INITIALIZING);
       change_node_trigger(false, false);
 
       auto pose =
         req->pose_with_covariance.empty() ? get_gnss_pose() : req->pose_with_covariance.front();
+      std::optional<double> nero_gnss_sigma;
+      if (nero_gate_.enabled && req->pose_with_covariance.empty() && gnss_) {
+        const auto raw = gnss_->get_pose();  // gnss_poser's own covariance (get_gnss_pose overwrites it)
+        nero_gnss_sigma = std::sqrt(std::max(raw.pose.covariance[0], raw.pose.covariance[7]));
+      }
+      const int64_t nero_align_called_ns = now().nanoseconds();
       bool reliable = true;
       if (ndt_) {
         std::tie(pose, reliable) = ndt_->align_pose(pose);
@@ -197,7 +244,53 @@ void PoseInitializer::on_initialize(
         diagnostics_pose_reliable_->update_level_and_message(
           diagnostic_msgs::msg::DiagnosticStatus::ERROR, message.str());
       }
+
+      // NERO_POSE_INIT_GATE: do not replace the localization with a pose NDT rates unreliable, nor a healthy
+      // localization with a pose that fits the lidar worse than it does
+      std::string nero_refusal;
+      if (nero_gate_.enabled && ndt_) {
+        NeroGateInput in;
+        in.reliable = reliable;
+        in.align_score = nero_wait_align_score(nero_align_called_ns);
+        in.has_previous = nero_before.initialized && nero_before.pose.has_value();
+        in.current_nvtl = nero_before.nvtl;
+        in.gnss_sigma = nero_gnss_sigma;
+        nero_refusal = nero_gate_refusal({nero_gate_.healthy_nvtl, nero_gate_.margin}, in);
+        const std::string score = in.align_score ? nero_fmt("%.2f", *in.align_score) : "unknown";
+        const std::string current = in.current_nvtl ? nero_fmt("%.2f", *in.current_nvtl) : "none";
+        diagnostics_pose_reliable_->add_key_value("nero_align_score", score);
+        diagnostics_pose_reliable_->add_key_value("nero_current_nvtl", current);
+        diagnostics_pose_reliable_->add_key_value(
+          "nero_init_gate", std::string(nero_refusal.empty() ? "accepted" : "refused"));
+        if (!nero_refusal.empty()) {
+          diagnostics_pose_reliable_->update_level_and_message(
+            diagnostic_msgs::msg::DiagnosticStatus::WARN, nero_refusal);
+        }
+        const auto & p = pose.pose.pose.position;
+        RCLCPP_WARN(
+          get_logger(), "[NERO_POSE_INIT_GATE] %s: align NDT %s at (%.2f, %.2f), current NDT %s (n %zu)%s%s",
+          nero_refusal.empty() ? "accepted" : "refused", score.c_str(), p.x, p.y, current.c_str(),
+          nero_before.nvtl_n, nero_refusal.empty() ? "" : ": ", nero_refusal.c_str());
+      }
+
       diagnostics_pose_reliable_->publish(this->now());
+
+      if (!nero_refusal.empty()) {
+        if (nero_before.initialized && nero_before.pose) {
+          // hand the running localization back to the EKF (a deactivation cleared its initial pose)
+          auto previous = *nero_before.pose;
+          previous.header.stamp = now();
+          pub_reset_->publish(previous);
+          change_node_trigger(true, false);
+          change_state(State::Message::INITIALIZED);
+        } else {
+          change_state(State::Message::UNINITIALIZED);  // nothing to keep: as a failed boot init
+        }
+        res->status.success = false;
+        res->status.code = Initialize::Service::Response::ERROR_ESTIMATION;
+        res->status.message = nero_refusal;
+        return;
+      }
 
       pose.pose.covariance = output_pose_covariance_;
       pub_reset_->publish(pose);
@@ -234,6 +327,70 @@ void PoseInitializer::on_initialize(
     res->status.message = respose_status.message;
     change_state(State::Message::UNINITIALIZED);
   }
+}
+
+void PoseInitializer::nero_on_diag(const diagnostic_msgs::msg::DiagnosticArray::ConstSharedPtr msg)
+{
+  for (const auto & st : msg->status) {
+    const bool scan = st.name == "ndt_scan_matcher: scan_matching_status";
+    const bool align = st.name == "ndt_scan_matcher: ndt_align_service_status";
+    if (!scan && !align) continue;
+    std::optional<double> nvtl;
+    std::optional<double> best;
+    std::optional<int64_t> called;
+    bool activated = true;
+    for (const auto & kv : st.values) {
+      try {
+        if (kv.key == "nearest_voxel_transformation_likelihood") nvtl = std::stod(kv.value);
+        if (kv.key == "best_particle_score") best = std::stod(kv.value);
+        if (kv.key == "service_call_time_stamp") called = std::stoll(kv.value);
+        if (kv.key == "is_activated") activated = (kv.value == "True");
+      } catch (const std::exception &) {
+      }
+    }
+    std::lock_guard<std::mutex> lock(nero_mutex_);
+    if (scan && nvtl && activated) {
+      nero_nvtl_.emplace_back(rclcpp::Time(msg->header.stamp, get_clock()->get_clock_type()), *nvtl);
+      while (nero_nvtl_.size() > 200) nero_nvtl_.pop_front();
+    }
+    if (align && best && called) nero_align_score_ = std::make_pair(*called, *best);
+  }
+}
+
+PoseInitializer::NeroSnapshot PoseInitializer::nero_snapshot()
+{
+  NeroSnapshot snap;
+  snap.initialized = state_.state == State::Message::INITIALIZED;
+  const auto t = now();
+  std::lock_guard<std::mutex> lock(nero_mutex_);
+  if (nero_last_pose_ && (t - rclcpp::Time(nero_last_pose_->header.stamp, t.get_clock_type())).seconds() < 1.0) {
+    snap.pose = nero_last_pose_;
+  }
+  // the last 10 tracking scores (1 s of scans), none older than window_s: NDT is off during an init, so an init
+  // right after another one still sees the scores from before that one
+  std::vector<double> v;
+  for (auto it = nero_nvtl_.rbegin(); it != nero_nvtl_.rend() && v.size() < 10; ++it) {
+    if ((t - it->first).seconds() <= nero_gate_.window_s) v.push_back(it->second);
+  }
+  snap.nvtl_n = v.size();
+  if (v.size() >= 3) {
+    std::nth_element(v.begin(), v.begin() + v.size() / 2, v.end());
+    snap.nvtl = v[v.size() / 2];
+  }
+  return snap;
+}
+
+std::optional<double> PoseInitializer::nero_wait_align_score(int64_t called_ns)
+{
+  // NDT publishes its align diagnostic before it answers; the two travel on different topics
+  for (int i = 0; i < 50; ++i) {
+    {
+      std::lock_guard<std::mutex> lock(nero_mutex_);
+      if (nero_align_score_ && nero_align_score_->first >= called_ns) return nero_align_score_->second;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  }
+  return std::nullopt;
 }
 
 geometry_msgs::msg::PoseWithCovarianceStamped PoseInitializer::get_gnss_pose()

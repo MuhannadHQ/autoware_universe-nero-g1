@@ -33,6 +33,7 @@ if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)
   ament_lint_auto_find_test_dependencies()
   add_testcase(test/test_copy_vector_to_array.cpp)
+  add_testcase(test/test_nero_init_gate.cpp)
 endif()
 
 ament_auto_package(

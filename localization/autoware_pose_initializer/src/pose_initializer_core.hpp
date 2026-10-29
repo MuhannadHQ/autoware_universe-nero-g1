@@ -21,9 +21,15 @@
 #include <autoware_utils/ros/logger_level_configure.hpp>
 #include <rclcpp/rclcpp.hpp>
 
+#include <diagnostic_msgs/msg/diagnostic_array.hpp>
 #include <geometry_msgs/msg/pose_with_covariance_stamped.hpp>
 
+#include <deque>
 #include <memory>
+#include <mutex>
+#include <optional>
+#include <string>
+#include <utility>
 
 namespace autoware::pose_initializer
 {
@@ -62,6 +68,35 @@ private:
   std::unique_ptr<autoware_utils::LoggerLevelConfigure> logger_configure_;
   std::unique_ptr<autoware_utils::DiagnosticsInterface> diagnostics_pose_reliable_;
   double stop_check_duration_;
+
+  // NERO_POSE_INIT_GATE=<healthy NVTL>,<margin>[,<max score age s>] (unset = upstream): an AUTO init whose NDT align is
+  // unreliable, or that fits the lidar worse than a healthy running localization, is refused and the running
+  // localization is handed back to the EKF unchanged.
+  struct NeroGate
+  {
+    bool enabled{false};
+    double healthy_nvtl{2.3};
+    double margin{0.1};
+    double window_s{10.0};  // the current score = median of the last 10 tracking scores no older than this
+  };
+  struct NeroSnapshot
+  {
+    bool initialized{false};
+    std::optional<PoseWithCovarianceStamped> pose;  // the EKF's pose just before the init
+    std::optional<double> nvtl;                      // median of the last 10 NDT tracking scores
+    size_t nvtl_n{0};
+  };
+  NeroGate nero_gate_;
+  rclcpp::CallbackGroup::SharedPtr nero_group_;
+  rclcpp::Subscription<PoseWithCovarianceStamped>::SharedPtr nero_sub_pose_;
+  rclcpp::Subscription<diagnostic_msgs::msg::DiagnosticArray>::SharedPtr nero_sub_diag_;
+  std::mutex nero_mutex_;
+  std::optional<PoseWithCovarianceStamped> nero_last_pose_;
+  std::deque<std::pair<rclcpp::Time, double>> nero_nvtl_;
+  std::optional<std::pair<int64_t, double>> nero_align_score_;  // (service call stamp ns, best particle NVTL)
+  void nero_on_diag(const diagnostic_msgs::msg::DiagnosticArray::ConstSharedPtr msg);
+  NeroSnapshot nero_snapshot();
+  std::optional<double> nero_wait_align_score(int64_t called_ns);
 
   void change_node_trigger(bool flag, bool need_spin = false);
   void set_user_defined_initial_pose(
