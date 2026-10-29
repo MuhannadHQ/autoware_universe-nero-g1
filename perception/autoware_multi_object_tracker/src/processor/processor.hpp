@@ -94,6 +94,44 @@ private:
     const types::DynamicObject & object, const rclcpp::Time & time) const;
 
   std::shared_ptr<autoware_utils::TimeKeeper> time_keeper_;
+
+  // NERO_MOT_REBIRTH=<min_count>,<margin m>,<max_dist m>,<max_pred_speed m/s> (tbx, 2026-10-28; unset = stock): a
+  // vehicle measurement that starts a new track on an UNKNOWN track's object (the UNKNOWN track's centre inside its
+  // box + margin, standing or slower than max_pred_speed) continues that object: its motion starts from the UNKNOWN
+  // track's velocity, the object's measurements of both classes count for confident_count_threshold (with at least
+  // <min_count> vehicle measurements), and when published it takes the UNKNOWN track's uuid (the UNKNOWN track takes
+  // the vehicle track's unpublished one). The UNKNOWN track stays (updated by the object's clusters) while the vehicle
+  // track lives: hidden where the stock overlap rule would have removed it and until it has had as many measurements
+  // since as a stock track needs to be published again (confident_count_threshold), a separate object otherwise; it takes the object's uuid back if the vehicle track dies (never a gap, no uuid churn). The link ends
+  // when the UNKNOWN track's centre leaves the vehicle box (+ margin): two objects from then on (before the hand-over
+  // the vehicle track goes on as a stock one)
+  struct NeroRebirth
+  {
+    bool enabled{false};
+    int min_count{2};
+    double margin{0.5};
+    double max_dist{3.0};
+    double max_pred_speed{1.0};
+  };
+  NeroRebirth nero_rebirth_;
+  std::shared_ptr<Tracker> neroFindPredecessor(
+    const types::DynamicObject & measurement, const types::InputChannel & channel,
+    const rclcpp::Time & time, types::DynamicObject & seeded_measurement) const;
+  bool neroCovers(const types::DynamicObject & vehicle, const types::DynamicObject & unknown) const;
+  bool neroStockRemoves(
+    const std::shared_ptr<Tracker> & vehicle, const std::shared_ptr<Tracker> & unknown,
+    const rclcpp::Time & time) const;
+  void neroHandOver(const rclcpp::Time & time);
+  bool neroHidden(const std::shared_ptr<Tracker> & tracker, const rclcpp::Time & time) const;
+
+  // NERO_MOT_DUP_FRESH=<fresh s> (tbx, 2026-10-28; unset = stock; upstream's freshness tier, autoware_universe #12996 /
+  // merger/survival_ranking.cpp, full_measure_stale_threshold 0.35 s): removeOverlappedTracker deletes a vehicle track
+  // overlapping a prioritized vehicle track (IoU > min_known_object_removal_iou) also when the prioritized one is
+  // confident and had a FULL measurement (a channel that trusts the box extent: not detection_by_tracker, which only
+  // re-measures the track's own shape) within <fresh> s, not only when its last measurement is the newer one. With two input
+  // channels a duplicate born from the other channel's detection otherwise survives every prune, gets published with
+  // the speed of its first boxes' motion and nearer the path (10-26e #59: 279a07 on the parked 41db95, -2.82)
+  double nero_dup_fresh_{0.0};
 };
 
 }  // namespace autoware::multi_object_tracker

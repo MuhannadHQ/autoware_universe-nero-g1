@@ -32,6 +32,7 @@
 #include <geometry_msgs/msg/point.hpp>
 #include <unique_identifier_msgs/msg/uuid.hpp>
 
+#include <memory>
 #include <vector>
 
 namespace autoware::multi_object_tracker
@@ -76,6 +77,26 @@ public:
   double getElapsedTimeFromLastUpdate(const rclcpp::Time & current_time) const
   {
     return (current_time - last_update_with_measurement_time_).seconds();
+  }
+
+  // NERO_MOT_REBIRTH (tbx): a vehicle track born on a confident UNKNOWN track's standing object continues that object
+  const unique_identifier_msgs::msg::UUID & getUUID() const { return object_.uuid; }
+  void setUUID(const unique_identifier_msgs::msg::UUID & uuid) { object_.uuid = uuid; }
+  std::weak_ptr<Tracker> nero_predecessor;
+  unique_identifier_msgs::msg::UUID nero_predecessor_uuid;
+  int nero_predecessor_count{0};  // the predecessor's measurement count (last seen alive)
+  bool nero_is_successor{false};
+  bool nero_handed_over{false};
+  std::weak_ptr<Tracker> nero_successor;  // set on the UNKNOWN track while a live vehicle track continues it
+  bool nero_handed_over_to{false};       // the UNKNOWN track's object was published by its successor
+  unique_identifier_msgs::msg::UUID nero_own_uuid;  // the object's uuid, taken back if the successor dies
+  int nero_removed_at_count{-1};  // its measurement count when the stock overlap rule last would have removed it
+  // NERO_MOT_DUP_FRESH (tbx): the last update by a channel that trusts the box extent (upstream's "full measurement";
+  // detection_by_tracker, can_trust_extension false, only re-measures the track's own shape)
+  rclcpp::Time nero_last_full_update_time;
+  double neroElapsedFromFullUpdate(const rclcpp::Time & current_time) const
+  {
+    return (current_time - nero_last_full_update_time).seconds();
   }
 
 protected:

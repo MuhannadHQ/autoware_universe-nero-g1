@@ -85,6 +85,24 @@ bool nero_same_side_harmless()
   return on;
 }
 
+// NERO_SOA_DECEL_SOFT=1 (2026-10-28, tbx, QUEUE TBX case 4: 10-27 20:48:18): with policy.deceleration "reliable" a
+// target whose full margin does not fit under the lateral jerk limit any more (a parked car's box published late,
+// 12 m ahead at 15 km/h) is NEED_DECELERATION and gets a stop that ignores the decel limits (field -4.18), even when
+// only the soft margin is short. With the switch such a target goes through the best-effort shift (policy.lateral_
+// margin "best_effort" is the car's): it is passed with the shift that fits when that keeps the hard margin, or
+// without a shift when the robot's line already keeps it; the reliable stop stays whenever the hard margin would not
+// be kept.
+bool nero_decel_soft()
+{
+  static const bool on = [] {
+    const char * v = std::getenv("NERO_SOA_DECEL_SOFT");
+    const bool r = v && std::atoi(v) > 0;
+    std::fprintf(stderr, "[NERO_SOA] decel_soft=%d\n", r);
+    return r;
+  }();
+  return on;
+}
+
 // NERO_SOA_RETURN_NO_NEED=1 (2026-10-26, QUEUE OLS, capture 10-25 #6): addReturnShiftLine adds no return while any
 // target ahead is not avoidable, and a target that needs no shift at all (SAME_DIRECTION_SHIFT: every kerb UNKNOWN,
 // bin or car parked off the lane is a target, the UNKNOWN filter has no "enough lateral distance" check) is never
@@ -460,6 +478,15 @@ AvoidOutlines ShiftLineGenerator::generateAvoidOutline(
 
     constexpr double LON_DIST_BUFFER = 1e-3;
 
+    // NERO_SOA_DECEL_SOFT: under the reliable policy the best-effort shift below is tried before a stop
+    const bool nero_soft = !isBestEffort(parameters_->policy_deceleration) && nero_decel_soft();
+    const auto nero_hard_margin = object.is_parked
+                                    ? object_parameter.lateral_hard_margin_for_parked_vehicle
+                                    : object_parameter.lateral_hard_margin;
+    const auto nero_line_keeps_hard_margin =
+      std::abs(current_ego_shift - object.overhang_points.front().first) >=
+      0.5 * data_->parameters.vehicle_width + nero_hard_margin + 1e-3;
+
     // avoidance distance is not enough. unavoidable.
     if (!isBestEffort(parameters_->policy_deceleration)) {
       if (avoidance_distance < helper_->getMinAvoidanceDistance(avoiding_shift) + LON_DIST_BUFFER) {
@@ -470,7 +497,7 @@ AvoidOutlines ShiftLineGenerator::generateAvoidOutline(
         }
         object.info = ObjectInfo::INSUFFICIENT_LONGITUDINAL_DISTANCE;
         return std::nullopt;
-      } else {
+      } else if (!nero_soft) {
         object.info = ObjectInfo::NEED_DECELERATION;
         return std::nullopt;
       }
@@ -481,7 +508,9 @@ AvoidOutlines ShiftLineGenerator::generateAvoidOutline(
       avoidance_distance, helper_->getLateralMaxJerkLimit(), helper_->getAvoidanceEgoSpeed());
 
     if (std::abs(feasible_relative_shift_length) < parameters_->lateral_execution_threshold) {
-      object.info = ObjectInfo::LESS_THAN_EXECUTION_THRESHOLD;
+      // NERO_SOA_DECEL_SOFT: no shift fits; pass only if the robot's line keeps the hard margin, else stop as today
+      object.info = nero_soft && !nero_line_keeps_hard_margin ? ObjectInfo::NEED_DECELERATION
+                                                              : ObjectInfo::LESS_THAN_EXECUTION_THRESHOLD;
       return std::nullopt;
     }
 
@@ -496,7 +525,10 @@ AvoidOutlines ShiftLineGenerator::generateAvoidOutline(
         object.info = ObjectInfo::CLOSE_DISTANCE_AVOIDANCE;
         return std::make_pair(desire_shift_length, object.longitudinal);
       }
-      object.info = ObjectInfo::INSUFFICIENT_LONGITUDINAL_DISTANCE;
+      // NERO_SOA_DECEL_SOFT: as above
+      object.info = nero_soft && !nero_line_keeps_hard_margin
+                      ? ObjectInfo::NEED_DECELERATION
+                      : ObjectInfo::INSUFFICIENT_LONGITUDINAL_DISTANCE;
       return std::nullopt;
     }
 

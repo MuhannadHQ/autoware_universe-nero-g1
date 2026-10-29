@@ -47,6 +47,7 @@ Tracker::Tracker(const rclcpp::Time & time, const types::DynamicObject & detecte
   total_no_measurement_count_(0),
   total_measurement_count_(1),
   last_update_with_measurement_time_(time),
+  nero_last_full_update_time(time),
   object_(detected_object)
 {
   // Generate random number
@@ -113,6 +114,7 @@ bool Tracker::updateWithMeasurement(
   }
 
   last_update_with_measurement_time_ = measurement_time;
+  if (channel_info.trust_extension) nero_last_full_update_time = measurement_time;
 
   // Update classification
   if (
