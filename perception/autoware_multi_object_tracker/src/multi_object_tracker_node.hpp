@@ -86,6 +86,17 @@ private:
   std::string world_frame_id_;  // tracking frame
   std::unique_ptr<TrackerProcessor> processor_;
 
+  // NERO flatos (NERO_MOT_SPAWN_PRUNE=1; unset = upstream): the overlap check also right after spawning, at the
+  // measurement time. Today a new track is first checked at publish time, when moving tracks have been predicted ahead
+  // (delay compensation) and a track just born at 0 m/s from a moving car's rear no longer overlaps the car.
+  bool nero_spawn_prune_{false};
+  struct NeroSpawnPruneLog
+  {
+    double t_last{0.0};
+    int n_unknown{0};
+    std::string last;
+  } nero_spawn_prune_log_{};
+
   // input manager
   std::unique_ptr<InputManager> input_manager_;
   std::shared_ptr<Odometry> odometry_;

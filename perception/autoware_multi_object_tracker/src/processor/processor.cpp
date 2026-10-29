@@ -396,6 +396,45 @@ void TrackerProcessor::removeOldTracker(const rclcpp::Time & time)
   }
 }
 
+// NERO flatos (NERO_MOT_SPAWN_PRUNE): removes the UNKNOWN trackers just spawned from a measurement whose centre lies
+// inside a live moving vehicle track's box at that measurement's time (a piece of that vehicle)
+std::vector<std::shared_ptr<Tracker>> TrackerProcessor::removeSpawnedUnknownOverlapped(
+  const rclcpp::Time & time, const std::vector<std::shared_ptr<Tracker>> & spawned, const double max_age,
+  const double min_vehicle_speed)
+{
+  std::vector<std::shared_ptr<Tracker>> removed;
+  for (const auto & candidate : spawned) {
+    if (candidate->getHighestProbLabel() != Label::UNKNOWN) continue;  // new vehicles etc.: today's handling
+    types::DynamicObject object2;
+    if (!candidate->getTrackedObject(time, object2)) continue;
+    for (const auto & other : list_tracker_) {
+      if (std::find(spawned.begin(), spawned.end(), other) != spawned.end()) continue;
+      // a live vehicle track only (measured within max_age), not one coasting on its prediction
+      if (!autoware::object_recognition_utils::isCarLikeVehicle(other->getHighestProbLabel())) continue;
+      if (other->getElapsedTimeFromLastUpdate(time) > max_age) continue;
+      types::DynamicObject object1;
+      if (!other->getTrackedObject(time, object1)) continue;
+      if (object1.shape.type != autoware_perception_msgs::msg::Shape::BOUNDING_BOX) continue;
+      // a MOVING vehicle only: for a standing one the publish-time check sees the same geometry (no timing gap)
+      if (std::hypot(object1.twist.linear.x, object1.twist.linear.y) < min_vehicle_speed) continue;
+      // the new UNKNOWN's centre inside the vehicle's box at the same time = a piece of that vehicle (its rear band
+      // under the crop ceiling, left outside the car track because UNKNOWN measurements never update a vehicle track
+      // and prune()'s centre-distance gate (1 m) never reaches a vehicle's ends)
+      const double yaw = tf2::getYaw(object1.pose.orientation);
+      const double dx = object2.pose.position.x - object1.pose.position.x;
+      const double dy = object2.pose.position.y - object1.pose.position.y;
+      if (
+        std::abs(dx * std::cos(yaw) + dy * std::sin(yaw)) <= 0.5 * object1.shape.dimensions.x &&
+        std::abs(-dx * std::sin(yaw) + dy * std::cos(yaw)) <= 0.5 * object1.shape.dimensions.y) {
+        removed.push_back(candidate);
+        break;
+      }
+    }
+  }
+  for (const auto & tracker : removed) list_tracker_.remove(tracker);
+  return removed;
+}
+
 // This function removes overlapped trackers based on distance and IoU criteria
 void TrackerProcessor::removeOverlappedTracker(const rclcpp::Time & time)
 {

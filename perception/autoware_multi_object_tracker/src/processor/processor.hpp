@@ -21,10 +21,13 @@
 
 #include <autoware_utils/system/time_keeper.hpp>
 #include <rclcpp/rclcpp.hpp>
+#include <tf2/utils.h>
 
 #include "autoware_perception_msgs/msg/detected_objects.hpp"
 #include "autoware_perception_msgs/msg/tracked_objects.hpp"
 
+#include <algorithm>
+#include <cmath>
 #include <list>
 #include <map>
 #include <memory>
@@ -67,6 +70,12 @@ public:
     const types::DynamicObjectList & detected_objects,
     const std::unordered_map<int, int> & reverse_assignment);
   void prune(const rclcpp::Time & time);
+  // NERO flatos (NERO_MOT_SPAWN_PRUNE): an UNKNOWN tracker just spawned from a measurement whose centre lies inside a
+  // live (measured within max_age) MOVING (>= min_vehicle_speed) vehicle track's box at that measurement's time is a
+  // piece of that vehicle and is removed. Returns the removed trackers.
+  std::vector<std::shared_ptr<Tracker>> removeSpawnedUnknownOverlapped(
+    const rclcpp::Time & time, const std::vector<std::shared_ptr<Tracker>> & spawned, const double max_age,
+    const double min_vehicle_speed);
 
   // output
   bool isConfidentTracker(const std::shared_ptr<Tracker> & tracker) const;

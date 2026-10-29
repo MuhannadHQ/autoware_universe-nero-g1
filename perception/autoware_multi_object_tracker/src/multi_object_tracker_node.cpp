@@ -31,6 +31,8 @@
 #include <tf2_ros/create_timer_interface.h>
 #include <tf2_ros/create_timer_ros.h>
 
+#include <cstdio>
+#include <cstdlib>
 #include <iterator>
 #include <list>
 #include <map>
@@ -64,6 +66,13 @@ MultiObjectTracker::MultiObjectTracker(const rclcpp::NodeOptions & node_options)
   bool enable_delay_compensation{declare_parameter<bool>("enable_delay_compensation")};
   bool enable_odometry_uncertainty = declare_parameter<bool>("consider_odometry_uncertainty");
   bool use_time_keeper = declare_parameter<bool>("publish_processing_time_detail");
+  if (const char * env = std::getenv("NERO_MOT_SPAWN_PRUNE"); env != nullptr && std::atoi(env) == 1) {
+    nero_spawn_prune_ = true;
+    RCLCPP_INFO(
+      this->get_logger(),
+      "[NERO_MOT_SPAWN_PRUNE] on: a new UNKNOWN track inside a moving vehicle's box at its measurement "
+      "time is removed");
+  }
 
   declare_parameter("selected_input_channels", std::vector<std::string>());
   std::vector<std::string> selected_input_channels =
@@ -334,7 +343,46 @@ void MultiObjectTracker::runProcess(const types::DynamicObjectList & detected_ob
   processor_->prune(measurement_time);
 
   /* spawn new tracker */
+  if (!nero_spawn_prune_) {
+    processor_->spawn(detected_objects, reverse_assignment);
+    return;
+  }
+  // NERO flatos: judge the new UNKNOWN trackers against the others at the measurement time
+  const size_t n_before = processor_->getListTracker().size();
   processor_->spawn(detected_objects, reverse_assignment);
+  std::vector<std::shared_ptr<Tracker>> spawned;
+  {
+    auto itr = processor_->getListTracker().begin();
+    std::advance(itr, n_before);
+    for (; itr != processor_->getListTracker().end(); ++itr) spawned.push_back(*itr);
+  }
+  if (spawned.empty()) return;
+  constexpr double nero_max_age = 0.3;    // [s] the vehicle track measured within this (live, not coasting)
+  constexpr double nero_min_speed = 2.0;  // [m/s] a moving vehicle (a standing one has no timing gap)
+  for (const auto & tracker :
+       processor_->removeSpawnedUnknownOverlapped(measurement_time, spawned, nero_max_age, nero_min_speed)) {
+    types::DynamicObject object;
+    ++nero_spawn_prune_log_.n_unknown;
+    if (tracker->getTrackedObject(measurement_time, object)) {
+      char buf[160];
+      std::snprintf(
+        buf, sizeof(buf), "h %.2f m at (%.1f, %.1f)", object.shape.dimensions.z, object.pose.position.x,
+        object.pose.position.y);
+      nero_spawn_prune_log_.last = buf;
+    }
+  }
+  const double now_s = measurement_time.seconds();
+  if (
+    now_s - nero_spawn_prune_log_.t_last >= 1.0 &&
+    nero_spawn_prune_log_.n_unknown > 0) {
+    RCLCPP_INFO(
+      this->get_logger(),
+      "[NERO_MOT_SPAWN_PRUNE] new UNKNOWN tracks inside a moving vehicle's box at their measurement time (pieces of "
+      "that vehicle), removed since the last line: %d; last: %s",
+      nero_spawn_prune_log_.n_unknown, nero_spawn_prune_log_.last.c_str());
+    nero_spawn_prune_log_ = NeroSpawnPruneLog{};
+    nero_spawn_prune_log_.t_last = now_s;
+  }
 }
 
 void MultiObjectTracker::checkAndPublish(const rclcpp::Time & time)
