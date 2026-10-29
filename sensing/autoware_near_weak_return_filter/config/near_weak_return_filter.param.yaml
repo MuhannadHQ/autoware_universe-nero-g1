@@ -1,0 +1,8 @@
+/**:
+  ros__parameters:
+    # A point is dropped only if ALL of these hold (anything else passes untouched):
+    max_distance: 1.5           # [m] its own `distance` field (range from the sensor) is below this
+    max_intensity: 3            # [-] its intensity is at most this
+    neighbor_radius_ratio: 0.07  # [-] neighbours are counted within this x its range (~6 E1R pixels, 3D)
+    max_neighbors: 10           # [-] it has at most this many other returns within that radius (not a surface)
+    publish_removed: false      # publish the dropped points on ~/debug/removed/pointcloud
