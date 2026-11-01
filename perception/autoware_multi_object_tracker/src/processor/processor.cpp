@@ -279,8 +279,11 @@ std::shared_ptr<Tracker> TrackerProcessor::neroFindPredecessor(
     if (!candidate->getTrackedObject(time, object)) continue;
     if (
       std::hypot(object.twist.linear.x, object.twist.linear.y) > nero_rebirth_.max_pred_speed &&
-      !(UnknownTracker::neroMoverEnabled() && neroMoverAlong(candidate, time, myaw))) {
-      continue;  // a moving UNKNOWN keeps today's handling (NERO_MOT_UNKNOWN_MOVER: unless a mover along the box)
+      !(UnknownTracker::neroMoverEnabled() && neroMoverAlong(candidate, time, myaw)) &&
+      !(UnknownTracker::neroCrossEnabled() && neroMoverMadeAlong(candidate, object, time, myaw))) {
+      // a moving UNKNOWN keeps today's handling (NERO_MOT_UNKNOWN_MOVER: unless a mover along the box; crossmover c3:
+      // or one the mover rule made fast along it)
+      continue;
     }
     // the UNKNOWN track's centre inside the vehicle box (+ margin): the same object
     if (!neroCovers(measurement, object)) continue;
@@ -302,8 +305,20 @@ std::shared_ptr<Tracker> TrackerProcessor::neroFindPredecessor(
   if (UnknownTracker::neroMoverEnabled() && std::hypot(vx, vy) > nero_rebirth_.max_pred_speed) {
     const auto unknown = std::dynamic_pointer_cast<UnknownTracker>(best);
     if (unknown) {
-      unknown->neroMoverLine(vx, vy);
-      mover = true;
+      // crossmover c3: a crossing mover's line counts from the first of its consecutive start tests (as long as an
+      // oncoming mover's from its start: neroMoverAlong's 0.15 s)
+      if (
+        !UnknownTracker::neroCrossEnabled() || neroMoverAlong(best, time, myaw) ||
+        unknown->neroCrossHeld(time) >= 0.15) {
+        unknown->neroMoverLine(vx, vy);
+        mover = true;
+      } else {
+        // crossmover c3: a crossing mover too young for the hand-over, or one whose line just ended (it may have
+        // stopped): the vehicle track starts exactly as the stock rule starts it (from its own box); only the object's
+        // uuid and its publication until that track is confident come from the UNKNOWN
+        seeded_measurement = measurement;
+        return best;
+      }
     }
   }
   seeded_measurement = measurement;
@@ -321,6 +336,28 @@ std::shared_ptr<Tracker> TrackerProcessor::neroFindPredecessor(
     mover ? 4.0 : 0.25, best_object.twist_covariance[XYZRPY_COV_IDX::X_X] +
                           best_object.twist_covariance[XYZRPY_COV_IDX::Y_Y]);
   return best;
+}
+
+bool TrackerProcessor::neroMoverMadeFast(
+  const std::shared_ptr<Tracker> & tracker, const types::DynamicObject & object, const rclcpp::Time & time) const
+{
+  if (std::hypot(object.twist.linear.x, object.twist.linear.y) <= nero_rebirth_.max_pred_speed) return false;
+  const auto unknown = std::dynamic_pointer_cast<UnknownTracker>(tracker);
+  return unknown && unknown->neroMoverRecent(time);
+}
+
+bool TrackerProcessor::neroMoverMadeAlong(
+  const std::shared_ptr<Tracker> & tracker, const types::DynamicObject & object, const rclcpp::Time & time,
+  const double box_yaw) const
+{
+  if (!neroMoverMadeFast(tracker, object, time)) return false;
+  // the published motion (map frame) within 30 deg of the box's axis, either way (as neroMoverAlong)
+  const double uyaw = tf2::getYaw(object.pose.orientation);
+  const double vx = std::cos(uyaw) * object.twist.linear.x - std::sin(uyaw) * object.twist.linear.y;
+  const double vy = std::sin(uyaw) * object.twist.linear.x + std::cos(uyaw) * object.twist.linear.y;
+  constexpr double max_angle = 30.0 * M_PI / 180.0;
+  const double angle = std::abs(autoware_utils::normalize_radian(std::atan2(vy, vx) - box_yaw));
+  return angle <= max_angle || angle >= M_PI - max_angle;
 }
 
 bool TrackerProcessor::neroMoverLink(
@@ -455,9 +492,25 @@ void TrackerProcessor::neroHandOver(const rclcpp::Time & time)
     if (predecessor) {
       types::DynamicObject vehicle;
       types::DynamicObject unknown;
-      if (
-        tracker->getTrackedObject(time, vehicle) && predecessor->getTrackedObject(time, unknown) &&
-        !neroCovers(vehicle, unknown)) {
+      const bool unknown_ok =
+        tracker->getTrackedObject(time, vehicle) && predecessor->getTrackedObject(time, unknown);
+      bool covered = unknown_ok && neroCovers(vehicle, unknown);
+      // crossmover c3: an UNKNOWN that turned into a crossing mover after its vehicle successor took it over runs ahead
+      // of the successor's slower start on its line's velocity: the link also holds while the cluster MEASURED last is
+      // inside the vehicle box (10-27 20:32:58.8: a 6.6 m/s crosser left its truck box unpublished). c3e: ALSO, not
+      // instead: a crossing mover's last cluster stays behind while its vehicle box moves on (20:32:27.7 / 23.9: the
+      // link broke before the vehicle's 2nd box and the crosser was never published as a vehicle)
+      if (unknown_ok && !covered && UnknownTracker::neroCrossEnabled()) {
+        const auto u = std::dynamic_pointer_cast<UnknownTracker>(predecessor);
+        double mx = 0.0;
+        double my = 0.0;
+        if (u && u->neroMoverRecent(time) && u->neroLastMeasured(mx, my)) {
+          unknown.pose.position.x = mx;
+          unknown.pose.position.y = my;
+          covered = neroCovers(vehicle, unknown);
+        }
+      }
+      if (unknown_ok && !covered) {
         // the vehicle track left the UNKNOWN track's object: two objects from now on
         predecessor->nero_successor.reset();
         predecessor->nero_handed_over_to = false;
@@ -623,6 +676,16 @@ void TrackerProcessor::removeOverlappedTracker(const rclcpp::Time & time)
           /* erase only when prioritized one has a measurement */
           delete_candidate_tracker = true;
         }
+      }
+
+      // crossmover c3: a published UNKNOWN the mover rule made fast stays while the vehicle track over it is not
+      // published yet (the stock rule removes it once that track is confident)
+      if (
+        delete_candidate_tracker && label2 == Label::UNKNOWN && label1 != Label::UNKNOWN &&
+        UnknownTracker::neroCrossEnabled() && !isConfidentTracker(sorted_list_tracker[i]) &&
+        isConfidentTracker(sorted_list_tracker[j]) &&
+        neroMoverMadeFast(sorted_list_tracker[j], object2, time)) {
+        delete_candidate_tracker = false;
       }
 
       if (delete_candidate_tracker) {

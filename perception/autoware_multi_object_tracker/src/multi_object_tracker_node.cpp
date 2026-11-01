@@ -324,6 +324,14 @@ void MultiObjectTracker::runProcess(const types::DynamicObjectList & detected_ob
   const rclcpp::Time measurement_time =
     rclcpp::Time(detected_objects.header.stamp, this->now().get_clock_type());
 
+  // crossmover: the robot's position at this measurement time, for the crossing mover's log line only (the transform
+  // is the one the input manager already cached for these detections)
+  if (UnknownTracker::neroCrossEnabled()) {
+    if (const auto ego = odometry_->getTransform(measurement_time)) {
+      UnknownTracker::neroSetEgo(ego->translation.x, ego->translation.y);
+    }
+  }
+
   /* predict trackers to the measurement time */
   processor_->predict(measurement_time);
 

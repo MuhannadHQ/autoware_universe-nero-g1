@@ -96,6 +96,12 @@ private:
   double nero_mover_start_{-1.0};  // [s] when the current mover's line first passed
   double nero_birth_t_{-1.0};      // [s] the track's first measurement
   bool nero_inherited_{false};     // its points went to a newer track
+  double nero_mover_floor_{0.0};   // [m/s] the speed floor of the current mover's kind (crossmover: oncoming or crossing)
+  int nero_cross_passes_{0};      // crossmover: consecutive measurement times whose start test passed
+  double nero_cross_t_{-1.0};      // ... the last of them (-1: the last test failed)
+  double nero_cross_first_t_{-1.0};  // crossmover c3: ... the first of them
+  double nero_mover_since_{-1.0};    // crossmover c3: the first passing test of the run that started the current mover
+  bool nero_mover_cross_{false};     // crossmover c3: the mover's last passing line was a crossing one
   void neroMoverStarts(const double t, const double vx, const double vy, const rclcpp::Time & time);
   void neroInitWithVelocity(
     const rclcpp::Time & time, const types::DynamicObject & object, const double vx, const double vy,
@@ -115,6 +121,9 @@ public:
     double v_near{0.0};  // speed along the line of the outline's rear-most and front-most points
     double v_far{0.0};
     double area{0.0};     // median footprint area of the measurements
+    bool crossing{false};  // crossmover: the line runs across the robot's heading (not against it)
+    double lead_step{0.0};  // crossmover: the leading end's largest single step / its travel over the window
+    double last_step{0.0};  // crossmover: the leading end's newest step as a speed / the line speed
     bool ok{false};       // starts a mover: the centres on the line, travel, both outline ends moving with it
     bool ok_cont{false};  // keeps one: the centres on the line and the leading end moving with it (a car seen closer
                           // shows more of its side: its trailing end lags)
@@ -124,6 +133,7 @@ public:
   NeroLine nero_last_line_;  // research logs only
 
 private:
+  int neroCrossPasses(const double t, const NeroLine & line);  // crossmover
 
 public:
   struct Options
@@ -151,6 +161,10 @@ public:
 
   // NERO_MOT_UNKNOWN_MOVER
   static bool neroMoverEnabled();
+  // crossmover: crossing movers on (NERO_MOT_UNKNOWN_MOVER's 7th / 8th fields) and the robot's position at the current
+  // measurement time (for the crossing mover's log line only)
+  static bool neroCrossEnabled();
+  static void neroSetEgo(const double x, const double y);
   // a mover at <time> (its measured positions showed one within the hold): its velocity (map frame)
   bool neroMover(const rclcpp::Time & time, double & vx, double & vy) const;
   // the velocity of its last straight line (map frame)
@@ -163,6 +177,19 @@ public:
   bool neroMoverContinues(const rclcpp::Time & time, const types::DynamicObject & measurement) const;
   // how long the mover at <time> has held its line [s] (< 0: no mover)
   double neroMoverAge(const rclcpp::Time & time) const;
+  // crossmover c3: its measured positions passed a CROSSING mover's line within the mover hold before <time> (a mover
+  // now, or one whose line just ended): the speed it is published with comes from that line, not from the stock filter
+  bool neroMoverRecent(const rclcpp::Time & time) const;
+  // crossmover c3: a crossing mover at <time>: how long its line has passed, from the first passing start test of the
+  // run that started it (its <cross_tests> consecutive passes count) [s] (< 0: none)
+  double neroCrossHeld(const rclcpp::Time & time) const;
+  // crossmover c3: where it was last measured (false: never)
+  bool neroLastMeasured(double & x, double & y) const
+  {
+    x = last_meas_x_;
+    y = last_meas_y_;
+    return has_meas_;
+  }
   // a young track (born within kNeroInheritAge) the gates lost: the number of its measured positions that a new
   // track born from <newborn> at <time> continues on a straight line against the robot's heading (0: none)
   int neroInheritable(const rclcpp::Time & time, const UnknownTracker & newborn) const;

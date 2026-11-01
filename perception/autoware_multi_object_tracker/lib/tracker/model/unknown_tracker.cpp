@@ -58,17 +58,44 @@ struct NeroMover
   int n_min{4};
   double d_min{0.0};
   double end_tol{99.0};
+  // crossmover (2026-10-31, QUEUE XUNK): optional 7th / 8th fields <cross_v_min m/s>,<lead_step>: a line ACROSS the
+  // robot's heading (kNeroMoverCrossing .. kNeroMoverOncoming) starts a mover too, from cross_v_min, when the
+  // cluster's leading end advances steadily (its largest single step <= lead_step x its travel over the window);
+  // 6 fields = oncomingtrack's rule exactly (no crossing movers)
+  // optional 9th field <cross_tests>: a crossing line starts a mover only when the start test has passed at this many
+  // consecutive measurement times of the track (8 fields = 1): a standing cluster's centre jitter or a 4-frame
+  // transient passes one test on its first 4 positions and fails the next (10-27 20:51:46.7, 20:42:13.3)
+  bool cross{false};
+  double cross_v_min{0.0};
+  double lead_step{0.0};
+  int cross_tests{1};
   NeroMover()
   {
     if (const char * env = std::getenv("NERO_MOT_UNKNOWN_MOVER"); env != nullptr && env[0] != '\0') {
-      enabled = std::sscanf(
-                  env, "%lf,%lf,%lf,%d,%lf,%lf", &v_min, &rms_max, &window, &n_min, &d_min, &end_tol) == 6 &&
-                n_min >= 3;
+      double cv = 0.0;
+      double ls = 0.0;
+      int ct = 1;
+      const int n = std::sscanf(
+        env, "%lf,%lf,%lf,%d,%lf,%lf,%lf,%lf,%d", &v_min, &rms_max, &window, &n_min, &d_min, &end_tol, &cv, &ls,
+        &ct);
+      enabled = (n == 6 || n == 8 || n == 9) && n_min >= 3;
+      cross = enabled && n >= 8 && cv > 0.0 && ls > 0.0 && ct >= 1;
+      if (cross) {
+        cross_v_min = cv;
+        lead_step = ls;
+        cross_tests = n == 9 ? ct : 1;
+      }
       if (enabled) {
         RCLCPP_INFO(
           rclcpp::get_logger("UnknownTracker"),
           "[NERO_MOT_UNKNOWN_MOVER] on: v_min %.2f rms_max %.2f window %.2f n_min %d d_min %.2f end_tol %.2f", v_min,
           rms_max, window, n_min, d_min, end_tol);
+      }
+      if (cross) {
+        RCLCPP_INFO(
+          rclcpp::get_logger("UnknownTracker"),
+          "[NERO_MOT_UNKNOWN_MOVER] crossing movers on: cross_v_min %.2f lead_step %.2f cross_tests %d", cross_v_min,
+          lead_step, cross_tests);
       }
     }
   }
@@ -88,9 +115,26 @@ constexpr double kNeroMoverFragmentBehind = 1.0;  // [m] a mover's measurement t
 constexpr double kNeroMoverFragmentAcross = 1.5;  // [m] ... within this of the line
 constexpr int kNeroMoverMaxFragments = 3;         // measurements in a row
 constexpr double kNeroMoverOncoming = 120.0 * M_PI / 180.0;  // [rad] the line's direction vs the robot's heading
+constexpr double kNeroMoverCrossing = 60.0 * M_PI / 180.0;  // [rad] crossmover: from here up to kNeroMoverOncoming
+constexpr double kNeroCrossLastStep = 0.1;  // crossmover: a crossing start's leading end, newest step / line speed
 constexpr double kNeroMoverMinArea = 0.4;  // [m2] median footprint area to start a mover
 constexpr double kNeroInheritAge = 0.35;  // [s] a track born this recently can hand its positions on
 constexpr double kNeroInheritGap = 0.3;   // [s] ... when its last one is at most this old
+
+// the speed floor of a line by its direction against the measurement's yaw (the robot's heading): oncoming lines from
+// v_min; with crossmover's fields crossing lines from cross_v_min; any other direction never makes a mover (< 0)
+double neroFloor(const double against)
+{
+  const auto & mover = neroMoverCfg();
+  if (against >= kNeroMoverOncoming) return mover.v_min;
+  if (mover.cross && against >= kNeroMoverCrossing) return mover.cross_v_min;
+  return -1.0;
+}
+
+// crossmover: the robot's position at the current measurement time (set by the node; the crossing mover's log only)
+double g_nero_ego_x = 0.0;
+double g_nero_ego_y = 0.0;
+bool g_nero_ego_ok = false;
 
 // least-squares slope of v over t
 double neroSlope(const double * t, const double * v, const int n)
@@ -157,6 +201,29 @@ bool UnknownTracker::neroMoverEnabled()
   return neroMoverCfg().enabled;
 }
 
+bool UnknownTracker::neroCrossEnabled()
+{
+  return neroMoverCfg().cross;
+}
+
+void UnknownTracker::neroSetEgo(const double x, const double y)
+{
+  g_nero_ego_x = x;
+  g_nero_ego_y = y;
+  g_nero_ego_ok = true;
+}
+
+int UnknownTracker::neroCrossPasses(const double t, const NeroLine & line)
+{
+  // consecutive measurement times whose start test passed (one count per measurement time)
+  if (t - nero_cross_t_ > 1e-3 || nero_cross_t_ < 0.0) {
+    if (line.ok && nero_cross_passes_ == 0) nero_cross_first_t_ = t;  // crossmover c3
+    nero_cross_passes_ = line.ok ? nero_cross_passes_ + 1 : 0;
+    nero_cross_t_ = line.ok ? t : -1.0;
+  }
+  return nero_cross_passes_;
+}
+
 UnknownTracker::NeroPoint UnknownTracker::neroPoint(
   const rclcpp::Time & time, const types::DynamicObject & object)
 {
@@ -196,10 +263,13 @@ UnknownTracker::NeroLine UnknownTracker::neroLineTest(const NeroView & points, c
   line.disp = std::hypot(points.back().x - points.front().x, points.back().y - points.front().y);
   if (v < 1e-3) return line;
   // only against the robot's heading (an oncoming object): a static object wrongly given a speed away from or along
-  // with the robot would weaken a stop for it; an approaching one only makes the planners more careful
+  // with the robot would weaken a stop for it; an approaching one only makes the planners more careful. crossmover:
+  // with its fields also ACROSS the robot's heading (60..120 deg), from cross_v_min and only on a steady leading end
   const double against =
     std::abs(autoware_utils::normalize_radian(std::atan2(line.vy, line.vx) - points.back().yaw));
-  if (!(line.rms <= mover.rms_max && v >= mover.v_min && against >= kNeroMoverOncoming)) return line;
+  const double floor = neroFloor(against);
+  line.crossing = against < kNeroMoverOncoming;
+  if (!(line.rms <= mover.rms_max && floor > 0.0 && v >= floor)) return line;
   const double ux = line.vx / v;
   const double uy = line.vy / v;
   std::array<double, kNeroMaxPoints> ts;
@@ -220,8 +290,24 @@ UnknownTracker::NeroLine UnknownTracker::neroLineTest(const NeroView & points, c
   }
   line.v_near = neroSlope(ts.data(), near.data(), points.n);
   line.v_far = neroSlope(ts.data(), far.data(), points.n);
-  line.ok_cont = line.rms <= mover.rms_max && v >= mover.v_min && std::abs(line.v_far - v) <= mover.end_tol * v &&
-                 against >= kNeroMoverOncoming;
+  line.ok_cont = line.rms <= mover.rms_max && v >= floor && std::abs(line.v_far - v) <= mover.end_tol * v;
+  // crossmover: a crossing line starts a mover only when its leading end advances steadily: a standing cluster
+  // whose track switches to a neighbouring cluster (10-27 20:35:11, 3.8 m ahead of the standing robot) moves its
+  // centre and both ends in ONE step (>= 0.85 x the window's travel); a car crossing advances ~1 / (n - 1) per frame
+  bool steady = true;
+  if (line.crossing) {
+    double step = 0.0;
+    for (int i = 1; i < points.n; ++i) step = std::max(step, far[i] - far[i - 1]);
+    const double travel = far[points.n - 1] - far[0];
+    line.lead_step = travel > 1e-3 ? step / travel : 99.0;
+    steady = line.lead_step <= mover.lead_step;
+    // ... and it still advances in its newest step (>= kNeroCrossLastStep x the line speed): a cluster that jumped
+    // ~2 m in 0.3 s and then stood (10-29 20:25:16.5-17.0, pedestrians 25 m ahead, newest step 0.02 x its line) passed
+    // two start tests on the jump alone; real crossers' newest steps are >= 0.15 x their line (10-27 / 10-29 / 51377)
+    const double dt = ts[points.n - 1] - ts[points.n - 2];
+    line.last_step = dt > 1e-3 ? (far[points.n - 1] - far[points.n - 2]) / dt / v : 0.0;
+    steady = steady && line.last_step >= kNeroCrossLastStep;
+  }
   std::array<double, kNeroMaxPoints> areas;
   for (int i = 0; i < points.n; ++i) areas[i] = points.p[i]->area;
   std::nth_element(areas.begin(), areas.begin() + points.n / 2, areas.begin() + points.n);
@@ -229,7 +315,7 @@ UnknownTracker::NeroLine UnknownTracker::neroLineTest(const NeroView & points, c
   // a mover starts on clusters of a vehicle's face (>= kNeroMoverMinArea): a flickering clutter of a few points (10-27
   // 20:47:06.9 at the kerb, 0.03-0.14 m2) hops its centre along a line too
   line.ok = line.ok_cont && line.disp >= mover.d_min && std::abs(line.v_near - v) <= mover.end_tol * v &&
-            line.area >= kNeroMoverMinArea;
+            line.area >= kNeroMoverMinArea && steady;
   return line;
 }
 
@@ -432,6 +518,12 @@ bool UnknownTracker::measure(
     }
     nero_last_line_ = neroLineTest(nero_points_, mover.n_min);
     line = nero_mover_ ? nero_last_line_.ok_cont : nero_last_line_.ok;
+    if (mover.cross) {
+      // crossmover: a crossing start needs <cross_tests> consecutive measurement times whose start test passed
+      // (counted on every measurement, the mover's too)
+      const int passes = neroCrossPasses(t, nero_last_line_);
+      if (!nero_mover_ && nero_last_line_.crossing && passes < mover.cross_tests) line = false;
+    }
     line_vx = nero_last_line_.vx;
     line_vy = nero_last_line_.vy;
     if (line) {
@@ -476,7 +568,7 @@ bool UnknownTracker::measure(
     } else if (mover_ends) {
       double vx = motion_model_.getStateElement(IDX::VX);
       double vy = motion_model_.getStateElement(IDX::VY);
-      if (nero_last_line_.n >= 3 && std::hypot(nero_last_line_.vx, nero_last_line_.vy) < 0.5 * mover.v_min) {
+      if (nero_last_line_.n >= 3 && std::hypot(nero_last_line_.vx, nero_last_line_.vy) < 0.5 * nero_mover_floor_) {
         vx = nero_last_line_.vx;
         vy = nero_last_line_.vy;
       }
@@ -519,13 +611,36 @@ bool UnknownTracker::neroMover(const rclcpp::Time & time, double & vx, double & 
   vx = motion_model_.getStateElement(IDX::VX);
   vy = motion_model_.getStateElement(IDX::VY);
   // the filter has followed the line since (a fragment or a stop can take it down: then it is no mover any more)
-  return std::hypot(vx, vy) >= 0.5 * neroMoverCfg().v_min;
+  return std::hypot(vx, vy) >= 0.5 * nero_mover_floor_;
 }
 
 void UnknownTracker::neroMoverStarts(
   const double t, const double vx, const double vy, const rclcpp::Time & time)
 {
-  if (!nero_mover_ || t - nero_mover_time_.seconds() > kNeroMoverHold) nero_mover_start_ = t;
+  const bool starts = !nero_mover_ || t - nero_mover_time_.seconds() > kNeroMoverHold;
+  if (starts) nero_mover_start_ = t;
+  // crossmover c3: a crossing mover's line has passed since the first of its consecutive start tests
+  if (starts) {
+    nero_mover_since_ =
+      nero_last_line_.crossing && nero_cross_passes_ > 0 && nero_cross_first_t_ >= 0.0 ? nero_cross_first_t_ : t;
+  }
+  nero_mover_cross_ = nero_last_line_.crossing;
+  // the speed floor of this mover's kind (crossmover: a crossing line's is cross_v_min; else v_min)
+  const auto & mover = neroMoverCfg();
+  nero_mover_floor_ = nero_last_line_.crossing ? mover.cross_v_min : mover.v_min;
+  if (starts && nero_last_line_.crossing) {
+    // crossmover: the first-drive log line (track, place, range from the robot, line speed, angle to the robot's heading)
+    const auto & u = getUUID().uuid;
+    const auto & p = nero_points_.back();
+    const double angle =
+      std::abs(autoware_utils::normalize_radian(std::atan2(vy, vx) - p.yaw)) * 180.0 / M_PI;
+    RCLCPP_INFO(
+      logger_,
+      "[NERO_MOT_UNKNOWN_MOVER] crossing mover %02x%02x%02x%02x at (%.1f, %.1f), range %.1f m, line %.1f m/s, "
+      "%.0f deg to the robot's heading",
+      u[0], u[1], u[2], u[3], p.x, p.y,
+      g_nero_ego_ok ? std::hypot(p.x - g_nero_ego_x, p.y - g_nero_ego_y) : -1.0, std::hypot(vx, vy), angle);
+  }
   nero_mover_ = true;
   nero_mover_vx_ = vx;
   nero_mover_vy_ = vy;
@@ -539,6 +654,20 @@ double UnknownTracker::neroMoverAge(const rclcpp::Time & time) const
   double vy = 0.0;
   if (!neroMover(time, vx, vy)) return -1.0;
   return time.seconds() - nero_mover_start_;
+}
+
+bool UnknownTracker::neroMoverRecent(const rclcpp::Time & time) const
+{
+  if (!neroMoverCfg().cross || nero_mover_start_ < 0.0 || !nero_mover_cross_) return false;
+  return (time - nero_mover_time_).seconds() <= kNeroMoverHold;
+}
+
+double UnknownTracker::neroCrossHeld(const rclcpp::Time & time) const
+{
+  double vx = 0.0;
+  double vy = 0.0;
+  if (!neroMoverCfg().cross || !nero_mover_cross_ || nero_mover_since_ < 0.0 || !neroMover(time, vx, vy)) return -1.0;
+  return time.seconds() - nero_mover_since_;
 }
 
 int UnknownTracker::neroInheritable(const rclcpp::Time & time, const UnknownTracker & newborn) const
@@ -561,8 +690,10 @@ int UnknownTracker::neroInheritable(const rclcpp::Time & time, const UnknownTrac
   const double ex = m.x - last.x;
   const double ey = m.y - last.y;
   const double v1 = std::hypot(ex, ey) / dt;
-  if (dt > kNeroInheritGap + 1e-3 || v1 < mover.v_min || v1 > kNeroMoverMaxV) return 0;
-  if (std::abs(autoware_utils::normalize_radian(std::atan2(ey, ex) - m.yaw)) < kNeroMoverOncoming) return 0;
+  if (dt > kNeroInheritGap + 1e-3 || v1 > kNeroMoverMaxV) return 0;
+  // against the robot's heading from v_min (crossmover: or across it from cross_v_min)
+  const double floor1 = neroFloor(std::abs(autoware_utils::normalize_radian(std::atan2(ey, ex) - m.yaw)));
+  if (floor1 <= 0.0 || v1 < floor1) return 0;
   if (pts.n >= 2) {
     // more than one: all on a straight line with the new one (the centre test of the start rule)
     pts.push(&m);
@@ -571,8 +702,8 @@ int UnknownTracker::neroInheritable(const rclcpp::Time & time, const UnknownTrac
     double rms = 0.0;
     if (!neroFitLine(pts, vx, vy, rms)) return 0;
     const double v = std::hypot(vx, vy);
-    if (rms > mover.rms_max || v < mover.v_min || v > kNeroMoverMaxV) return 0;
-    if (std::abs(autoware_utils::normalize_radian(std::atan2(vy, vx) - m.yaw)) < kNeroMoverOncoming) return 0;
+    const double floor = neroFloor(std::abs(autoware_utils::normalize_radian(std::atan2(vy, vx) - m.yaw)));
+    if (rms > mover.rms_max || floor <= 0.0 || v < floor || v > kNeroMoverMaxV) return 0;
     return pts.n - 1;
   }
   return pts.n;
@@ -589,9 +720,17 @@ void UnknownTracker::neroInheritFrom(
   }
   from.nero_inherited_ = true;
   for (auto it = older.rbegin(); it != older.rend(); ++it) nero_points_.push_front(*it);
-  // the start test at once (4 positions with the inherited ones: a mover from its first frame)
+  // the start test at once (4 positions with the inherited ones: a mover from its first frame); crossmover: a crossing
+  // line counts the lost track's consecutive passes up to its last measurement as its own
   nero_last_line_ = neroLineTest(nero_points_, mover.n_min);
-  if (nero_last_line_.ok) {
+  if (mover.cross && !older.empty() && from.nero_cross_t_ >= older.back().t - 1e-3) {
+    nero_cross_passes_ = from.nero_cross_passes_;
+    nero_cross_t_ = from.nero_cross_t_;
+    nero_cross_first_t_ = from.nero_cross_first_t_;
+  }
+  const bool passes = !mover.cross || neroCrossPasses(t, nero_last_line_) >= mover.cross_tests ||
+                      !nero_last_line_.crossing;
+  if (nero_last_line_.ok && passes) {
     neroMoverStarts(t, nero_last_line_.vx, nero_last_line_.vy, time);
     neroInitWithVelocity(time, measurement, nero_last_line_.vx, nero_last_line_.vy, kNeroMoverSigmaV);
   }

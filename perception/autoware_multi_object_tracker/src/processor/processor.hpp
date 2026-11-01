@@ -154,6 +154,16 @@ private:
     const rclcpp::Time & time);
   bool neroMoverAlong(
     const std::shared_ptr<Tracker> & tracker, const rclcpp::Time & time, const double box_yaw) const;
+  // crossmover c3 (NERO_MOT_UNKNOWN_MOVER with the crossing fields): an UNKNOWN published fast because of a crossing
+  // mover line within the last mover hold (a young mover, or one whose line just ended) is continued by a vehicle box
+  // its motion runs along (within 30 deg, either way) like a slow one, and no vehicle track that is not published yet
+  // removes it (else the object vanishes until that track is confident: 10-27 20:45:11.3, 13 m in the path).
+  // Oncoming movers keep oncomingtrack's rules (a 0.1 s fragment line at a standing vehicle: 20:28:47.9)
+  bool neroMoverMadeAlong(
+    const std::shared_ptr<Tracker> & tracker, const types::DynamicObject & object, const rclcpp::Time & time,
+    const double box_yaw) const;
+  bool neroMoverMadeFast(
+    const std::shared_ptr<Tracker> & tracker, const types::DynamicObject & object, const rclcpp::Time & time) const;
 };
 
 }  // namespace autoware::multi_object_tracker
