@@ -3566,6 +3566,34 @@ std::optional<StaticObstacleAvoidanceModule::NeroCgwCar> StaticObstacleAvoidance
         const auto & qc = q.kinematics.initial_pose_with_covariance.pose.position;
         if (std::hypot(qc.x - getEgoPosition().x, qc.y - getEgoPosition().y) > x.s_near + 10.0) continue;
         const auto qx = extent(q, nero_cgw::seg_of(ref, qc, pj));
+        // [nero 2026-11-01 cgwside] NERO_SOA_CORRIDOR_GIVEWAY_ROWSIDE=1: a standing object pushes the coming car toward
+        // ego's lane only if it reaches into the car's line (from its kerb side, or overlapping it). One that stands
+        // wholly BETWEEN the car and ego's lane (its left edge right of the car's right edge) is not in the car's way;
+        // the car keeps its line. Without this a parked car 26 m to the side of the path at a turn exit (w31 20:48:03,
+        // 337578, recognised far out by CenterPoint with the shuffle fix, tracker noise 1.4 m/s) was "pushed" by the
+        // parked cars at the corner to 0.35 m off ego and the plan kept right 27.65 m (off the lanes). Unset = the car.
+        static const bool nero_rowside = [] {
+          const char * s = std::getenv("NERO_SOA_CORRIDOR_GIVEWAY_ROWSIDE");
+          const bool on = s != nullptr && std::string(s) == "1";
+          if (on) {
+            RCLCPP_INFO(
+              rclcpp::get_logger("static_obstacle_avoidance"),
+              "[NERO_SOA_CGW] NERO_SOA_CORRIDOR_GIVEWAY_ROWSIDE=1: only objects reaching into a coming car's line push it");
+          }
+          return on;
+        }();
+        if (
+          nero_rowside && qx.hi <= x.lo && 0.5 * (qx.lo + qx.hi) > lane_left && qx.s_far >= 0.0 &&
+          qx.s_near <= x.s_near) {
+          if (qx.lo - o.shape.dimensions.y - nero_cgw::SQUEEZE_M < lane_left) {
+            RCLCPP_WARN_THROTTLE(
+              getLogger(), *clock_, 1000,
+              "[NERO_SOA_CGW] %s rowside: no push from a standing object between it and ego's lane (car lat %.2f..%.2f, "
+              "object %.2f..%.2f, %.1f m ahead)",
+              id.c_str(), x.lo, x.hi, qx.lo, qx.hi, qx.s_near);
+          }
+          continue;
+        }
         if (0.5 * (qx.lo + qx.hi) <= lane_left || qx.s_far < 0.0 || qx.s_near > x.s_near) continue;
         lo_pred = std::min(lo_pred, qx.lo - o.shape.dimensions.y - nero_cgw::SQUEEZE_M);
       }
