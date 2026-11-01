@@ -22,14 +22,41 @@
 #include <fmt/format.h>
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
 namespace autoware::motion::control::pid_longitudinal_controller
 {
+namespace
+{
+// [nero] NERO_PID_SLOPE_STOP (slopestop, QUEUE SMSG): settings and state per controller, outside
+// the class layout
+struct NeroSlopeStop
+{
+  bool enabled{false};
+  double dead_rad{0.02};
+  double max_rad{0.25};
+  double gain{1.0};
+  double drive_m{0.0};
+  double term{0.0};
+  bool logged{false};
+};
+NeroSlopeStop & neroSlopeStop(const void * controller)
+{
+  static std::mutex mutex;
+  static std::unordered_map<const void *, NeroSlopeStop> states;
+  std::lock_guard<std::mutex> lock(mutex);
+  return states[controller];
+}
+}  // namespace
+
 PidLongitudinalController::PidLongitudinalController(
   rclcpp::Node & node, std::shared_ptr<diagnostic_updater::Updater> diag_updater)
 : node_parameters_(node.get_node_parameters_interface()),
@@ -201,6 +228,33 @@ PidLongitudinalController::PidLongitudinalController(
   } else {
     RCLCPP_ERROR(logger_, "Slope source is not valid. Using raw_pitch option as default");
     m_slope_source = SlopeSource::RAW_PITCH;
+  }
+
+  // [nero] NERO_PID_SLOPE_STOP=<dead_rad>,<max_rad>,<gain>,<drive_m> (slopestop, QUEUE SMSG)
+  if (const char * e = std::getenv("NERO_PID_SLOPE_STOP"); e && *e) {
+    auto & p = neroSlopeStop(this);
+    double d = 0.0, m = 0.0, g = 0.0, dm = 0.0;
+    if (m_enable_slope_compensation) {
+      RCLCPP_ERROR(
+        logger_,
+        "[NERO_PID_SLOPE_STOP] enable_slope_compensation is true (it would count twice): off");
+    } else if (
+      std::sscanf(e, "%lf,%lf,%lf,%lf", &d, &m, &g, &dm) == 4 && d >= 0.0 && m > d && g > 0.0 &&
+      dm >= 0.0) {
+      p.enabled = true;
+      p.dead_rad = d;
+      p.max_rad = m;
+      p.gain = g;
+      p.drive_m = dm;
+      RCLCPP_INFO(
+        logger_,
+        "[NERO_PID_SLOPE_STOP] on: braking for a stop on a down-grade gets %.2f x g sin(grade) "
+        "(measured pitch, none above -%.3f rad, full from -%.3f, at most %.3f rad; STOPPING, and "
+        "DRIVE within %.1f m of the stop point)",
+        g, d, 2.0 * d, m, dm);
+    } else {
+      RCLCPP_ERROR(logger_, "[NERO_PID_SLOPE_STOP] bad value '%s': off", e);
+    }
   }
 
   // ego nearest index search
@@ -879,6 +933,8 @@ PidLongitudinalController::Motion PidLongitudinalController::calcCtrlCmd(
     ctrl_cmd_as_pedal_pos.acc =
       applySlopeCompensation(acc_cmd, control_data.slope_angle, control_data.shift);
     m_debug_values.setValues(DebugValues::TYPE::ACC_CMD_SLOPE_APPLIED, ctrl_cmd_as_pedal_pos.acc);
+    // [nero] NERO_PID_SLOPE_STOP: 0 unless set (the car's slope compensation stays as configured)
+    ctrl_cmd_as_pedal_pos.acc += neroSlopeStopTerm(control_data, raw_ctrl_cmd.acc);
     ctrl_cmd_as_pedal_pos.vel = raw_ctrl_cmd.vel;
   }
 
@@ -1014,6 +1070,61 @@ double PidLongitudinalController::applySlopeCompensation(
   double sign = (shift == Shift::Forward) ? 1.0 : (shift == Shift::Reverse ? -1.0 : 0);
   double compensated_acc = input_acc + sign * 9.81 * std::sin(pitch_limited);
   return compensated_acc;
+}
+
+double PidLongitudinalController::neroSlopeStopTerm(
+  const ControlData & control_data, const double raw_acc)
+{
+  // [nero] slopestop (QUEUE SMSG). The Nero chassis takes a velocity target + brake % = -10 x acc
+  // and runs its own speed loop. That loop absorbs the grade while the target is above 0 (until its
+  // braking saturates on a steep dip), but with the smooth stop's target 0 it lets go: gravity
+  // passes through fully (bag 10-27: -0.90 g sin) and on a down-grade the robot speeds up through
+  // its stop point (10-29 15:51, 51377: 0.9 -> 1.5 m/s under -0.8). So while braking for a stop on
+  // a down-grade (STOPPING / EMERGENCY; DRIVE within drive_m of the stop point while the robot runs
+  // ahead of the plan) the gravity term goes into the brake command. Down-grades only (never a
+  // weaker stop uphill), from the measured pitch (the lanelet map's z misses dips), forward only.
+  // Engaged at the controller's jerk limit, released at once.
+  auto & p = neroSlopeStop(this);
+  if (!p.enabled) {
+    return 0.0;
+  }
+  double target = 0.0;
+  const double slope = m_lpf_pitch->getValue();  // + = up-grade
+  // dead band: nothing above -dead_rad (the EKF pitch reads ~-0.4 deg on flat roads), full
+  // term from -2 x dead_rad
+  const double ramp = std::clamp((-slope - p.dead_rad) / p.dead_rad, 0.0, 1.0);
+  if (ramp > 0.0 && control_data.shift == Shift::Forward) {
+    double weight = 0.0;
+    if (m_control_state == ControlState::STOPPING || m_control_state == ControlState::EMERGENCY) {
+      // EMERGENCY: unreachable with the car's enable_overshoot_emergency false; no release there
+      weight = 1.0;
+    } else if (
+      m_control_state == ControlState::DRIVE && control_data.stop_dist < p.drive_m &&
+      raw_acc < 0.0) {
+      // with a target above 0 the chassis' speed loop absorbs the grade (bag 10-27: 85-100 %) until
+      // its braking saturates; the robot then runs ahead of the plan (51377: +0.35..0.65 m/s). Only
+      // that over-speed opens the term (none up to 0.1 m/s, full from 0.4), else it would brake
+      // twice and stop short.
+      const double v_target =
+        control_data.interpolated_traj.points.at(control_data.target_idx).longitudinal_velocity_mps;
+      weight = std::clamp((control_data.current_motion.vel - v_target - 0.1) / 0.3, 0.0, 1.0);
+    }
+    target = weight * ramp * p.gain * 9.81 * std::sin(std::max(slope, -p.max_rad));
+  }
+  const double step = std::abs(m_min_jerk) * control_data.dt;
+  p.term = target < p.term ? std::max(target, p.term - step) : target;
+  if (p.term < -0.05 && !p.logged) {
+    p.logged = true;
+    RCLCPP_INFO(
+      logger_,
+      "[NERO_PID_SLOPE_STOP] braking for a stop on a down-grade: pitch %.1f %%, state %s, "
+      "v %.2f m/s, stop in %.2f m, adding %.2f m/s2 to the brake",
+      100.0 * std::tan(m_lpf_pitch->getValue()), toStr(m_control_state).c_str(),
+      control_data.current_motion.vel, control_data.stop_dist, target);
+  } else if (p.term > -0.01) {
+    p.logged = false;
+  }
+  return p.term;
 }
 
 PidLongitudinalController::Motion PidLongitudinalController::keepBrakeBeforeStop(

@@ -373,6 +373,17 @@ private:
   double applySlopeCompensation(const double acc, const double pitch, const Shift shift) const;
 
   /**
+   * @brief [nero] NERO_PID_SLOPE_STOP: the gravity term added to the brake command while braking
+   * for a stop on a down-grade (0 elsewhere). Its settings / state live in the .cpp, not in this
+   * class: a new data member would change the size of this class, which
+   * autoware_trajectory_follower_node allocates (a rebuild of this package alone would then
+   * corrupt memory).
+   * @param [in] control_data data for control calculation
+   * @param [in] raw_acc the controller's acceleration before slope compensation
+   */
+  double neroSlopeStopTerm(const ControlData & control_data, const double raw_acc);
+
+  /**
    * @brief keep target motion acceleration negative before stop
    * @param [in] traj reference trajectory
    * @param [in] motion delay compensated target motion
