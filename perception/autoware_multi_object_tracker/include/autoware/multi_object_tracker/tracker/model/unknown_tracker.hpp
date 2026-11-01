@@ -26,6 +26,10 @@
 
 #include <autoware/kalman_filter/kalman_filter.hpp>
 
+#include <array>
+#include <deque>
+#include <vector>
+
 namespace autoware::multi_object_tracker
 {
 
@@ -50,6 +54,78 @@ private:
   static double footprintArea(const types::DynamicObject & object);
 
 public:
+  // NERO_MOT_UNKNOWN_MOVER (oncomingtrack): the track's own measured positions (one per measurement time) and the
+  // last velocity they showed as a mover
+  struct NeroPoint
+  {
+    double t;
+    double x;
+    double y;
+    std::vector<std::array<double, 2>> outline;  // the measured footprint in the map frame
+    double yaw;  // the measurement's yaw: a cluster carries the robot's heading at its time
+    double area;  // the measured footprint's area
+  };
+  // a line test's points without copies (the window holds one point per measurement time: <= ~20 in 0.5 s)
+  static constexpr int kNeroMaxPoints = 64;
+  struct NeroView
+  {
+    std::array<const NeroPoint *, kNeroMaxPoints> p{};
+    int n{0};
+    void push(const NeroPoint * q)
+    {
+      if (n == kNeroMaxPoints) {  // keep the newest (never reached at 10-20 Hz in a 0.5 s window)
+        for (int i = 1; i < n; ++i) p[i - 1] = p[i];
+        --n;
+      }
+      p[n++] = q;
+    }
+    const NeroPoint & front() const { return *p[0]; }
+    const NeroPoint & back() const { return *p[n - 1]; }
+  };
+
+private:
+  std::deque<NeroPoint> nero_points_;
+  bool nero_mover_{false};
+  double nero_mover_vx_{0.0};
+  double nero_mover_vy_{0.0};
+  rclcpp::Time nero_mover_time_;
+  int nero_misses_{0};     // consecutive measurement times the line test failed while a mover
+  int nero_fragments_{0};  // consecutive measurement times taken as the mover's rear fragments
+  double nero_fragment_t_{-1.0};
+  double nero_miss_t_{-1.0};
+  double nero_mover_start_{-1.0};  // [s] when the current mover's line first passed
+  double nero_birth_t_{-1.0};      // [s] the track's first measurement
+  bool nero_inherited_{false};     // its points went to a newer track
+  void neroMoverStarts(const double t, const double vx, const double vy, const rclcpp::Time & time);
+  void neroInitWithVelocity(
+    const rclcpp::Time & time, const types::DynamicObject & object, const double vx, const double vy,
+    const double sigma_v);
+  static NeroPoint neroPoint(const rclcpp::Time & time, const types::DynamicObject & object);
+
+public:
+  // NERO_MOT_UNKNOWN_MOVER: the straight-line test over measured positions (stats for research logs)
+  struct NeroLine
+  {
+    int n{0};
+    double span{0.0};
+    double vx{0.0};
+    double vy{0.0};
+    double rms{0.0};
+    double disp{0.0};    // first -> last measured centre
+    double v_near{0.0};  // speed along the line of the outline's rear-most and front-most points
+    double v_far{0.0};
+    double area{0.0};     // median footprint area of the measurements
+    bool ok{false};       // starts a mover: the centres on the line, travel, both outline ends moving with it
+    bool ok_cont{false};  // keeps one: the centres on the line and the leading end moving with it (a car seen closer
+                          // shows more of its side: its trailing end lags)
+  };
+  static NeroLine neroLineTest(const std::deque<NeroPoint> & points, const int min_n);
+  static NeroLine neroLineTest(const NeroView & points, const int min_n);
+  NeroLine nero_last_line_;  // research logs only
+
+private:
+
+public:
   struct Options
   {
     // publish the footprint where it was last measured (+ velocity * time since that measurement)
@@ -72,6 +148,26 @@ public:
   bool measureWithPose(const types::DynamicObject & object);
   bool measureWithShape(const types::DynamicObject & object);
   bool getTrackedObject(const rclcpp::Time & time, types::DynamicObject & object) const override;
+
+  // NERO_MOT_UNKNOWN_MOVER
+  static bool neroMoverEnabled();
+  // a mover at <time> (its measured positions showed one within the hold): its velocity (map frame)
+  bool neroMover(const rclcpp::Time & time, double & vx, double & vy) const;
+  // the velocity of its last straight line (map frame)
+  void neroMoverLine(double & vx, double & vy) const
+  {
+    vx = nero_mover_vx_;
+    vy = nero_mover_vy_;
+  }
+  // a measurement at <time> at (x, y) continues this track's measured positions on a mover's straight line
+  bool neroMoverContinues(const rclcpp::Time & time, const types::DynamicObject & measurement) const;
+  // how long the mover at <time> has held its line [s] (< 0: no mover)
+  double neroMoverAge(const rclcpp::Time & time) const;
+  // a young track (born within kNeroInheritAge) the gates lost: the number of its measured positions that a new
+  // track born from <newborn> at <time> continues on a straight line against the robot's heading (0: none)
+  int neroInheritable(const rclcpp::Time & time, const UnknownTracker & newborn) const;
+  // take those positions as this (new) track's history; a mover at once when they pass the start test
+  void neroInheritFrom(UnknownTracker & from, const rclcpp::Time & time, const types::DynamicObject & measurement);
 };
 
 }  // namespace autoware::multi_object_tracker

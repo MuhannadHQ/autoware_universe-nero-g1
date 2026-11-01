@@ -37,6 +37,7 @@
 
 namespace autoware::multi_object_tracker
 {
+class UnknownTracker;  // NERO_MOT_UNKNOWN_MOVER
 using LabelType = autoware_perception_msgs::msg::ObjectClassification::_label_type;
 
 struct TrackerProcessorConfig
@@ -141,6 +142,18 @@ private:
   // channels a duplicate born from the other channel's detection otherwise survives every prune, gets published with
   // the speed of its first boxes' motion and nearer the path (10-26e #59: 279a07 on the parked 41db95, -2.82)
   double nero_dup_fresh_{0.0};
+
+  // NERO_MOT_UNKNOWN_MOVER (oncomingtrack, 2026-10-31; unset = stock; UnknownTracker holds the rule): an UNKNOWN
+  // measurement that no track took but that continues a recently measured UNKNOWN track's straight mover line updates
+  // that track instead of starting one at speed 0; with NERO_MOT_REBIRTH, a vehicle measurement on a mover whose motion
+  // runs along the vehicle box (within 30 deg, either way) continues it like a standing one, heading the way it moves
+  bool neroMoverLink(
+    const types::DynamicObject & measurement, const types::InputChannel & channel, const rclcpp::Time & time);
+  void neroMoverInherit(
+    const std::shared_ptr<UnknownTracker> & newborn, const types::DynamicObject & measurement,
+    const rclcpp::Time & time);
+  bool neroMoverAlong(
+    const std::shared_ptr<Tracker> & tracker, const rclcpp::Time & time, const double box_yaw) const;
 };
 
 }  // namespace autoware::multi_object_tracker
