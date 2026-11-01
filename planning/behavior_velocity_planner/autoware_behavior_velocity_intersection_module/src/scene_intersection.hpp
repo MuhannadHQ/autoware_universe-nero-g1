@@ -492,6 +492,12 @@ private:
   std::optional<geometry_msgs::msg::Point> nero_xh_again_stop_;
   //! ego is stopping / held for such a vehicle (the decision stands until the hold ends)
   bool nero_xh_again_held_{false};
+  //! NERO_IX_CROSSING_HOLD_FOLLOWER (followturn, 2026-10-30): where ego drove since it came into the hold zone (x, y;
+  //! a point every 0.5 m), ego's yaw at the first one, and the vehicles kept as followers by this switch alone
+  //! (uuidKey() -> short id; logged when they become one and when they stop being one)
+  std::vector<std::pair<double, double>> nero_xh_trail_;
+  double nero_xh_trail_yaw0_{0.0};
+  std::map<std::string, std::string> nero_xh_followers_;
 
   //! turn_direction of this lane
   const std::string turn_direction_;

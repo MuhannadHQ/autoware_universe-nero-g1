@@ -63,6 +63,18 @@
 // for it, as for a crosser), until it is behind ego, leaves the way or has stood again. The
 // crosser / no-start rules are unchanged (a vehicle >= <v_min> whose path comes into ego's way
 // holds it whatever this switch says). Unset = the above exactly.
+//
+// NERO_IX_CROSSING_HOLD_FOLLOWER=<band m>[,<heading deg>] (followturn job, 2026-10-30, QUEUE XFOL): the follower test
+// above (behind ego's rear, within 2.0 m of its path, heading within 45 deg of EGO'S heading) fails for the car queued
+// behind ego once ego has turned 45 deg into its turn: 10-29 15:57 at 62830 the car that had queued behind the robot at
+// the line and crept after it at 1.1-1.5 m/s, 2 m behind, became a crosser 4.8 m into the left turn and held the robot
+// 3.0 s inside the mouth at -3.4 with that car closing from behind. With this switch a vehicle is also a follower while
+// it is behind ego along the way ego came: its centre projects onto ego's own trail since it came into the hold zone
+// (every 0.5 m, continued straight back along ego's heading at its first point), behind ego's rear, within <band> m of
+// that trail, heading within <heading> deg of the trail's direction there. A car coming up beside ego, pulling out of
+// ego's track (more than <band> m off it, or turning more than <heading> deg away from it) or cutting a corner is judged
+// by the rules above again from that cycle on; every vehicle the old test keeps as a follower stays one. Unset = the
+// above exactly.
 
 #include "scene_intersection.hpp"
 
@@ -87,6 +99,7 @@
 #include <iterator>
 #include <limits>
 #include <map>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -161,6 +174,30 @@ const NeroCrossingYieldParam & nero_crossing_yield_param()
     r.stood = std::max(0.5, v[0]);
     r.approach = std::max(0.0, v[1]);
     r.near = std::max(0.0, v[2]);
+    return r;
+  }();
+  return p;
+}
+
+struct NeroCrossingFollowerParam
+{
+  bool on{false};
+  double band{2.0};
+  double dyaw{M_PI / 4.0};
+};
+
+const NeroCrossingFollowerParam & nero_crossing_follower_param()
+{
+  static const NeroCrossingFollowerParam p = [] {
+    NeroCrossingFollowerParam r;
+    const char * e = std::getenv("NERO_IX_CROSSING_HOLD_FOLLOWER");
+    if (e == nullptr || std::string(e).empty()) return r;
+    double v[2] = {r.band, 45.0};
+    const int n = std::sscanf(e, "%lf,%lf", &v[0], &v[1]);
+    if (n < 1) return r;
+    r.on = true;
+    r.band = std::max(0.0, v[0]);
+    r.dyaw = std::clamp(v[1], 0.0, 90.0) * M_PI / 180.0;
     return r;
   }();
   return p;
@@ -244,6 +281,8 @@ void IntersectionModule::neroCrossingHold(PathWithLaneId * path)
     nero_xh_revoked_.clear();
     nero_xh_again_stop_.reset();
     nero_xh_again_held_ = false;
+    nero_xh_trail_.clear();
+    nero_xh_followers_.clear();
   };
   // scope: a stop-sign lane where this module has no attention lane to check (it returned
   // InternalError)
@@ -279,6 +318,14 @@ void IntersectionModule::neroCrossingHold(PathWithLaneId * path)
         lane_id_, nero_crossing_yield_param().near, nero_crossing_yield_param().approach,
         nero_crossing_yield_param().stood);
     }
+    if (nero_crossing_follower_param().on) {
+      RCLCPP_INFO(
+        logger_,
+        "[NERO_IX] crossing_hold: lane %ld followers along ego's own trail: behind its rear, within %.1f m "
+        "of the trail, heading within %.0f deg of it",
+        lane_id_, nero_crossing_follower_param().band,
+        nero_crossing_follower_param().dyaw * 180.0 / M_PI);
+    }
   }
   if (path->points.size() < 2) return reset();
   const auto & ego_pose = planner_data_->current_odometry->pose;
@@ -309,6 +356,52 @@ void IntersectionModule::neroCrossingHold(PathWithLaneId * path)
   if (!s_line) return reset();
   const double nose_past = front - s_line.value();  // + = ego's nose past the line
   if (nose_past < -2.0 || nose_past > p.depth) return reset();
+
+  // NERO_IX_CROSSING_HOLD_FOLLOWER: ego's trail since it came into the hold zone (a point every 0.5 m)
+  const auto & fp = nero_crossing_follower_param();
+  if (fp.on) {
+    if (nero_xh_trail_.empty()) {
+      nero_xh_trail_.emplace_back(ego_pos.x, ego_pos.y);
+      nero_xh_trail_yaw0_ = tf2::getYaw(ego_pose.orientation);
+    } else if (
+      nero_xh_trail_.size() < 400 &&
+      std::hypot(ego_pos.x - nero_xh_trail_.back().first, ego_pos.y - nero_xh_trail_.back().second) >=
+        0.5) {
+      nero_xh_trail_.emplace_back(ego_pos.x, ego_pos.y);
+    }
+  }
+  // a point's place against that trail (continued straight back along ego's yaw at its first point, and on to ego):
+  // its arc length from ego (< 0 behind), its distance from the trail and the trail's direction there
+  struct TrailView
+  {
+    double s{0.0}, lat{std::numeric_limits<double>::infinity()}, yaw{0.0};
+  };
+  auto trail_view = [&](const double qx, const double qy) {
+    TrailView best;
+    if (nero_xh_trail_.empty()) return best;
+    {
+      const double ux = std::cos(nero_xh_trail_yaw0_), uy = std::sin(nero_xh_trail_yaw0_);
+      const double x0 = nero_xh_trail_.front().first, y0 = nero_xh_trail_.front().second;
+      const double r = (qx - x0) * ux + (qy - y0) * uy;
+      if (r <= 0.0) best = {r, std::abs(-(qx - x0) * uy + (qy - y0) * ux), nero_xh_trail_yaw0_};
+    }
+    double cum = 0.0;  // arc length from the trail's first point
+    const size_t n = nero_xh_trail_.size();
+    for (size_t i = 0; i < n; ++i) {
+      const double ax = nero_xh_trail_[i].first, ay = nero_xh_trail_[i].second;
+      const double bx = i + 1 < n ? nero_xh_trail_[i + 1].first : ego_pos.x;
+      const double by = i + 1 < n ? nero_xh_trail_[i + 1].second : ego_pos.y;
+      const double dx = bx - ax, dy = by - ay, len = std::hypot(dx, dy);
+      if (len < 0.05) continue;
+      const double r = std::clamp(((qx - ax) * dx + (qy - ay) * dy) / (len * len), 0.0, 1.0);
+      const double d = std::hypot(qx - (ax + r * dx), qy - (ay + r * dy));
+      if (d < best.lat) best = {cum + r * len, d, std::atan2(dy, dx)};
+      cum += len;
+    }
+    best.s -= cum;  // from ego
+    return best;
+  };
+  std::set<std::string> followers_now;
 
   // ego's passage from where it is: standstill -> <delay>, then <acc> up to the path speed
   const double v0 = std::abs(planner_data_->current_velocity->twist.linear.x);
@@ -447,7 +540,32 @@ void IntersectionModule::neroCrossingHold(PathWithLaneId * path)
         std::abs(autoware::motion_utils::calcLateralOffset(path->points, opose.position));
       const double dyaw = std::abs(autoware_utils::normalize_radian(
         tf2::getYaw(opose.orientation) - tf2::getYaw(ego_pose.orientation)));
-      if (s_o < -rear && dyaw < M_PI / 4.0 && lat < 2.0) continue;
+      if (s_o < -rear && dyaw < M_PI / 4.0 && lat < 2.0) {
+        if (fp.on) followers_now.insert(key);
+        continue;
+      }
+      // NERO_IX_CROSSING_HOLD_FOLLOWER: behind ego along its own trail (ego's heading has turned away from it)
+      if (fp.on) {
+        const auto tv = trail_view(opose.position.x, opose.position.y);
+        const double dyaw_t =
+          std::abs(autoware_utils::normalize_radian(tf2::getYaw(opose.orientation) - tv.yaw));
+        if (tv.s < -rear && tv.lat < fp.band && dyaw_t < fp.dyaw) {
+          followers_now.insert(key);
+          if (nero_xh_followers_.count(key) == 0) {
+            const std::string fid = autoware_utils::to_hex_string(object.object_id).substr(0, 4);
+            nero_xh_followers_.emplace(key, fid);
+            RCLCPP_INFO(
+              logger_,
+              "[NERO_IX] crossing_hold: lane %ld %s (class %d, %.1f m/s) follows ego: centre %.1f m behind "
+              "its rear, %.2f m off its trail, heading %.0f deg off the trail (%.0f deg off ego's; "
+              "ego v %.2f, nose %+.2f): not a crosser",
+              lane_id_, fid.c_str(),
+              object.classification.empty() ? 0 : object.classification.front().label, v,
+              -tv.s - rear, tv.lat, dyaw_t * 180.0 / M_PI, dyaw * 180.0 / M_PI, v0, nose_past);
+          }
+          continue;
+        }
+      }
     }
     const std::string id = autoware_utils::to_hex_string(object.object_id).substr(0, 4);
     // slow movers: a vehicle (not UNKNOWN: those count from <v_min> on) slower than <v_slow> that
@@ -772,6 +890,21 @@ void IntersectionModule::neroCrossingHold(PathWithLaneId * path)
       continue;
     }
     if (!conflict || c_obj->t < conflict->t) conflict = c_obj;
+  }
+
+  // NERO_IX_CROSSING_HOLD_FOLLOWER: a vehicle this switch kept as a follower is judged again (it left ego's track,
+  // came up beside it, or is gone)
+  for (auto it = nero_xh_followers_.begin(); it != nero_xh_followers_.end();) {
+    if (followers_now.count(it->first)) {
+      ++it;
+      continue;
+    }
+    RCLCPP_INFO(
+      logger_,
+      "[NERO_IX] crossing_hold: lane %ld %s no longer follows ego along its trail (ego v %.2f, nose %+.2f): "
+      "judged as any vehicle",
+      lane_id_, it->second.c_str(), v0, nose_past);
+    it = nero_xh_followers_.erase(it);
   }
 
   const double now = clock_->now().seconds();
