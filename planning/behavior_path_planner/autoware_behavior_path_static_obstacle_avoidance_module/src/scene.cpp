@@ -58,8 +58,29 @@
 
 namespace autoware::behavior_path_planner
 {
+namespace utils::static_obstacle_avoidance::nero_frag
+{
+// utils.cpp (NERO_SOA_AMBIGUOUS_FRAGMENT): the switch is set; false for a vehicle that carries an UNKNOWN fragment's
+// standing history and whose approved shift does not keep its hard margin
+bool on();
+bool debug();
+bool carried(const ObjectData & o);
+bool keepApprovedShortcut(
+  const ObjectData & o, const double approved_shift, const double vehicle_width,
+  const std::shared_ptr<AvoidanceParameters> & parameters);
+}  // namespace utils::static_obstacle_avoidance::nero_frag
+
 namespace
 {
+// NERO_SOA_AMBIGUOUS_FRAGMENT: the stop before a carried vehicle (see updateEgoBehavior), kept while that vehicle comes
+// toward the robot (a car first seen as a fragment that pulls out toward it is no longer a static target)
+struct NeroFragStop
+{
+  unique_identifier_msgs::msg::UUID id;
+  geometry_msgs::msg::Point at;
+};
+std::optional<NeroFragStop> nero_frag_stop;
+
 bool isDrivingSameLane(
   const lanelet::ConstLanelets & previous_lanes, const lanelet::ConstLanelets & current_lanes)
 {
@@ -1814,6 +1835,97 @@ void StaticObstacleAvoidanceModule::updateEgoBehavior(
     if (data.yield_required) {
       insertWaitPoint(isBestEffort(parameters_->policy_deceleration), path);
       return;
+    }
+
+    // NERO_SOA_AMBIGUOUS_FRAGMENT (utils.cpp nero_frag): a vehicle first avoided as its fragment needs more shift than
+    // the registered line gives (it does not keep the hard margin). Stock stops for an unavoidable target only when no
+    // line is registered, treats INSUFFICIENT_LONGITUDINAL_DISTANCE as never avoidable, and an avoidable target whose
+    // new line is not executed (not comfortable / not valid) gets nothing: the robot passed it on the fragment's line
+    // (sim 0.16 m). Stop before it until a line that keeps the hard margin is registered: at the module's own stop line
+    // for it (room to shift from standstill; standing, the module avoids it, CLOSE_DISTANCE_AVOIDANCE), not nearer than
+    // its near end, never nearer than the module's hard-constraint stop distance.
+    for (const auto & o : data.target_objects) {
+      if (!utils::static_obstacle_avoidance::nero_frag::on()) break;
+      if (
+        o.longitudinal < 0.0 || !o.avoid_required ||
+        !utils::static_obstacle_avoidance::nero_frag::carried(o)) {
+        continue;
+      }
+      // avoidable but its line not executed yet, or not avoidable only for lack of distance; a vehicle with no room
+      // (INSUFFICIENT_DRIVABLE_SPACE ...) stays as stock (obstacle_stop / the give-way)
+      if (
+        !o.is_avoidable && o.info != ObjectInfo::NEED_DECELERATION &&
+        o.info != ObjectInfo::INSUFFICIENT_LONGITUDINAL_DISTANCE) {
+        continue;
+      }
+      if (utils::static_obstacle_avoidance::nero_frag::keepApprovedShortcut(
+            o, helper_->getShift(o.getPosition()), planner_data_->parameters.vehicle_width, parameters_)) {
+        continue;
+      }
+      // firm, not hard: when the module's own stop line is already inside its max_deceleration (-1.5) stopping
+      // distance, stop at -2.0 m/s2 / 2.0 m/s3 (the robot otherwise reached the car's near end at 2.4 m/s when it was
+      // classified 10 m out at 16 km/h); a hard brake is <= -2.5
+      constexpr double FIRM_DECEL = -2.0;
+      constexpr double FIRM_JERK = 2.0;
+      const double to_near =
+        o.longitudinal - planner_data_->parameters.base_link2front - parameters_->stop_buffer;
+      const auto firm = autoware::motion_utils::calcDecelDistWithJerkAndAccConstraints(
+        getEgoSpeed(), 0.0, planner_data_->self_acceleration->accel.accel.linear.x, FIRM_DECEL, FIRM_JERK,
+        -FIRM_JERK);
+      const double stop_distance = std::max(
+        std::min(o.to_stop_line, to_near),
+        firm ? firm.value() : helper_->getFeasibleDecelDistance(0.0, true));
+      utils::static_obstacle_avoidance::insertDecelPoint(
+        getEgoPosition(), stop_distance, 0.0, path.path, stop_pose_);
+      if (stop_pose_) nero_frag_stop = NeroFragStop{o.object.object_id, stop_pose_->pose.position};
+      RCLCPP_INFO_THROTTLE(
+        getLogger(), *clock_, 1000,
+        "[NERO_SOA_FRAG] stop %.1f m ahead before the vehicle (its near end %.1f m, info %s, v %.2f)",
+        stop_distance, o.longitudinal, magic_enum::enum_name(o.info).data(), getEgoSpeed());
+      return;
+    }
+    // the vehicle left the target list (it moves): keep the stop while it comes toward the robot
+    if (nero_frag_stop && utils::static_obstacle_avoidance::nero_frag::on()) {
+      const auto & objs = planner_data_->dynamic_object->objects;
+      const auto it = std::find_if(objs.begin(), objs.end(), [](const auto & ob) {
+        return ob.object_id == nero_frag_stop->id;
+      });
+      bool keep = false;
+      if (it != objs.end()) {
+        const auto & op = it->kinematics.initial_pose_with_covariance.pose;
+        const auto & tw = it->kinematics.initial_twist_with_covariance.twist;
+        const auto ego = getEgoPose();
+        const double yaw = tf2::getYaw(op.orientation);
+        const double vx = std::cos(yaw) * tw.linear.x - std::sin(yaw) * tw.linear.y;
+        const double vy = std::sin(yaw) * tw.linear.x + std::cos(yaw) * tw.linear.y;
+        const double dx = op.position.x - ego.position.x;
+        const double dy = op.position.y - ego.position.y;
+        const double ego_yaw = tf2::getYaw(ego.orientation);
+        const bool ahead = std::cos(ego_yaw) * dx + std::sin(ego_yaw) * dy > 0.0;
+        const double toward = -(vx * dx + vy * dy) / std::max(std::hypot(dx, dy), 0.1);
+        keep = ahead && toward > 0.2;
+      }
+      if (keep) {
+        // the place kept, and obstacle_stop's 5 m stop margin to the vehicle's near end as it comes; never firmer than
+        // -2.0 m/s2 / 2.0 m/s3 from this rule (obstacle_stop brakes as it does for anything in the trajectory)
+        constexpr double STOP_MARGIN = 5.0;
+        const auto & pts = path.path.points;
+        const double d_kept = autoware::motion_utils::calcSignedArcLength(pts, getEgoPosition(), nero_frag_stop->at);
+        const double d_near = autoware::motion_utils::calcSignedArcLength(
+                                pts, getEgoPosition(), it->kinematics.initial_pose_with_covariance.pose.position) -
+                              0.5 * it->shape.dimensions.x - planner_data_->parameters.base_link2front;
+        const auto firm = autoware::motion_utils::calcDecelDistWithJerkAndAccConstraints(
+          getEgoSpeed(), 0.0, planner_data_->self_acceleration->accel.accel.linear.x, -2.0, 2.0, -2.0);
+        const double d =
+          std::max(std::min(d_kept, d_near - STOP_MARGIN), firm ? firm.value() : 0.0);
+        utils::static_obstacle_avoidance::insertDecelPoint(
+          getEgoPosition(), std::max(d, 0.0), 0.0, path.path, stop_pose_);
+        RCLCPP_INFO_THROTTLE(
+          getLogger(), *clock_, 1000,
+          "[NERO_SOA_FRAG] stop kept %.1f m ahead: the vehicle comes toward the robot (its near end %.1f m)", d, d_near);
+        return;
+      }
+      nero_frag_stop.reset();
     }
 
     if (!data.avoid_required) {
@@ -5730,11 +5842,46 @@ void StaticObstacleAvoidanceModule::addNewShiftLines(
   // Is it ok? This is a situation where the vehicle was originally going to avoid at the farther
   // point, but decided to avoid it at a closer point. In this case, it is reasonable to cancel the
   // farther avoidance.
+  // NERO_SOA_AMBIGUOUS_FRAGMENT (utils.cpp nero_frag): while a vehicle first avoided as its fragment is a target ahead
+  // whose approved shift does not keep the hard margin, a registered line in progress across the new line's start is
+  // kept up to that start and the new line takes over there (stock removed it when it ended later with a smaller shift:
+  // the proposed path then had no shift between ego and the new line -> "HUGE OFFSET", every new line invalid while
+  // the robot was part-way through the fragment's line; or kept it whole, overlapping the new line)
+  const bool keep_in_progress =
+    utils::static_obstacle_avoidance::nero_frag::on() &&
+    std::any_of(avoid_data_.target_objects.begin(), avoid_data_.target_objects.end(), [this](const auto & o) {
+      return o.longitudinal > 0.0 && utils::static_obstacle_avoidance::nero_frag::carried(o) &&
+             !utils::static_obstacle_avoidance::nero_frag::keepApprovedShortcut(
+               o, helper_->getShift(o.getPosition()), planner_data_->parameters.vehicle_width, parameters_);
+    });
+  // the junction at the first new line's start takes the current path's shift there (the generator starts a line
+  // from the linear shift: 0.56 m beside a standing robot whose path was at 0.73 m -> "offset at ego 0.15", for good)
+  double junction_shift = 0.0;
+  if (keep_in_progress) {
+    for (auto & sl : future) {
+      if (sl.start_idx != min_start_idx) continue;
+      junction_shift = helper_->getShift(sl.start.position);
+      sl.start_shift_length = junction_shift;
+    }
+  }
+  const auto cut_at_new_start = [&](ShiftLine sl) {
+    sl.end_idx = min_start_idx;
+    sl.end = path_shifter.getReferencePath().points.at(sl.end_idx).point.pose;
+    sl.end_shift_length = junction_shift;
+    future.push_back(sl);
+  };
+
   for (const auto & sl : current_shift_lines) {
     if (sl.start_idx >= min_start_idx) {
       RCLCPP_DEBUG(
         getLogger(), "sl.start_idx = %lu, this sl starts after new proposal. remove this one.",
         sl.start_idx);
+      continue;
+    }
+
+    // NERO_SOA_AMBIGUOUS_FRAGMENT: a line in progress across the new line's start hands over to it there
+    if (keep_in_progress && sl.end_idx > min_start_idx) {
+      cut_at_new_start(sl);
       continue;
     }
 
@@ -5794,6 +5941,11 @@ bool StaticObstacleAvoidanceModule::isValidShiftLine(
 
     constexpr double THRESHOLD = 0.1;
     const auto offset = std::abs(new_shift_length - helper_->getEgoShift());
+    if (offset > THRESHOLD && utils::static_obstacle_avoidance::nero_frag::debug()) {
+      RCLCPP_INFO(
+        getLogger(), "[NERO_SOA_VALID] invalid: offset at ego %.2f (new path %.2f, ego %.2f), lines kept %zu",
+        offset, new_shift_length, helper_->getEgoShift(), shifter_for_validate.getShiftLines().size());
+    }
     if (offset > THRESHOLD) {
       RCLCPP_DEBUG_THROTTLE(
         getLogger(), *clock_, 1000, "new shift line is invalid. [HUGE OFFSET (%.2f)]", offset);
@@ -5832,6 +5984,15 @@ bool StaticObstacleAvoidanceModule::isValidShiftLine(
         const auto shift_length = proposed_shift_path.shift_length.at(i);
         const auto THRESHOLD = minimum_distance + std::abs(shift_length);
 
+        if (
+          utils::static_obstacle_avoidance::nero_frag::debug() &&
+          boost::geometry::distance(basic_point, (shift_length > 0.0 ? left_bound : right_bound)) <
+            THRESHOLD) {
+          RCLCPP_INFO(
+            getLogger(), "[NERO_SOA_VALID] invalid: bound %.2f m < %.2f at shift %.2f (point %zu of %zu..%zu)",
+            boost::geometry::distance(basic_point, (shift_length > 0.0 ? left_bound : right_bound)), THRESHOLD,
+            shift_length, i, start_idx, end_idx);
+        }
         if (
           boost::geometry::distance(basic_point, (shift_length > 0.0 ? left_bound : right_bound)) <
           THRESHOLD) {

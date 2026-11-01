@@ -34,6 +34,13 @@
 
 namespace autoware::behavior_path_planner::utils::static_obstacle_avoidance
 {
+namespace nero_frag
+{
+bool keepApprovedShortcut(
+  const ObjectData & o, const double approved_shift, const double vehicle_width,
+  const std::shared_ptr<AvoidanceParameters> & parameters);
+}  // namespace nero_frag
+
 namespace
 {
 // NERO_SOA_NO_CHATTER (session 5, upstream #11046 without changing ObjectData's layout, which avoidance_by_lane_change
@@ -446,7 +453,12 @@ AvoidOutlines ShiftLineGenerator::generateAvoidOutline(
     const auto is_approved =
       (helper_->getShift(object.getPosition()) > 0.0 && is_object_on_right) ||
       (helper_->getShift(object.getPosition()) < 0.0 && !is_object_on_right);
-    if (is_approved) {
+    // NERO_SOA_AMBIGUOUS_FRAGMENT (utils.cpp nero_frag): a vehicle first avoided as its fragment is "approved" only
+    // when the approved shift reaches what the vehicle needs
+    if (
+      is_approved && nero_frag::keepApprovedShortcut(
+                       object, helper_->getShift(object.getPosition()),
+                       data_->parameters.vehicle_width, parameters_)) {
       return std::make_pair(desire_shift_length, avoidance_distance);
     }
 
@@ -600,8 +612,14 @@ AvoidOutlines ShiftLineGenerator::generateAvoidOutline(
 
     // calculate feasible shift length based on behavior policy
     const auto feasible_shift_profile = get_shift_profile(o, desire_shift_length);
+    // NERO_SOA_AMBIGUOUS_FRAGMENT: as in get_shift_profile (a vehicle first avoided as its fragment)
+    const auto approved_covers = [&]() {
+      return is_approved(o) &&
+             nero_frag::keepApprovedShortcut(
+               o, helper_->getShift(o.getPosition()), data_->parameters.vehicle_width, parameters_);
+    };
     if (!feasible_shift_profile.has_value()) {
-      if (is_approved(o)) {
+      if (approved_covers()) {
         // the avoidance path for this object has already approved
         o.is_avoidable = true;
         continue;
@@ -735,7 +753,7 @@ AvoidOutlines ShiftLineGenerator::generateAvoidOutline(
       outlines.emplace_back(al_avoid, std::nullopt);
     } else if (is_valid_shift_line(al_avoid) && is_valid_shift_line(al_return)) {
       outlines.emplace_back(al_avoid, al_return);
-    } else if (!is_approved(o)) {
+    } else if (!approved_covers()) {
       o.info = ObjectInfo::INVALID_SHIFT_LINE;
       continue;
     }

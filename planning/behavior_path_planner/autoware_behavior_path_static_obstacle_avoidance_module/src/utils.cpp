@@ -26,19 +26,25 @@
 #include <autoware_lanelet2_extension/utility/message_conversion.hpp>
 #include <autoware_lanelet2_extension/utility/query.hpp>
 #include <autoware_lanelet2_extension/utility/utilities.hpp>
+#include <magic_enum.hpp>
 
 #include <boost/geometry/algorithms/buffer.hpp>
 #include <boost/geometry/algorithms/convex_hull.hpp>
 #include <boost/geometry/algorithms/correct.hpp>
+#include <boost/geometry/algorithms/distance.hpp>
 #include <boost/geometry/algorithms/union.hpp>
 #include <boost/geometry/geometries/point_xy.hpp>
 
 #include <lanelet2_routing/RoutingGraphContainer.h>
+#include <tf2/utils.h>
 
 #include <algorithm>
+#include <array>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -324,6 +330,202 @@ bool isQueued(
   return false;
 }
 }  // namespace nero_filter
+
+// ---- nero (2026-10-30, retaa job, QUEUE RETAA): a standing vehicle first reported as an UNKNOWN fragment (one end of
+// the car) and later as a vehicle went down the ambiguous-vehicle tests (avoidance_for_ambiguous_vehicle.condition
+// th_stopped_time / th_moving_distance) with the fragment's history broken: on the same track id the moved distance was
+// measured from the FRAGMENT's first place, 1.9-2.4 m from the car's centre = "moved", never a target while it stood
+// (field 10-29 17:06 #4, passed at 0.25-0.29 m at 13 km/h); at a new track id the stop clock restarted = 3 s of "not a
+// target" with the robot coming up beside it (sim 0.17 m).
+//  NERO_SOA_AMBIGUOUS_FRAGMENT=m,g  a vehicle that stands (below its moving speed) where an UNKNOWN stood keeps that
+//                                   UNKNOWN's standing history when it becomes a vehicle: the UNKNOWN seen <= g s ago,
+//                                   its last place inside the vehicle's box + m, and not creeping (its mean velocity
+//                                   over th_stopped_time below 0.2 m/s and th_moving_distance / th_stopped_time). Then the stop
+//                                   clock runs from when the UNKNOWN started to stand and the moved distance counts
+//                                   from the vehicle's first place: on the same id (the registry entry of the fragment,
+//                                   or a new entry when the module instance was replaced) and for a NEW vehicle track
+//                                   never seen before (the longest-standing UNKNOWN inside its box). The history is the
+//                                   switch's own table, not the module instance's registry. A vehicle faster than its
+//                                   moving speed is unchanged (stop time 0); one that creeps > th_moving_distance from
+//                                   its first place is "moved" as before. Log: [NERO_SOA_FRAG] at each carry.
+//                                   ,t (3rd field, default 0.1 m): for such a vehicle the shift line generator's
+//                                   "avoidance path already approved" shortcut (any approved shift on the object's side
+//                                   = avoidable with the full desired shift, no feasibility check) holds only when the
+//                                   approved shift at the object keeps the hard margin + t (the robot's body hard +
+//                                   envelope buffer + t from the box): the fragment's line (0.90 m) was taken as approved
+//                                   for the car that needed 1.40 m (1.04 for the hard margin), the bigger line never
+//                                   became comfortable and the robot passed on the fragment's line (sim 0.17 m). Else
+//                                   the module's own checks decide (shift under the jerk limit, the best-effort shift
+//                                   that keeps the hard margin, or its stop: scene.cpp stops before such a vehicle at
+//                                   the module's stop line for it - or, when that is nearer than its max_deceleration
+//                                   stop distance, at the -2.0 m/s2 / 2.0 m/s3 one (firm; a hard brake is <= -2.5) -
+//                                   until a line that keeps the hard margin is registered (not for a vehicle with no
+//                                   room: INSUFFICIENT_DRIVABLE_SPACE stays as stock), and kept while that vehicle
+//                                   leaves the target list by coming toward the robot (> 0.2 m/s), then also obstacle_
+//                                   stop's 5 m stop margin to its near end; a line in progress across the
+//                                   new line's start hands over to it there at the path's actual shift, so the new line
+//                                   is valid while the robot is part-way through the fragment's line).
+//  NERO_SOA_AMBIGUOUS_DEBUG=1       logging only: one [NERO_SOA_AMB] line per vehicle and cycle on the vehicle path (stop
+//                                   time, moved distance, parked, margin, verdict); [NERO_SOA_VALID] why a new shift
+//                                   line is invalid
+namespace nero_frag
+{
+struct Env
+{
+  bool on{false};
+  double margin_m{0.5};
+  double gap_s{1.0};
+  double approved_tol_m{0.1};
+  bool debug{false};
+};
+
+const Env & env()
+{
+  static const Env e = [] {
+    Env r;
+    if (const char * v = std::getenv("NERO_SOA_AMBIGUOUS_FRAGMENT"); v && *v) {
+      r.on = std::sscanf(v, "%lf,%lf,%lf", &r.margin_m, &r.gap_s, &r.approved_tol_m) >= 1;
+    }
+    if (const char * v = std::getenv("NERO_SOA_AMBIGUOUS_DEBUG"); v) r.debug = std::atoi(v) > 0;
+    std::fprintf(
+      stderr, "[NERO_SOA] ambiguous_fragment=%d margin_m=%.2f gap_s=%.2f approved_tol_m=%.2f ambiguous_debug=%d\n",
+      r.on, r.margin_m, r.gap_s, r.approved_tol_m, r.debug);
+    return r;
+  }();
+  return e;
+}
+
+std::string hexId(const unique_identifier_msgs::msg::UUID & id)
+{
+  char s[9];
+  std::snprintf(s, sizeof(s), "%02x%02x%02x%02x", id.uuid[0], id.uuid[1], id.uuid[2], id.uuid[3]);
+  return s;
+}
+
+// what the module saw of each track id in its target area: its last place, and while it was an UNKNOWN its last place
+// and its mean velocity
+struct Track
+{
+  double t{0.0};
+  double ux{0.0}, uy{0.0}, ut{-1.0};  // last place / time as an UNKNOWN
+  double uvx{0.0}, uvy{0.0};          // velocity as an UNKNOWN in the map frame, averaged over ~th_stopped_time
+  double ustand_t{-1.0};              // the UNKNOWN stands (below its moving speed) since then (-1: moving)
+  double ufast_t{-1.0};               // the UNKNOWN is faster than its moving speed since then (-1: not)
+  bool carried{false};                // a vehicle that carries an UNKNOWN's standing history
+};
+using Key = std::array<uint8_t, 16>;
+
+std::map<Key, Track> & tracks()
+{
+  static std::map<Key, Track> m;
+  return m;
+}
+
+// the fragment's last place lies inside the vehicle's box (+ margin)
+bool insideBox(const PredictedObject & vehicle, const double x, const double y, const double margin)
+{
+  const auto & p = vehicle.kinematics.initial_pose_with_covariance.pose;
+  const double yaw = tf2::getYaw(p.orientation);
+  const double dx = x - p.position.x;
+  const double dy = y - p.position.y;
+  const double lon = std::cos(yaw) * dx + std::sin(yaw) * dy;
+  const double lat = -std::sin(yaw) * dx + std::cos(yaw) * dy;
+  if (vehicle.shape.type == autoware_perception_msgs::msg::Shape::BOUNDING_BOX) {
+    return std::abs(lon) <= 0.5 * vehicle.shape.dimensions.x + margin &&
+           std::abs(lat) <= 0.5 * vehicle.shape.dimensions.y + margin;
+  }
+  const auto poly = autoware_utils::to_polygon2d(vehicle);
+  return boost::geometry::distance(autoware_utils::Point2d(x, y), poly) <= margin;
+}
+
+bool on()
+{
+  return env().on;
+}
+
+bool debug()
+{
+  return env().debug;
+}
+
+// a vehicle that carries an UNKNOWN fragment's standing history
+bool carried(const ObjectData & o)
+{
+  if (!env().on) return false;
+  Key k;
+  std::copy(o.object.object_id.uuid.begin(), o.object.object_id.uuid.end(), k.begin());
+  const auto it = tracks().find(k);
+  return it != tracks().end() && it->second.carried;
+}
+
+// keep the "already approved" shortcut for this object? No for a carried vehicle whose approved shift at it does not
+// keep the hard margin + approved_tol_m (or lies on the other side)
+bool keepApprovedShortcut(
+  const ObjectData & o, const double approved_shift, const double vehicle_width,
+  const std::shared_ptr<AvoidanceParameters> & parameters)
+{
+  const auto & e = env();
+  if (!e.on || o.overhang_points.empty()) return true;
+  Key k;
+  std::copy(o.object.object_id.uuid.begin(), o.object.object_id.uuid.end(), k.begin());
+  const auto it = tracks().find(k);
+  if (it == tracks().end() || !it->second.carried) return true;
+  const auto & op = parameters->object_parameters.at(utils::getHighestProbLabel(o.object.classification));
+  const double hard = o.is_parked ? op.lateral_hard_margin_for_parked_vehicle : op.lateral_hard_margin;
+  const double need =
+    calcShiftLength(isOnRight(o), o.overhang_points.front().first, 0.5 * vehicle_width + hard + e.approved_tol_m);
+  if (approved_shift * need > 0.0 && std::abs(approved_shift) >= std::abs(need)) return true;
+  static rclcpp::Clock steady_clock(RCL_STEADY_TIME);
+  RCLCPP_INFO_THROTTLE(
+    rclcpp::get_logger(logger_namespace), steady_clock, 1000,
+    "[NERO_SOA_FRAG] %s: the approved shift at it %.2f m does not keep the hard margin (needs %.2f m): its "
+    "feasibility is checked",
+    hexId(o.object.object_id).c_str(), approved_shift, need);
+  return false;
+}
+
+// update the track table with this cycle's object (after the history decision); an UNKNOWN stops standing only after
+// moving_time of being faster than moving_v (as the module's registry)
+void see(
+  const ObjectData & o, const double now, const double avg_s, const double moving_v, const double moving_time)
+{
+  auto & m = tracks();
+  Key k;
+  std::copy(o.object.object_id.uuid.begin(), o.object.object_id.uuid.end(), k.begin());
+  auto & tr = m[k];
+  tr.t = now;  // first: an entry the history decision just made has t 0 and would be pruned below
+  static double last_prune = 0.0;
+  if (now - last_prune > 1.0) {  // ids unseen for 5 s, once a second (not per object)
+    last_prune = now;
+    for (auto it = m.begin(); it != m.end();) {
+      it = now - it->second.t > 5.0 ? m.erase(it) : std::next(it);
+    }
+  }
+  if (
+    utils::getHighestProbLabel(o.object.classification) !=
+    autoware_perception_msgs::msg::ObjectClassification::UNKNOWN) {
+    return;
+  }
+  const auto & p = o.object.kinematics.initial_pose_with_covariance.pose;
+  const auto & tw = o.object.kinematics.initial_twist_with_covariance.twist;
+  const double yaw = tf2::getYaw(p.orientation);
+  const double vx = std::cos(yaw) * tw.linear.x - std::sin(yaw) * tw.linear.y;
+  const double vy = std::sin(yaw) * tw.linear.x + std::cos(yaw) * tw.linear.y;
+  const double a = tr.ut < 0.0 ? 1.0 : std::clamp((now - tr.ut) / std::max(avg_s, 0.1), 0.0, 1.0);
+  tr.uvx += a * (vx - tr.uvx);
+  tr.uvy += a * (vy - tr.uvy);
+  if (std::hypot(tw.linear.x, tw.linear.y) > moving_v) {
+    if (tr.ufast_t < 0.0) tr.ufast_t = now;
+    if (now - tr.ufast_t > moving_time) tr.ustand_t = -1.0;
+  } else {
+    tr.ufast_t = -1.0;
+    if (tr.ustand_t < 0.0) tr.ustand_t = now;
+  }
+  tr.ux = p.position.x;
+  tr.uy = p.position.y;
+  tr.ut = now;
+}
+}  // namespace nero_frag
 
 namespace filtering_utils
 {
@@ -1827,6 +2029,45 @@ void fillObjectMovingTime(
   const auto is_new_object = same_id_obj == stopped_objects.end();
   const rclcpp::Time now = rclcpp::Clock(RCL_ROS_TIME).now();
 
+  // nero retaa: NERO_SOA_AMBIGUOUS_FRAGMENT (see nero_frag); the table is updated after the decision
+  const auto & nf = nero_frag::env();
+  struct SeeOnExit
+  {
+    const ObjectData & o;
+    double now, avg_s, moving_v, moving_time;
+    bool on;
+    ~SeeOnExit()
+    {
+      if (on) nero_frag::see(o, now, avg_s, moving_v, moving_time);
+    }
+  } see_on_exit{
+    object_data,
+    now.seconds(),
+    parameters->time_threshold_for_ambiguous_vehicle,
+    object_parameter.moving_speed_threshold,
+    object_parameter.moving_time_threshold,
+    nf.on};
+  const bool frag_check = nf.on && !is_faster_than_threshold &&
+                          object_type != ObjectClassification::UNKNOWN &&
+                          object_type != ObjectClassification::PEDESTRIAN &&
+                          object_type != ObjectClassification::BICYCLE;
+  // an UNKNOWN that stood where the vehicle stands now: its last place inside the vehicle's box (+ margin), seen within
+  // gap_s, standing in the registry (stop clock) and not creeping
+  // a creeping car (0.3-1.5 m/s) stays the give-way's / obstacle_stop's: below the module's own 1 m / 3 s and below
+  // 0.2 m/s (field standing fragments average < 0.05 m/s; a 0.3 m/s creeper was carried at 1 m / 3 s)
+  const double creep_v = std::min(
+    0.2, parameters->distance_threshold_for_ambiguous_vehicle /
+           std::max(parameters->time_threshold_for_ambiguous_vehicle, 0.1));
+  const auto fragmentOk = [&](const nero_frag::Track & tr) {
+    return tr.ut >= 0.0 && tr.ustand_t >= 0.0 && now.seconds() - tr.ut <= nf.gap_s &&
+           std::hypot(tr.uvx, tr.uvy) < creep_v &&
+           nero_frag::insideBox(object_data.object, tr.ux, tr.uy, nf.margin_m);
+  };
+  const auto pos = object_data.getPosition();
+  const auto since = [&](const double t) { return now - rclcpp::Duration::from_seconds(now.seconds() - t); };
+  nero_frag::Key key;
+  std::copy(id.uuid.begin(), id.uuid.end(), key.begin());
+
   if (!is_faster_than_threshold) {
     object_data.last_stop = now;
     object_data.move_time = 0.0;
@@ -1834,8 +2075,60 @@ void fillObjectMovingTime(
       object_data.init_pose = object_data.getPose();
       object_data.stop_time = 0.0;
       object_data.last_move = now;
+      if (frag_check) {
+        // the same id as a standing UNKNOWN (the module instance's registry is new), else a vehicle track never seen
+        // before: the longest-standing UNKNOWN inside its box
+        auto & m = nero_frag::tracks();
+        const auto self = m.find(key);
+        const nero_frag::Track * from = nullptr;
+        nero_frag::Key from_key = key;
+        if (self != m.end()) {
+          if (fragmentOk(self->second)) from = &self->second;
+        } else {
+          for (const auto & [k, tr] : m) {
+            if (fragmentOk(tr) && (from == nullptr || tr.ustand_t < from->ustand_t)) {
+              from = &tr;
+              from_key = k;
+            }
+          }
+        }
+        if (from != nullptr) {
+          m[key].carried = true;
+          object_data.last_move = since(from->ustand_t);
+          object_data.stop_time = (now - object_data.last_move).seconds();
+          unique_identifier_msgs::msg::UUID from_id;
+          std::copy(from_key.begin(), from_key.end(), from_id.uuid.begin());
+          RCLCPP_INFO(
+            rclcpp::get_logger(logger_namespace),
+            "[NERO_SOA_FRAG] %s %s (label %u) carries the standing history of UNKNOWN %s: its last place %.2f m "
+            "from the vehicle's centre, standing %.1f s, moved distance from here",
+            self != m.end() ? "same id" : "new id", nero_frag::hexId(id).c_str(), object_type,
+            nero_frag::hexId(from_id).c_str(), std::hypot(from->ux - pos.x, from->uy - pos.y),
+            object_data.stop_time);
+        }
+      }
       stopped_objects.push_back(object_data);
     } else {
+      if (
+        frag_check && utils::getHighestProbLabel(same_id_obj->object.classification) ==
+                        ObjectClassification::UNKNOWN) {
+        // registered as an UNKNOWN: the moved distance from the vehicle's first place
+        const auto self = nero_frag::tracks().find(key);
+        if (self != nero_frag::tracks().end() && fragmentOk(self->second)) {
+          const auto & tr = self->second;
+          if (since(tr.ustand_t) < same_id_obj->last_move) same_id_obj->last_move = since(tr.ustand_t);
+          RCLCPP_INFO(
+            rclcpp::get_logger(logger_namespace),
+            "[NERO_SOA_FRAG] same id %s UNKNOWN -> label %u carries its standing history: moved distance from the "
+            "vehicle's place (the fragment's first place was %.2f m away, its last %.2f m), standing %.1f s",
+            nero_frag::hexId(id).c_str(), object_type,
+            calc_distance2d(same_id_obj->init_pose, object_data.getPose()),
+            std::hypot(tr.ux - pos.x, tr.uy - pos.y), (now - same_id_obj->last_move).seconds());
+          same_id_obj->init_pose = object_data.getPose();
+          nero_frag::tracks()[key].carried = true;
+        }
+        same_id_obj->object.classification = object_data.object.classification;
+      }
       same_id_obj->stop_time = (now - same_id_obj->last_move).seconds();
       same_id_obj->last_stop = now;
       same_id_obj->move_time = 0.0;
@@ -2193,12 +2486,32 @@ void filterTargetObjects(
         filtering_utils::isParkedVehicle(o, data, planner_data->route_handler, parameters);
       o.avoid_margin = filtering_utils::getAvoidMargin(o, planner_data, parameters);
 
+      // nero retaa: NERO_SOA_AMBIGUOUS_DEBUG=1 (logging only)
+      const auto amb_debug = [&](const bool target) {
+        if (!nero_frag::env().debug) return;
+        const auto & tw = o.object.kinematics.initial_twist_with_covariance.twist;
+        RCLCPP_INFO(
+          rclcpp::get_logger(logger_namespace),
+          "[NERO_SOA_AMB] id %s label %u v %.2f stop %.2f moved %.2f parked %d ratio %.2f on_ego_lane %d "
+          "behavior %d long %.1f overhang %.2f shoulder %.2f margin %.2f info %s target %d",
+          nero_frag::hexId(o.object.object_id).c_str(),
+          utils::getHighestProbLabel(o.object.classification), std::hypot(tw.linear.x, tw.linear.y),
+          o.stop_time, calc_distance2d(o.init_pose, o.getPose()), o.is_parked, o.shiftable_ratio,
+          o.is_on_ego_lane, static_cast<int>(o.behavior), o.longitudinal,
+          o.overhang_points.empty() ? 0.0 : o.overhang_points.front().first, o.to_road_shoulder_distance,
+          o.avoid_margin.value_or(-1.0), magic_enum::enum_name(o.info).data(), target);
+      };
+
       if (filtering_utils::isNoNeedAvoidanceBehavior(o, parameters)) {
+        amb_debug(false);
         data.other_objects.push_back(o);
         continue;
       }
 
-      if (!filtering_utils::isSatisfiedWithVehicleCondition(o, data, planner_data, parameters)) {
+      const bool vehicle_condition =
+        filtering_utils::isSatisfiedWithVehicleCondition(o, data, planner_data, parameters);
+      amb_debug(vehicle_condition);
+      if (!vehicle_condition) {
         data.other_objects.push_back(o);
         continue;
       }
