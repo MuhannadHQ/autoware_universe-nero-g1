@@ -128,6 +128,9 @@ private:
     const types::DynamicObject & measurement, const types::InputChannel & channel,
     const rclcpp::Time & time, types::DynamicObject & seeded_measurement) const;
   bool neroCovers(const types::DynamicObject & vehicle, const types::DynamicObject & unknown) const;
+  // NERO_MOT_FLIP_DEFER (flipspeed): a published vehicle track at a judged track's place and its velocity
+  bool neroFindPartner(
+    const std::shared_ptr<Tracker> & tracker, const rclcpp::Time & time, double & vx, double & vy) const;
   bool neroStockRemoves(
     const std::shared_ptr<Tracker> & vehicle, const std::shared_ptr<Tracker> & unknown,
     const rclcpp::Time & time) const;

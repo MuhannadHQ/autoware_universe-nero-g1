@@ -106,6 +106,18 @@ public:
 
   bool limitStates();
 
+  // NERO_MOT_FLIP_DEFER (flipspeed): limitStates() would turn the object by 180 deg now
+  bool isBeyondReverseLimit() const
+  {
+    return motion_params_.max_reverse_vel < 0 &&
+           getStateElement(IDX::VEL) < motion_params_.max_reverse_vel;
+  }
+  // NERO_MOT_FLIP_DEFER (flipspeed): the speed's variance, the standing hypothesis (speed 0 with variance vel_cov and
+  // no correlation to the other states) and taking over another model's state
+  double getVelocityVariance() const;
+  bool holdStanding(const double vel_cov);
+  bool takeStateOf(const BicycleMotionModel & other);
+
   bool updateExtendedState(const double & length);
 
   bool predictStateStep(const double dt, KalmanFilter & ekf) const override;

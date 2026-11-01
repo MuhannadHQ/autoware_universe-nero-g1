@@ -39,6 +39,9 @@ public:
   MultipleVehicleTracker(const rclcpp::Time & time, const types::DynamicObject & object);
 
   bool predict(const rclcpp::Time & time) override;
+  bool neroJudgedUnpublished() const override;
+  void neroOnPublished(
+    const bool has_partner, const double partner_vx, const double partner_vy) override;
   bool measure(
     const types::DynamicObject & object, const rclcpp::Time & time,
     const types::InputChannel & channel_info) override;

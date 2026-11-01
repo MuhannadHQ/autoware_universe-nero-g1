@@ -33,6 +33,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <iterator>
+#include <limits>
 #include <map>
 #include <memory>
 #include <string>
@@ -123,6 +124,58 @@ void TrackerProcessor::update(
       (*(tracker_itr))->updateWithoutMeasurement(time);
     }
   }
+  if (VehicleTracker::neroFlipDeferEnabled()) {
+    // NERO_MOT_FLIP_DEFER: a vehicle track judging a turn that is published from now on is shown by what the vehicle
+    // track already at its place does
+    for (const auto & tracker : list_tracker_) {
+      if (!isConfidentTracker(tracker)) continue;
+      double partner_vx = 0.0;
+      double partner_vy = 0.0;
+      const bool has_partner = tracker->neroJudgedUnpublished() &&
+                               neroFindPartner(tracker, time, partner_vx, partner_vy);
+      tracker->neroOnPublished(has_partner, partner_vx, partner_vy);
+    }
+  }
+}
+
+bool TrackerProcessor::neroFindPartner(
+  const std::shared_ptr<Tracker> & tracker, const rclcpp::Time & time, double & vx, double & vy) const
+{
+  // NERO_MOT_FLIP_DEFER: the nearest published vehicle track whose centre lies in this track's box (+ 0.5 m)
+  types::DynamicObject object;
+  if (
+    !tracker->getTrackedObject(time, object) ||
+    object.shape.type != autoware_perception_msgs::msg::Shape::BOUNDING_BOX) {
+    return false;
+  }
+  const double yaw = tf2::getYaw(object.pose.orientation);
+  const double half_l = 0.5 * object.shape.dimensions.x + 0.5;
+  const double half_w = 0.5 * object.shape.dimensions.y + 0.5;
+  double best = std::numeric_limits<double>::max();
+  for (const auto & candidate : list_tracker_) {
+    if (
+      candidate == tracker ||
+      !autoware::object_recognition_utils::isCarLikeVehicle(candidate->getHighestProbLabel()) ||
+      candidate->neroJudgedUnpublished() || !isConfidentTracker(candidate)) {
+      continue;
+    }
+    types::DynamicObject other;
+    if (!candidate->getTrackedObject(time, other)) continue;
+    const double dx = other.pose.position.x - object.pose.position.x;
+    const double dy = other.pose.position.y - object.pose.position.y;
+    if (
+      std::abs(dx * std::cos(yaw) + dy * std::sin(yaw)) > half_l ||
+      std::abs(-dx * std::sin(yaw) + dy * std::cos(yaw)) > half_w) {
+      continue;
+    }
+    const double dist = std::hypot(dx, dy);
+    if (dist >= best) continue;
+    best = dist;
+    const double other_yaw = tf2::getYaw(other.pose.orientation);
+    vx = other.twist.linear.x * std::cos(other_yaw) - other.twist.linear.y * std::sin(other_yaw);
+    vy = other.twist.linear.x * std::sin(other_yaw) + other.twist.linear.y * std::cos(other_yaw);
+  }
+  return best < std::numeric_limits<double>::max();
 }
 
 void TrackerProcessor::spawn(

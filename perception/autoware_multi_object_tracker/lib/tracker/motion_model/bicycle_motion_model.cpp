@@ -281,6 +281,40 @@ bool BicycleMotionModel::limitStates()
   return true;
 }
 
+double BicycleMotionModel::getVelocityVariance() const
+{
+  Eigen::MatrixXd P_t(DIM, DIM);
+  ekf_.getP(P_t);
+  return P_t(IDX::VEL, IDX::VEL);
+}
+
+bool BicycleMotionModel::holdStanding(const double vel_cov)
+{
+  // check if the state is initialized
+  if (!checkInitialized()) return false;
+
+  Eigen::MatrixXd X_t(DIM, 1);
+  Eigen::MatrixXd P_t(DIM, DIM);
+  ekf_.getX(X_t);
+  ekf_.getP(P_t);
+  X_t(IDX::VEL) = 0.0;
+  P_t.row(IDX::VEL).setZero();
+  P_t.col(IDX::VEL).setZero();
+  P_t(IDX::VEL, IDX::VEL) = vel_cov;
+  ekf_.init(X_t, P_t);
+  return true;
+}
+
+bool BicycleMotionModel::takeStateOf(const BicycleMotionModel & other)
+{
+  // both models were predicted and updated together: same time and extended state
+  Eigen::MatrixXd X_t(DIM, 1);
+  Eigen::MatrixXd P_t(DIM, DIM);
+  other.getStateVector(X_t);
+  other.ekf_.getP(P_t);
+  return ekf_.init(X_t, P_t);
+}
+
 bool BicycleMotionModel::updateExtendedState(const double & length)
 {
   lf_ = std::max(length * motion_params_.lf_ratio, motion_params_.lf_min);

@@ -115,6 +115,14 @@ protected:
 public:
   virtual bool getTrackedObject(const rclcpp::Time & time, types::DynamicObject & object) const = 0;
   virtual bool predict(const rclcpp::Time & time) = 0;
+  // NERO_MOT_FLIP_DEFER (flipspeed): a vehicle track judging a turn that has not been published yet
+  virtual bool neroJudgedUnpublished() const { return false; }
+  // the track is published from now on; a published vehicle track whose centre lies in its box (the same object)
+  // and that track's velocity, if there is one
+  virtual void neroOnPublished(
+    const bool /*has_partner*/, const double /*partner_vx*/, const double /*partner_vy*/)
+  {
+  }
 };
 
 }  // namespace autoware::multi_object_tracker

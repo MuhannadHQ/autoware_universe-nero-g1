@@ -41,10 +41,28 @@ bool MultipleVehicleTracker::measure(
   const types::DynamicObject & object, const rclcpp::Time & time,
   const types::InputChannel & channel_info)
 {
+  if (VehicleTracker::neroFlipDeferEnabled()) {
+    // NERO_MOT_FLIP_DEFER: the object's uuid in the vehicle models' log lines
+    big_vehicle_tracker_.neroSetLogName(object_.uuid, "big");
+    normal_vehicle_tracker_.neroSetLogName(object_.uuid, "nrm");
+  }
   big_vehicle_tracker_.measure(object, time, channel_info);
   normal_vehicle_tracker_.measure(object, time, channel_info);
 
   return true;
+}
+
+bool MultipleVehicleTracker::neroJudgedUnpublished() const
+{
+  return big_vehicle_tracker_.neroJudgedUnpublished() ||
+         normal_vehicle_tracker_.neroJudgedUnpublished();
+}
+
+void MultipleVehicleTracker::neroOnPublished(
+  const bool has_partner, const double partner_vx, const double partner_vy)
+{
+  big_vehicle_tracker_.neroOnPublished(has_partner, partner_vx, partner_vy);
+  normal_vehicle_tracker_.neroOnPublished(has_partner, partner_vx, partner_vy);
 }
 
 bool MultipleVehicleTracker::getTrackedObject(

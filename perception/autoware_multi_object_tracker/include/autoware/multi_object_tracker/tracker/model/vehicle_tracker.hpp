@@ -26,6 +26,10 @@
 
 #include <autoware/kalman_filter/kalman_filter.hpp>
 
+#include <algorithm>
+#include <array>
+#include <optional>
+
 namespace autoware::multi_object_tracker
 {
 
@@ -41,6 +45,34 @@ private:
 
   BicycleMotionModel motion_model_;
   using IDX = BicycleMotionModel::IDX;
+
+  // NERO_MOT_FLIP_DEFER (flipspeed): after a sudden reverse speed the track is held as standing and the object turned
+  // by 180 deg (as stock turns it) runs beside it on the same measurements until they show which one is right
+  std::optional<BicycleMotionModel> nero_turned_;
+  std::array<double, 8> nero_v_hist_t_{};         // the last updates: their time [s] and the speed before them
+  std::array<double, 8> nero_v_hist_v_{};
+  int nero_v_hist_n_{0};
+  int nero_turned_count_{0};                      // measured positions since the sudden reverse speed
+  std::array<double, 8> nero_turned_t_{};         // [s] after the first one
+  std::array<double, 8> nero_turned_along_{};     // [m] along the turned heading
+  double nero_turned_ux_{1.0};
+  double nero_turned_uy_{0.0};
+  double nero_turned_x_{0.0};
+  double nero_turned_y_{0.0};
+  rclcpp::Time nero_turned_time_;
+  rclcpp::Time nero_now_;
+  double nero_hold_pvv_{1.0};
+  bool nero_published_{false};       // the track has been published
+  bool nero_hold_published_{false};  // ... already when it was held
+  bool nero_hold_own_still_{false};  // when held, its own speeds over >= t_judge never moved the turned way
+  bool nero_show_turned_{false};     // published while judged without having been published before: shows the turned
+  const char * nero_first_pub_{""};  // what the vehicle track at its place said at its first publication (log)
+  std::array<uint8_t, 4> nero_log_uuid_{};
+  const char * nero_log_model_{""};
+  bool updateMotionModel(
+    BicycleMotionModel & motion_model, const types::DynamicObject & object,
+    const bool is_yaw_available) const;
+  void neroAddTurnedPosition(const types::DynamicObject & object, const rclcpp::Time & time);
 
 public:
   struct Options
@@ -65,6 +97,21 @@ public:
     const types::DynamicObject & object, const types::InputChannel & channel_info);
   bool measureWithShape(const types::DynamicObject & object);
   bool getTrackedObject(const rclcpp::Time & time, types::DynamicObject & object) const override;
+
+  // NERO_MOT_FLIP_DEFER (flipspeed): switch state and the names its log lines use
+  static bool neroFlipDeferEnabled();
+  // decide a judged turn once its positions span t_judge
+  void neroDecideTurned();
+  // a turn is judged and the track has not been published yet
+  bool neroJudgedUnpublished() const override { return nero_turned_.has_value() && !nero_published_; }
+  // the track is published from now on (with the vehicle track already at its place, if any)
+  void neroOnPublished(
+    const bool has_partner, const double partner_vx, const double partner_vy) override;
+  void neroSetLogName(const unique_identifier_msgs::msg::UUID & uuid, const char * model)
+  {
+    std::copy(uuid.uuid.begin(), uuid.uuid.begin() + 4, nero_log_uuid_.begin());
+    nero_log_model_ = model;
+  }
 };
 
 }  // namespace autoware::multi_object_tracker

@@ -40,6 +40,56 @@
 
 namespace autoware::multi_object_tracker
 {
+namespace
+{
+// NERO_MOT_FLIP_DEFER=<dv_min m/s>,<v_floor m/s>,<v_move m/s>,<t_judge s>,<sigma_stand m/s> (flipspeed, 2026-10-30;
+// unset = stock). The bicycle model turns a track by 180 deg as soon as its speed estimate falls below -5 km/h. On a
+// new or young track that estimate is the jump of the box centre between two frames (initial speed variance
+// (1000 km/h)^2), so the jitter of a standing vehicle's box turns it and gives it a speed. A SUDDEN reverse speed (the
+// speed before the update >= v_floor, i.e. not already reverse, and the update took it down by >= dv_min; or a clearly
+// forward speed >= -v_floor before an update of this frame or the one before and down by >= dv_min since: two
+// channels and duplicate boxes update a track several times per frame) is not turned at once: the track keeps its heading and reports speed 0 (with the speed
+// variance of the update, so it gates measurements as widely as the turned one) and the object turned as stock turns
+// it runs beside it on the same measurements. Once the measured positions since the jump span t_judge, their
+// least-squares speed decides: along the turned heading >= v_move, or after the jump <= -v_move with the turned state
+// itself back on the held heading at >= v_move = it moves: the track takes the turned state as is (what stock
+// publishes); else it stands: speed 0 with sigma_stand, its heading kept. A track already published when held shows
+// the held state while judged; one first published while judged shows what the vehicle track already at its place
+// says (the same object seen twice): it moves the turned way = the turn is taken at once; it stands = the held state;
+// none = the turned state.
+struct NeroFlipDefer
+{
+  bool enabled{false};
+  double dv_min{1.0};
+  double v_floor{-0.5};
+  double v_move{1.0};
+  double t_judge{0.2};
+  double sigma_stand{1.0};
+  NeroFlipDefer()
+  {
+    if (const char * env = std::getenv("NERO_MOT_FLIP_DEFER"); env != nullptr && env[0] != '\0') {
+      enabled =
+        std::sscanf(env, "%lf,%lf,%lf,%lf,%lf", &dv_min, &v_floor, &v_move, &t_judge, &sigma_stand) == 5;
+      if (enabled) {
+        RCLCPP_INFO(
+          rclcpp::get_logger("VehicleTracker"),
+          "[NERO_MOT_FLIP_DEFER] on: dv_min %.2f v_floor %.2f v_move %.2f t_judge %.2f sigma_stand %.2f", dv_min,
+          v_floor, v_move, t_judge, sigma_stand);
+      }
+    }
+  }
+};
+const NeroFlipDefer & neroFlipDefer()
+{
+  static const NeroFlipDefer defer;
+  return defer;
+}
+}  // namespace
+
+bool VehicleTracker::neroFlipDeferEnabled()
+{
+  return neroFlipDefer().enabled;
+}
 
 VehicleTracker::Options VehicleTracker::options{};
 VehicleTracker::VehicleTracker(
@@ -137,7 +187,46 @@ VehicleTracker::VehicleTracker(
 
 bool VehicleTracker::predict(const rclcpp::Time & time)
 {
+  if (nero_turned_) nero_turned_->predictState(time);
   return motion_model_.predictState(time);
+}
+
+bool VehicleTracker::updateMotionModel(
+  BicycleMotionModel & motion_model, const types::DynamicObject & object,
+  const bool is_yaw_available) const
+{
+  // velocity capability is checked only when the object has velocity measurement
+  // and the predicted velocity is close to the observed velocity
+  bool is_velocity_available = false;
+  if (object.kinematics.has_twist) {
+    const double tracked_vel = motion_model.getStateElement(IDX::VEL);
+    const double & observed_vel = object.twist.linear.x;
+    if (std::fabs(tracked_vel - observed_vel) < velocity_deviation_threshold_) {
+      // Velocity deviation is small
+      is_velocity_available = true;
+    }
+  }
+
+  const double x = object.pose.position.x;
+  const double y = object.pose.position.y;
+  const double yaw = tf2::getYaw(object.pose.orientation);
+  const double vel = object.twist.linear.x;
+
+  if (is_yaw_available && is_velocity_available) {
+    // update with yaw angle and velocity
+    return motion_model.updateStatePoseHeadVel(
+      x, y, yaw, object.pose_covariance, vel, object.twist_covariance);
+  } else if (is_yaw_available && !is_velocity_available) {
+    // update with yaw angle, but without velocity
+    return motion_model.updateStatePoseHead(x, y, yaw, object.pose_covariance);
+  } else if (!is_yaw_available && is_velocity_available) {
+    // update without yaw angle, but with velocity
+    return motion_model.updateStatePoseVel(
+      x, y, object.pose_covariance, vel, object.twist_covariance);
+  }
+  // update without yaw angle and velocity
+  return motion_model.updateStatePose(
+    x, y, object.pose_covariance);  // update without yaw angle and velocity
 }
 
 bool VehicleTracker::measureWithPose(
@@ -162,41 +251,80 @@ bool VehicleTracker::measureWithPose(
     }
   }
 
-  // velocity capability is checked only when the object has velocity measurement
-  // and the predicted velocity is close to the observed velocity
-  bool is_velocity_available = false;
-  if (object.kinematics.has_twist) {
-    const double tracked_vel = motion_model_.getStateElement(IDX::VEL);
-    const double & observed_vel = object.twist.linear.x;
-    if (std::fabs(tracked_vel - observed_vel) < velocity_deviation_threshold_) {
-      // Velocity deviation is small
-      is_velocity_available = true;
+  // NERO_MOT_FLIP_DEFER: the speed before this update, and the highest speed before any update of this frame and the
+  // one before it (two channels and duplicate boxes can take a clearly forward speed below the turn limit in several
+  // updates of one frame)
+  const auto & defer = neroFlipDefer();
+  const bool nero_may_hold = defer.enabled && !nero_turned_;
+  double nero_v_before = 0.0;
+  double nero_v_frames = 0.0;
+  if (defer.enabled) {
+    constexpr double nero_ref_window = 0.15;  // [s] this frame and the one before at 10 Hz
+    nero_v_before = motion_model_.getStateElement(IDX::VEL);
+    nero_v_frames = nero_v_before;
+    for (int i = 0; i < static_cast<int>(nero_v_hist_t_.size()); ++i) {
+      if (nero_v_hist_n_ > i && nero_now_.seconds() - nero_v_hist_t_[i] <= nero_ref_window) {
+        nero_v_frames = std::max(nero_v_frames, nero_v_hist_v_[i]);
+      }
     }
+    const int k = nero_v_hist_n_ % static_cast<int>(nero_v_hist_t_.size());
+    nero_v_hist_t_[k] = nero_now_.seconds();
+    nero_v_hist_v_[k] = nero_v_before;
+    ++nero_v_hist_n_;
   }
 
   // update
   bool is_updated = false;
   {
-    const double x = object.pose.position.x;
-    const double y = object.pose.position.y;
-    const double yaw = tf2::getYaw(object.pose.orientation);
-    const double vel = object.twist.linear.x;
-
-    if (is_yaw_available && is_velocity_available) {
-      // update with yaw angle and velocity
-      is_updated = motion_model_.updateStatePoseHeadVel(
-        x, y, yaw, object.pose_covariance, vel, object.twist_covariance);
-    } else if (is_yaw_available && !is_velocity_available) {
-      // update with yaw angle, but without velocity
-      is_updated = motion_model_.updateStatePoseHead(x, y, yaw, object.pose_covariance);
-    } else if (!is_yaw_available && is_velocity_available) {
-      // update without yaw angle, but with velocity
-      is_updated = motion_model_.updateStatePoseVel(
-        x, y, object.pose_covariance, vel, object.twist_covariance);
-    } else {
-      // update without yaw angle and velocity
-      is_updated = motion_model_.updateStatePose(
-        x, y, object.pose_covariance);  // update without yaw angle and velocity
+    is_updated = updateMotionModel(motion_model_, object, is_yaw_available);
+    if (nero_turned_) {
+      updateMotionModel(*nero_turned_, object, is_yaw_available);
+      nero_turned_->limitStates();
+      // NERO_MOT_FLIP_DEFER: still judged: the held track follows the positions and reports speed 0
+      motion_model_.holdStanding(nero_hold_pvv_);
+    }
+    const double nero_v_after = motion_model_.getStateElement(IDX::VEL);
+    const bool nero_sudden =
+      (nero_v_before >= defer.v_floor && nero_v_before - nero_v_after >= defer.dv_min) ||
+      (nero_v_frames >= -defer.v_floor && nero_v_frames - nero_v_after >= defer.dv_min);
+    if (nero_may_hold && nero_sudden && motion_model_.isBeyondReverseLimit()) {
+      const double nero_v_ref =
+        nero_v_before >= defer.v_floor && nero_v_before - nero_v_after >= defer.dv_min ? nero_v_before
+                                                                                      : nero_v_frames;
+      // NERO_MOT_FLIP_DEFER: a sudden reverse speed of an unconfirmed track: held as standing, the turn is judged
+      nero_turned_.emplace(motion_model_);
+      nero_turned_->limitStates();
+      nero_turned_count_ = 0;
+      nero_hold_published_ = nero_published_;
+      // the track's own speeds before this one (the ring, incl. the speed before this update): spanning >= t_judge
+      // and never below -v_move = it did not move the turned way before the jump
+      {
+        const int n = std::min(nero_v_hist_n_, static_cast<int>(nero_v_hist_t_.size()));
+        double t_oldest = nero_now_.seconds();
+        double v_min = nero_v_before;
+        for (int i = 0; i < n; ++i) {
+          t_oldest = std::min(t_oldest, nero_v_hist_t_[i]);
+          v_min = std::min(v_min, nero_v_hist_v_[i]);
+        }
+        nero_hold_own_still_ = nero_now_.seconds() - t_oldest >= defer.t_judge && v_min > -defer.v_move;
+      }
+      nero_show_turned_ = false;
+      nero_first_pub_ = "";
+      nero_turned_ux_ = std::cos(nero_turned_->getStateElement(IDX::YAW));
+      nero_turned_uy_ = std::sin(nero_turned_->getStateElement(IDX::YAW));
+      RCLCPP_INFO(
+        logger_,
+        "[NERO_MOT_FLIP_DEFER] %02x%02x%02x%02x %s hold: t %.2f at (%.2f, %.2f): yaw %.0f v %.2f -> %.2f "
+        "(sigma %.2f) would turn to yaw %.0f v %.2f",
+        nero_log_uuid_[0], nero_log_uuid_[1], nero_log_uuid_[2], nero_log_uuid_[3], nero_log_model_,
+        nero_now_.seconds(),
+        motion_model_.getStateElement(IDX::X), motion_model_.getStateElement(IDX::Y),
+        motion_model_.getStateElement(IDX::YAW) * 180.0 / M_PI, nero_v_ref,
+        motion_model_.getStateElement(IDX::VEL), std::sqrt(motion_model_.getVelocityVariance()),
+        nero_turned_->getStateElement(IDX::YAW) * 180.0 / M_PI, nero_turned_->getStateElement(IDX::VEL));
+      nero_hold_pvv_ =
+        std::max(motion_model_.getVelocityVariance(), defer.sigma_stand * defer.sigma_stand);
+      motion_model_.holdStanding(nero_hold_pvv_);
     }
     motion_model_.limitStates();
   }
@@ -242,6 +370,7 @@ bool VehicleTracker::measureWithShape(const types::DynamicObject & object)
 
   // update motion model
   motion_model_.updateExtendedState(object_extension.x);
+  if (nero_turned_) nero_turned_->updateExtendedState(object_extension.x);
 
   // update offset into object position
   {
@@ -252,6 +381,13 @@ bool VehicleTracker::measureWithShape(const types::DynamicObject & object)
     const double offset_y_global =
       tracking_offset_.x() * std::sin(yaw) + tracking_offset_.y() * std::cos(yaw);
     motion_model_.adjustPosition(-gain * offset_x_global, -gain * offset_y_global);
+    if (nero_turned_) {
+      // NERO_MOT_FLIP_DEFER: the turned hypothesis as stock would adjust it (with its own yaw)
+      const double yaw_turned = nero_turned_->getStateElement(IDX::YAW);
+      nero_turned_->adjustPosition(
+        -gain * (tracking_offset_.x() * std::cos(yaw_turned) - tracking_offset_.y() * std::sin(yaw_turned)),
+        -gain * (tracking_offset_.x() * std::sin(yaw_turned) + tracking_offset_.y() * std::cos(yaw_turned)));
+    }
     // update offset (object coordinate)
     tracking_offset_.x() = gain_inv * tracking_offset_.x();
     tracking_offset_.y() = gain_inv * tracking_offset_.y();
@@ -277,12 +413,133 @@ bool VehicleTracker::measure(
   // update object
   types::DynamicObject updating_object = in_object;
   shapes::calcAnchorPointOffset(object_, tracking_offset_, updating_object);
+  nero_now_ = time;
   measureWithPose(updating_object, channel_info);
   if (channel_info.trust_extension) {
     measureWithShape(updating_object);
   }
+  if (nero_turned_) {
+    // NERO_MOT_FLIP_DEFER: the measured positions since the sudden reverse speed decide
+    neroAddTurnedPosition(updating_object, time);
+    neroDecideTurned();
+  }
 
   return true;
+}
+
+void VehicleTracker::neroOnPublished(
+  const bool has_partner, const double partner_vx, const double partner_vy)
+{
+  const bool first = !nero_published_;
+  nero_published_ = true;
+  if (!nero_turned_ || nero_hold_published_ || !first) return;
+  // a track first published while judged. A vehicle track already published at its place (its centre in this box) is
+  // the same object seen twice, and its own motion tells whether the turn is real: it moves the turned way: the turn
+  // is taken now; it stands: the held (standing) state is shown until the decision. With no such track the turned
+  // state (what stock publishes) is shown until the decision, unless the track's own speeds before the jump spanned
+  // >= t_judge without moving the turned way (a box that jumped back on a tracked vehicle): then the held state.
+  if (!has_partner) {
+    nero_show_turned_ = !nero_hold_own_still_;
+    nero_first_pub_ = nero_hold_own_still_
+                        ? " (first published while judged: no vehicle track at its place; its own speeds before the "
+                          "jump did not move the turned way)"
+                        : " (first published while judged: no vehicle track at its place)";
+    return;
+  }
+  const double yaw_turned = nero_turned_->getStateElement(IDX::YAW);
+  const double v_partner = partner_vx * std::cos(yaw_turned) + partner_vy * std::sin(yaw_turned);
+  if (v_partner < neroFlipDefer().v_move) {
+    nero_show_turned_ = false;
+    nero_first_pub_ = " (first published while judged: the vehicle track at its place does not move the turned way)";
+    return;
+  }
+  RCLCPP_INFO(
+    logger_,
+    "[NERO_MOT_FLIP_DEFER] %02x%02x%02x%02x %s moving: turned: t %.2f at (%.2f, %.2f) first published while judged: "
+    "the vehicle track at its place moves %.2f m/s along the turned heading; held yaw %.0f v %.2f, turned yaw %.0f "
+    "v %.2f",
+    nero_log_uuid_[0], nero_log_uuid_[1], nero_log_uuid_[2], nero_log_uuid_[3], nero_log_model_,
+    nero_turned_time_.seconds(), nero_turned_x_, nero_turned_y_, v_partner,
+    motion_model_.getStateElement(IDX::YAW) * 180.0 / M_PI, motion_model_.getStateElement(IDX::VEL),
+    nero_turned_->getStateElement(IDX::YAW) * 180.0 / M_PI, nero_turned_->getStateElement(IDX::VEL));
+  motion_model_.takeStateOf(*nero_turned_);
+  nero_turned_.reset();
+  nero_show_turned_ = false;
+}
+
+void VehicleTracker::neroAddTurnedPosition(
+  const types::DynamicObject & object, const rclcpp::Time & time)
+{
+  const double along =
+    object.pose.position.x * nero_turned_ux_ + object.pose.position.y * nero_turned_uy_;
+  if (nero_turned_count_ == 0) {
+    nero_turned_time_ = time;
+    nero_turned_x_ = object.pose.position.x;
+    nero_turned_y_ = object.pose.position.y;
+  }
+  const double t = (time - nero_turned_time_).seconds();
+  if (nero_turned_count_ > 0 && t - nero_turned_t_[nero_turned_count_ - 1] < 0.02) {
+    // another channel of a frame already counted
+    return;
+  }
+  if (nero_turned_count_ >= static_cast<int>(nero_turned_t_.size())) return;
+  nero_turned_t_[nero_turned_count_] = t;
+  nero_turned_along_[nero_turned_count_] = along;
+  ++nero_turned_count_;
+}
+
+void VehicleTracker::neroDecideTurned()
+{
+  const auto & defer = neroFlipDefer();
+  if (!nero_turned_ || nero_turned_count_ < 2) return;
+  if (nero_turned_t_[nero_turned_count_ - 1] < defer.t_judge - 0.02) return;
+  // least-squares speed of the measured positions along the turned heading: from the jump on, and after it
+  const auto slope = [this](const int first) {
+    const int n = nero_turned_count_ - first;
+    if (n < 2) return 0.0;
+    double mt = 0.0, ma = 0.0;
+    for (int i = first; i < nero_turned_count_; ++i) {
+      mt += nero_turned_t_[i];
+      ma += nero_turned_along_[i];
+    }
+    mt /= n;
+    ma /= n;
+    double stt = 0.0, sta = 0.0;
+    for (int i = first; i < nero_turned_count_; ++i) {
+      stt += (nero_turned_t_[i] - mt) * (nero_turned_t_[i] - mt);
+      sta += (nero_turned_t_[i] - mt) * (nero_turned_along_[i] - ma);
+    }
+    return stt < 1e-6 ? 0.0 : sta / stt;
+  };
+  const double v_turned = slope(0);
+  const double v_after = slope(1);
+  // it moves the turned way (the turn was right), or after the jump it moves the way it was heading (the reverse
+  // speed was wrong, not the motion) and the stock state has turned back to that heading with that motion (a box
+  // that jumped back and returns, jitter, leaves the stock state turned or slow): either way the stock state is the
+  // object's
+  const double yaw_held = motion_model_.getStateElement(IDX::YAW);
+  const double yaw_turned = nero_turned_->getStateElement(IDX::YAW);
+  const bool turned_back = std::cos(yaw_turned - yaw_held) > 0.0 &&
+                           nero_turned_->getStateElement(IDX::VEL) >= defer.v_move;
+  const bool moving =
+    v_turned >= defer.v_move || (v_after <= -defer.v_move && turned_back);
+  RCLCPP_INFO(
+    logger_,
+    "[NERO_MOT_FLIP_DEFER] %02x%02x%02x%02x %s %s: t %.2f at (%.2f, %.2f) measured %.2f m/s along the turned "
+    "heading (%.2f after the jump) over %.2f s%s; held yaw %.0f v %.2f, turned yaw %.0f v %.2f",
+    nero_log_uuid_[0], nero_log_uuid_[1], nero_log_uuid_[2], nero_log_uuid_[3], nero_log_model_,
+    moving ? "moving: turned" : "standing: kept", nero_turned_time_.seconds(), nero_turned_x_, nero_turned_y_,
+    v_turned, v_after, nero_turned_t_[nero_turned_count_ - 1],
+    nero_hold_published_ ? " (published when held)" : nero_first_pub_,
+    motion_model_.getStateElement(IDX::YAW) * 180.0 / M_PI, motion_model_.getStateElement(IDX::VEL),
+    nero_turned_->getStateElement(IDX::YAW) * 180.0 / M_PI, nero_turned_->getStateElement(IDX::VEL));
+  if (moving) {
+    motion_model_.takeStateOf(*nero_turned_);
+  } else {
+    motion_model_.holdStanding(defer.sigma_stand * defer.sigma_stand);
+  }
+  nero_turned_.reset();
+  nero_show_turned_ = false;
 }
 
 bool VehicleTracker::getTrackedObject(
@@ -295,7 +552,9 @@ bool VehicleTracker::getTrackedObject(
   auto & pose_cov = object.pose_covariance;
   auto & twist = object.twist;
   auto & twist_cov = object.twist_covariance;
-  if (!motion_model_.getPredictedState(time, pose, pose_cov, twist, twist_cov)) {
+  // NERO_MOT_FLIP_DEFER: a track first published while judged shows the turned state until it is decided
+  const auto & model = nero_turned_ && nero_show_turned_ ? *nero_turned_ : motion_model_;
+  if (!model.getPredictedState(time, pose, pose_cov, twist, twist_cov)) {
     RCLCPP_WARN(logger_, "VehicleTracker::getTrackedObject: Failed to get predicted state.");
     return false;
   }
