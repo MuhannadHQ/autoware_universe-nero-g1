@@ -212,6 +212,69 @@ bool nero_crossing_hold_debug()
   return on;
 }
 
+// NERO_IX_CROSSING_HOLD_STOOD=<stood s>,<band_min m>,<band_max m>,<sustain s>[,<cycles>,<band window s>,
+//   <lag s>]
+// (besidebus job, 2026-10-30, QUEUE XBES): a vehicle standing BESIDE ego's approach counts as a
+// mover (the crosser and no-start rules of NERO_IX_CROSSING_HOLD) only once it really moves. 10-29
+// 20:47 at 62830 the robot, 0.5 m into its left turn at 0.64 m/s, was stopped where it was for a
+// bus that stood 2.7 m to its right all minute: perception's box (growth with its front end,
+// TRUCK <-> BUS) gave the bus a speed >= <v_min> for a cycle, map_based_prediction then gave it a
+// lane path along ego's own turn lane, and its place beside ego (1.2 m) was the conflict. The car's
+// tracker reports >= 0.5 m/s for standing vehicles in 80 episodes of 1-12 cycles in 165 s of the
+// 10-27 bag. With this switch, for a labelled vehicle (not UNKNOWN, a bounding box) whose centre is
+// beside ego's approach (in the frame of the path where it crosses the stop line: -10..+6 m along,
+// 1.0-4.5 m to either side, heading within 45 deg of the approach; recorded from ego's nose 20 m
+// before the line on) whose speed reads >= <v_min> after it stood (its centre within <band_max> m
+// of its mean over the <stood> s that end <lag> s (default 0.5: the tracker's speed lags a real
+// start by ~0.4 s, so the start's first motion stays out of the noise) before these reports began),
+// a report counts only once BOTH ends of its box have moved along the reported velocity beyond
+// their own noise (each end's largest deviation from that mean over the <band window> s before then
+// (default <stood>), + <band_min> m, at most <band_max> m) in <cycles> cycles in a row (default 1),
+// or the reports have lasted <sustain> s; until then it is treated as below <v_min> in that cycle
+// (the 10-27 bag's real starts: counted at their first report). The same vehicle beside the
+// approach is a slow mover ("moved >= 1 m in 5 s") only as far as the LESS-moved end of its box
+// moved (a box growing 2.3 m with its front end moves its centre 1.15 m: the sim's car stack held
+// the robot 1.8 s at the line for it), and a vehicle that let ego go moves again (crosswait's
+// re-arm) only with a report counted as above. A vehicle that did not stand (moved within <stood>
+// s, or seen for less), is not beside the approach or is UNKNOWN: unchanged (Apollo's prediction
+// keeps an obstacle still unless its position drifts beyond its noise: Obstacle::SetMotionStatus).
+// Logged once per vehicle when its reports are not counted, when they are, when they end
+// uncounted, and when its box ends keep it from being a slow mover. Unset = the above exactly.
+struct NeroCrossingStoodParam
+{
+  bool on{false};
+  double stood{2.0};
+  double band_min{0.2};
+  double band_max{1.0};
+  double sustain{1.3};
+  int cycles{1};
+  double window{2.0};
+  double lag{0.5};
+};
+
+const NeroCrossingStoodParam & nero_crossing_stood_param()
+{
+  static const NeroCrossingStoodParam p = [] {
+    NeroCrossingStoodParam r;
+    const char * e = std::getenv("NERO_IX_CROSSING_HOLD_STOOD");
+    if (e == nullptr || std::string(e).empty()) return r;
+    double v[7] = {r.stood, r.band_min, r.band_max, r.sustain, 1.0, -1.0, r.lag};
+    const int n = std::sscanf(
+      e, "%lf,%lf,%lf,%lf,%lf,%lf,%lf", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5], &v[6]);
+    if (n < 1) return r;
+    r.on = true;
+    r.stood = std::max(0.5, v[0]);
+    r.band_min = std::max(0.0, v[1]);
+    r.band_max = std::max(r.band_min, v[2]);
+    r.sustain = std::max(0.1, v[3]);
+    r.cycles = std::max(1, static_cast<int>(std::lround(v[4])));
+    r.window = v[5] > 0.0 ? std::max(r.stood, v[5]) : r.stood;
+    r.lag = std::max(0.0, v[6]);
+    return r;
+  }();
+  return p;
+}
+
 // the stop lines of the lane's stop signs (traffic_sign whose sign is a stop_sign -> its ref_line)
 std::vector<lanelet::ConstLineString3d> nero_stop_sign_lines(const lanelet::ConstLanelet & ll)
 {
@@ -354,6 +417,236 @@ void IntersectionModule::neroCrossingHold(PathWithLaneId * path)
     }
   }
   if (!s_line) return reset();
+  // NERO_IX_CROSSING_HOLD_STOOD: the labelled vehicles beside ego's approach (in the frame of the
+  // path where it crosses the stop line), recorded from ego's nose 20 m before the line on
+  const auto & sp = nero_crossing_stood_param();
+  const double nose_rec = front - s_line.value();
+  struct StoodPlace
+  {
+    double along{0.0}, lat{0.0};
+  };
+  auto stood_place = [&](const geometry_msgs::msg::Point & q) {
+    const auto & f = *nero_xh_stood_frame_;
+    const double dx = q.x - f.x, dy = q.y - f.y;
+    return StoodPlace{
+      dx * std::cos(f.yaw) + dy * std::sin(f.yaw), -dx * std::sin(f.yaw) + dy * std::cos(f.yaw)};
+  };
+  auto stood_beside = [&](const autoware_perception_msgs::msg::PredictedObject & o) {
+    if (!nero_xh_stood_frame_ || !isTargetCollisionVehicleType(o)) return false;
+    if (
+      o.classification.empty() ||
+      o.classification.front().label ==
+        autoware_perception_msgs::msg::ObjectClassification::UNKNOWN ||
+      o.shape.type != autoware_perception_msgs::msg::Shape::BOUNDING_BOX)
+      return false;
+    const auto & q = o.kinematics.initial_pose_with_covariance.pose;
+    const auto pl = stood_place(q.position);
+    const double dyaw = std::abs(
+      autoware_utils::normalize_radian(tf2::getYaw(q.orientation) - nero_xh_stood_frame_->yaw));
+    return pl.along >= -10.0 && pl.along <= 6.0 && std::abs(pl.lat) >= 1.0 &&
+           std::abs(pl.lat) <= 4.5 && dyaw < M_PI / 4.0;
+  };
+  const double t_stood = rclcpp::Time(planner_data_->predicted_objects->header.stamp).seconds();
+  if (sp.on) {
+    if (!nero_xh_stood_logged_) {
+      nero_xh_stood_logged_ = true;
+      RCLCPP_INFO(
+        logger_,
+        "[NERO_IX] crossing_hold: lane %ld vehicles that stood beside ego's approach count as "
+        "moving only once both box ends moved beyond their noise (stood %.1f s within %.2f m, band "
+        "+%.2f m up to %.2f m over %.1f s, ending %.1f s before the reports, %d cycle(s)) or after "
+        "%.1f s of reports",
+        lane_id_, sp.stood, sp.band_max, sp.band_min, sp.band_max, sp.window, sp.lag, sp.cycles,
+        sp.sustain);
+    }
+    const bool rec = nose_rec >= -20.0 && nose_rec <= p.depth;
+    if (rec && !nero_xh_stood_frame_) {
+      const auto lp =
+        autoware::motion_utils::calcLongitudinalOffsetPose(path->points, ego_pos, s_line.value());
+      if (lp) {
+        nero_xh_stood_frame_ =
+          NeroStoodFrame{lp->position.x, lp->position.y, tf2::getYaw(lp->orientation)};
+      }
+    }
+    for (const auto & o : planner_data_->predicted_objects->objects) {
+      if (!rec || !stood_beside(o)) continue;
+      const std::string key = uuidKey(o.object_id);
+      auto & h = nero_xh_stood_hist_[key];
+      if (!h.empty() && t_stood - h.back().t <= 0.05) continue;
+      const auto & q = o.kinematics.initial_pose_with_covariance.pose;
+      const auto & tw = o.kinematics.initial_twist_with_covariance.twist.linear;
+      h.push_back(
+        {t_stood, q.position.x, q.position.y, tf2::getYaw(q.orientation), o.shape.dimensions.x,
+         std::hypot(tw.x, tw.y), std::atan2(tw.y, tw.x)});
+      const auto st = nero_xh_stood_state_.find(key);
+      if (h.back().v < p.v_min && st != nero_xh_stood_state_.end()) {
+        if (st->second.logged && !st->second.counted) {
+          RCLCPP_INFO(
+            logger_,
+            "[NERO_IX] crossing_hold: lane %ld %s beside ego's approach below %.1f m/s again "
+            "after %.1f s, never moved beyond its noise (ego v %.2f, nose %+.2f)",
+            lane_id_, autoware_utils::to_hex_string(o.object_id).substr(0, 4).c_str(), p.v_min,
+            t_stood - st->second.run_t, planner_data_->current_velocity->twist.linear.x, nose_rec);
+        }
+        nero_xh_stood_state_.erase(st);
+      }
+    }
+    // keep <band window> + <lag> + <sustain> s and the slow movers' 5 s; a vehicle not beside the
+    // approach for 2 s is forgotten
+    const double keep = std::max(sp.window + sp.lag + sp.sustain, 5.0) + 0.5;
+    for (auto it = nero_xh_stood_hist_.begin(); it != nero_xh_stood_hist_.end();) {
+      auto & h = it->second;
+      while (!h.empty() && t_stood - h.front().t > keep) {
+        h.pop_front();
+      }
+      if (h.empty() || t_stood - h.back().t > 2.0) {
+        nero_xh_stood_state_.erase(it->first);
+        nero_xh_stood_shape_.erase(it->first);
+        it = nero_xh_stood_hist_.erase(it);
+      } else {
+        ++it;
+      }
+    }
+  }
+  // whether this cycle's report >= <v_min> of a vehicle that stood beside ego's approach is not
+  // counted yet (its box has not moved beyond its own noise)
+  auto stood_quiet = [&](
+                       const autoware_perception_msgs::msg::PredictedObject & o,
+                       const std::string & key, const std::string & id, const double v_ego,
+                       const double nose) {
+    if (!sp.on || !stood_beside(o)) return false;
+    const auto hit = nero_xh_stood_hist_.find(key);
+    if (hit == nero_xh_stood_hist_.end() || hit->second.empty()) return false;
+    const auto & h = hit->second;
+    const auto & q = h.back();  // this cycle's sample
+    if (q.v < p.v_min) return false;
+    // its current run of reports >= <v_min>
+    size_t j0 = h.size() - 1;
+    while (j0 > 0 && h[j0 - 1].v >= p.v_min && h[j0].t - h[j0 - 1].t < 0.3) --j0;
+    const double t_run = h[j0].t;
+    auto & st = nero_xh_stood_state_[key];
+    if (st.run_t != t_run) st = NeroStoodState{t_run, false, false, 0};
+    if (st.counted) return false;
+    if (st.cyc_t == q.t) return st.cyc_quiet;  // judged already in this cycle
+    st.cyc_t = q.t;
+    st.cyc_quiet = false;
+    const int label = o.classification.front().label;
+    const auto pl = stood_place(o.kinematics.initial_pose_with_covariance.pose.position);
+    if (q.t - t_run >= sp.sustain) {
+      st.counted = true;
+      if (st.logged) {
+        RCLCPP_INFO(
+          logger_,
+          "[NERO_IX] crossing_hold: lane %ld %s (class %d, %.1f m/s) beside ego's approach "
+          "reported >= %.1f m/s for %.1f s: counted as moving (ego v %.2f, nose %+.2f)",
+          lane_id_, id.c_str(), label, q.v, p.v_min, q.t - t_run, v_ego, nose);
+      }
+      return false;
+    }
+    // it stood: its centre within <band_max> of its mean over the <stood> s ending <lag> s before
+    // the run (samples [w0, we))
+    size_t we = j0;
+    while (we > 0 && h[we - 1].t >= t_run - sp.lag) --we;
+    size_t w0 = we;
+    while (w0 > 0 && h[w0 - 1].t >= t_run - sp.lag - sp.stood) --w0;
+    const size_t n = we - w0;
+    if (n < 5 || t_run - sp.lag - h[w0].t < sp.stood - 0.25) {
+      st.counted = true;  // seen for less: as the car
+      return false;
+    }
+    double mx = 0.0, my = 0.0, sy = 0.0, cy = 0.0;
+    for (size_t k = w0; k < we; ++k) {
+      mx += h[k].x / static_cast<double>(n);
+      my += h[k].y / static_cast<double>(n);
+      sy += std::sin(h[k].yaw);
+      cy += std::cos(h[k].yaw);
+    }
+    double dev = 0.0;
+    for (size_t k = w0; k < we; ++k) dev = std::max(dev, std::hypot(h[k].x - mx, h[k].y - my));
+    if (dev > sp.band_max) {
+      st.counted = true;  // it moved: as the car
+      return false;
+    }
+    // its box ends (headings folded onto their mean: a 180 deg flip swaps nothing) against their
+    // mean over that window and their largest deviation over the <band window> s ending there,
+    // along the reported velocity
+    const double axis = std::atan2(sy, cy);
+    auto end_of = [&](const NeroStoodSample & s, const double sgn) {
+      const double hy = std::cos(s.yaw - axis) >= 0.0 ? s.yaw : s.yaw + M_PI;
+      return std::make_pair(
+        s.x + sgn * 0.5 * s.l * std::cos(hy), s.y + sgn * 0.5 * s.l * std::sin(hy));
+    };
+    const double vd = q.yaw + q.vdir;
+    const double wx = std::cos(vd), wy = std::sin(vd);
+    size_t b0 = we;
+    while (b0 > 0 && h[b0 - 1].t >= t_run - sp.lag - sp.window) --b0;
+    double d[2], thr[2];
+    for (int e = 0; e < 2; ++e) {
+      const double sgn = e == 0 ? 1.0 : -1.0;
+      double ex = 0.0, ey = 0.0;
+      for (size_t k = w0; k < we; ++k) {
+        const auto pe = end_of(h[k], sgn);
+        ex += pe.first / static_cast<double>(n);
+        ey += pe.second / static_cast<double>(n);
+      }
+      double band = 0.0;
+      for (size_t k = b0; k < we; ++k) {
+        const auto pe = end_of(h[k], sgn);
+        band = std::max(band, std::abs((pe.first - ex) * wx + (pe.second - ey) * wy));
+      }
+      thr[e] = std::min(band + sp.band_min, sp.band_max);
+      const auto pn = end_of(q, sgn);
+      d[e] = (pn.first - ex) * wx + (pn.second - ey) * wy;
+    }
+    st.beyond = d[0] > thr[0] && d[1] > thr[1] ? st.beyond + 1 : 0;
+    if (st.beyond >= sp.cycles) {
+      st.counted = true;
+      if (st.logged) {
+        RCLCPP_INFO(
+          logger_,
+          "[NERO_IX] crossing_hold: lane %ld %s (class %d, %.1f m/s) beside ego's approach moves "
+          "after %.1f s of reports: front %+.2f > %.2f m, rear %+.2f > %.2f m: counted as moving "
+          "(ego v %.2f, nose %+.2f)",
+          lane_id_, id.c_str(), label, q.v, q.t - t_run, d[0], thr[0], d[1], thr[1], v_ego, nose);
+      }
+      return false;
+    }
+    if (!st.logged) {
+      st.logged = true;
+      RCLCPP_INFO(
+        logger_,
+        "[NERO_IX] crossing_hold: lane %ld %s (class %d, %.1f m/s) stood beside ego's approach "
+        "(%.1f m %s, %+.1f m along from the line; centre within %.2f m for %.1f s): front %+.2f / "
+        "rear %+.2f m against its noise %.2f / %.2f m: not counted as moving (ego v %.2f, nose "
+        "%+.2f)",
+        lane_id_, id.c_str(), label, q.v, std::abs(pl.lat), pl.lat > 0.0 ? "left" : "right",
+        pl.along, dev, sp.stood, d[0], d[1], thr[0], thr[1], v_ego, nose);
+    }
+    st.cyc_quiet = true;
+    return true;
+  };
+  // how far the front / rear end of the box of a labelled vehicle beside ego's approach moved since
+  // <t_from> (its sample within 0.3 s after it; headings folded: a 180 deg flip swaps nothing)
+  auto stood_ends_moved = [&](
+                            const autoware_perception_msgs::msg::PredictedObject & o,
+                            const std::string & key,
+                            const double t_from) -> std::optional<std::pair<double, double>> {
+    if (!sp.on || !stood_beside(o)) return std::nullopt;
+    const auto hit = nero_xh_stood_hist_.find(key);
+    if (hit == nero_xh_stood_hist_.end() || hit->second.size() < 2) return std::nullopt;
+    const auto & h = hit->second;
+    const auto a = std::find_if(
+      h.begin(), h.end(), [&](const NeroStoodSample & s) { return s.t >= t_from - 0.05; });
+    if (a == h.end() || a->t - t_from > 0.3) return std::nullopt;
+    const auto & b = h.back();
+    const double ya = a->yaw, yb = std::cos(b.yaw - ya) >= 0.0 ? b.yaw : b.yaw + M_PI;
+    auto d_end = [&](const double sgn) {
+      return std::hypot(
+        b.x + sgn * 0.5 * b.l * std::cos(yb) - (a->x + sgn * 0.5 * a->l * std::cos(ya)),
+        b.y + sgn * 0.5 * b.l * std::sin(yb) - (a->y + sgn * 0.5 * a->l * std::sin(ya)));
+    };
+    return std::make_pair(d_end(1.0), d_end(-1.0));
+  };
   const double nose_past = front - s_line.value();  // + = ego's nose past the line
   if (nose_past < -2.0 || nose_past > p.depth) return reset();
 
@@ -637,7 +930,21 @@ void IntersectionModule::neroCrossingHold(PathWithLaneId * path)
           standing && nose_past <= 2.5 && v < p.v_slow && t_obj - std::get<0>(ph.front()) >= 2.5 &&
           (!conflict || dbg_wait)) {
           const double x0 = std::get<1>(ph.front()), y0 = std::get<2>(ph.front());
-          const double moved = std::hypot(opose.position.x - x0, opose.position.y - y0);
+          double moved = std::hypot(opose.position.x - x0, opose.position.y - y0);
+          // NERO_IX_CROSSING_HOLD_STOOD: beside ego's approach, as far as its less-moved box end
+          if (const auto em = stood_ends_moved(object, key, std::get<0>(ph.front()))) {
+            const double m_end = std::min(em->first, em->second);
+            if (moved >= 1.0 && m_end < 1.0 && nero_xh_stood_shape_.insert(key).second) {
+              RCLCPP_INFO(
+                logger_,
+                "[NERO_IX] crossing_hold: lane %ld %s (class %d) beside ego's approach: centre "
+                "moved %.2f m in %.1f s, its box ends %.2f / %.2f m (front / rear): not a slow "
+                "mover (ego stood %.1f s, nose %+.2f)",
+                lane_id_, id.c_str(), label, moved, t_obj - std::get<0>(ph.front()), em->first,
+                em->second, ego_stood, nose_past);
+            }
+            moved = std::min(moved, m_end);
+          }
           double d_way = std::numeric_limits<double>::infinity(), d_then = d_way;
           for (const auto & e : ego) {
             d_way = std::min(d_way, std::hypot(opose.position.x - e.c.x, opose.position.y - e.c.y));
@@ -687,8 +994,10 @@ void IntersectionModule::neroCrossingHold(PathWithLaneId * path)
           const auto yv = yield_view();
           // moving again: reported >= <v_min> in its last two samples, and not away from the way (a
           // truck pulling out along a line parallel to ego's exit lane closes on it only a little)
+          // (NERO_IX_CROSSING_HOLD_STOOD: and counted as moving)
           const bool moving_again = hist.size() >= 2 && std::prev(hist.end())->second >= p.v_min &&
-                                    std::prev(hist.end(), 2)->second >= p.v_min;
+                                    std::prev(hist.end(), 2)->second >= p.v_min &&
+                                    !stood_quiet(object, key, id, v0, nose_past);
           if (!revoked && !yv.behind && moving_again && yv.closing > 0.05) {
             nero_xh_letgo_.erase(key);
             nero_xh_revoked_.insert(key);
@@ -729,6 +1038,9 @@ void IntersectionModule::neroCrossingHold(PathWithLaneId * path)
         }
       }
     }
+    // NERO_IX_CROSSING_HOLD_STOOD: a vehicle that stood beside ego's approach and whose box has not
+    // moved beyond its own noise is below <v_min> this cycle
+    if (v >= p.v_min && stood_quiet(object, key, id, v0, nose_past)) continue;
     if (v < p.v_min) continue;
     if (nero_xh_committed_.count(key)) {
       ++n_committed;

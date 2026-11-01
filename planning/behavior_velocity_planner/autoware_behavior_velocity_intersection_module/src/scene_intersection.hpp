@@ -481,6 +481,32 @@ private:
   std::set<std::string> nero_xh_committed_;
   //! speed history of the target objects, uuidKey() -> (objects stamp, speed)
   std::map<std::string, std::deque<std::pair<double, double>>> nero_xh_vhist_;
+  //! NERO_IX_CROSSING_HOLD_STOOD (besidebus, 2026-10-30): the labelled vehicles beside ego's approach, uuidKey() -> their
+  //! samples (objects stamp, centre, yaw, length, speed, velocity direction in the object frame), each one's current run
+  //! of reports >= v_min (start, counted, logged, cycles in a row beyond its noise, this cycle's verdict), the path's pose
+  //! at the stop line and the vehicles logged as no slow mover (their box changed its shape, its ends did not move)
+  struct NeroStoodSample
+  {
+    double t, x, y, yaw, l, v, vdir;
+  };
+  struct NeroStoodState
+  {
+    double run_t{-1.0};
+    bool counted{false};
+    bool logged{false};
+    int beyond{0};
+    double cyc_t{-1.0};
+    bool cyc_quiet{false};
+  };
+  struct NeroStoodFrame
+  {
+    double x, y, yaw;
+  };
+  std::map<std::string, std::deque<NeroStoodSample>> nero_xh_stood_hist_;
+  std::map<std::string, NeroStoodState> nero_xh_stood_state_;
+  std::optional<NeroStoodFrame> nero_xh_stood_frame_;
+  std::set<std::string> nero_xh_stood_shape_;
+  bool nero_xh_stood_logged_{false};
   //! position history of slow vehicles, uuidKey() -> (objects stamp, x, y)
   std::map<std::string, std::deque<std::tuple<double, double, double>>> nero_xh_phist_;
   //! NERO_IX_CROSSING_HOLD_YIELD (crosswait, 2026-10-29): objects stamp since which ego stands in the hold zone (< 0:
