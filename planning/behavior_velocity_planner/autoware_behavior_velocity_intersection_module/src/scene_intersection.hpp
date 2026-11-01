@@ -25,6 +25,7 @@
 #include <autoware/behavior_velocity_planner_common/utilization/state_machine.hpp>
 #include <autoware/behavior_velocity_rtc_interface/scene_module_interface_with_rtc.hpp>
 #include <autoware/motion_utils/marker/virtual_wall_marker_creator.hpp>
+#include <autoware_utils/geometry/boost_geometry.hpp>  // NERO_IX_PRIORITY_NO_EXIT
 #include <rclcpp/rclcpp.hpp>
 
 #include <autoware_internal_debug_msgs/msg/float64_multi_array_stamped.hpp>
@@ -35,6 +36,7 @@
 #include <lanelet2_routing/Forward.h>
 
 #include <map>
+#include <array>
 #include <deque>
 #include <limits>
 #include <memory>
@@ -608,6 +610,12 @@ private:
     //! APPROACH_PRIORITY: (index of a YIELD_PRIORITY_ROAD lane ahead, distance from this lane's end to its stop line)
     std::vector<std::pair<size_t, double>> to_line;
     double turn_sign{0.0};  //! YIELD_PRIORITY_ROAD (NERO_IX_PRIORITY_SWING): +1 the turn goes to the left, -1 right
+    //! NERO_IX_PRIORITY_NO_EXIT: APPROACH_PRIORITY: the fastest way on from it (any exit it leads into, 6 m/s2
+    //! sideways); YIELD_PRIORITY_ROAD: the slowest of its entries' (infinity = not known / not in scope)
+    double v_exit_max{std::numeric_limits<double>::infinity()};
+    //! NERO_IX_PRIORITY_NO_EXIT: SIBLING that is itself a turn (>= 20 deg) off an approach whose every way on is a turn
+    //! (a T mouth's other turn): not a straight lane for the "turning off its straight lane" test
+    bool turn_sibling{false};
   };
   std::optional<std::vector<NeroPriorityLane>> nero_priority_lanes_{std::nullopt};
   //! uuidKey() of attention objects treated as yielding to ego this cycle (NERO_IX_PRIORITY_FROM_SIGNS)
@@ -645,6 +653,26 @@ private:
   //! NERO_IX_PRIORITY_SWING: cars seen swinging toward a turn (uuidKey() + "L" / "R"; on at the threshold, off below
   //! half of it)
   mutable std::set<std::string> nero_priority_swinging_;
+  //! NERO_IX_PRIORITY_NO_EXIT (2026-10-30): the judged car is faster than every way on from its approach and cannot
+  //! stop at its line (set by the verdict)
+  mutable bool nero_priority_no_exit_now_{false};
+  //! NERO_IX_PRIORITY_NO_EXIT: such cars, uuidKey() -> steady time last flagged (their straight path is checked)
+  std::map<std::string, double> nero_priority_no_exit_;
+  //! NERO_IX_PRIORITY_NO_EXIT: the direction of the lane the judged car was flagged on (set by the verdict), and per
+  //! flagged car (uuidKey() -> yaw): its band also covers it until its own direction of motion is known
+  mutable double nero_priority_no_exit_lane_yaw_{0.0};
+  std::map<std::string, double> nero_priority_no_exit_lane_yaws_;
+  //! NERO_IX_PRIORITY_NO_EXIT: the collision stop now held was made only by such cars (their uuidKey()s)
+  bool nero_no_exit_only_stop_{false};
+  std::set<std::string> nero_no_exit_stop_uuids_;
+  //! NERO_IX_PRIORITY_NO_EXIT: position history of the cars with a priority verdict, uuidKey() -> (stamp, x, y): their
+  //! direction of motion over the last second (the tracker's heading is noisier)
+  std::map<std::string, std::vector<std::array<double, 3>>> nero_priority_xy_hist_;
+  //! NERO_IX_PRIORITY_NO_EXIT: this cycle's straight swept band of each such car, uuidKey() -> polygon
+  std::map<std::string, autoware_utils::Polygon2d> nero_no_exit_bands_;
+  //! NERO_IX_PRIORITY_NO_EXIT: the stop pose that keeps ego the margin from such a band, and when it was last needed
+  std::optional<geometry_msgs::msg::Pose> nero_no_exit_stop_pose_{std::nullopt};
+  double nero_no_exit_stop_time_{-1e9};
   //! NERO_IX_PRIORITY_DEBUG (log only): the last verdict's numbers, uuidKey() -> text
   mutable std::string nero_priority_dbg_;
   std::map<std::string, std::string> nero_priority_dbg_text_;
@@ -993,6 +1021,16 @@ private:
    * if an UNSAFE wrong-way object is ahead of ego on its own lane and ego can stop no harsher
    * than wrong_way_watch.max_decel, else nullopt
    */
+  /**
+   * @brief NERO_IX_PRIORITY_NO_EXIT: if a car that can take no way on is UNSAFE, the path index (inserted into *path)
+   * where ego stops to keep the switch's margin from its straight swept band (closest_idx if ego is already there);
+   * nullopt if no such car or the band is not on ego's path. The stop point is kept for 1.5 s after the last cycle
+   * that needed it (the collision hold).
+   */
+  std::optional<size_t> neroNoExitStopIndex(
+    autoware_internal_planning_msgs::msg::PathWithLaneId * path,
+    const InterpolatedPathInfo & interpolated_path_info, const size_t closest_idx);
+
   std::optional<size_t> findWrongWayWatchStopIndex(
     const autoware_internal_planning_msgs::msg::PathWithLaneId & path,
     const PathLanelets & path_lanelets, const size_t closest_idx);

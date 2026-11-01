@@ -28,9 +28,12 @@
 #include <autoware_utils/geometry/geometry.hpp>
 #include <autoware_utils/ros/uuid_helper.hpp>
 
+#include <boost/geometry/algorithms/intersects.hpp>  // NERO_IX_PRIORITY_NO_EXIT
 #include <boost/geometry/algorithms/within.hpp>
 
 #include <lanelet2_core/geometry/Polygon.h>
+#include <tf2/utils.h>  // NERO_IX_PRIORITY_NO_EXIT
+#include <fmt/format.h>  // NERO_IX_PRIORITY_NO_EXIT
 #include <lanelet2_core/primitives/BasicRegulatoryElements.h>
 #include <lanelet2_core/primitives/CompoundPolygon.h>
 #include <lanelet2_core/primitives/Lanelet.h>
@@ -351,9 +354,52 @@ DecisionResult IntersectionModule::modifyPathVelocityDetail(PathWithLaneId * pat
     return yield_stuck;
   }
 
+  // NERO_IX_PRIORITY_NO_EXIT: is this cycle's collision only from cars that can take no way on (judged from first
+  // sight, before their braking can show)?
+  bool nero_nx_unsafe = false, nero_other_unsafe = nero_sight_.unsafe;
+  std::set<std::string> nero_nx_unsafe_uuids;
+  if (!nero_priority_no_exit_.empty() || nero_no_exit_only_stop_) {
+    for (const auto & object_info : object_info_manager_.attentionObjects()) {
+      if (!object_info->unsafe_info()) continue;
+      const auto key = uuidKey(object_info->predicted_object().object_id);
+      const auto it = nero_priority_no_exit_.find(key);
+      if (it != nero_priority_no_exit_.end() && nero_creep_steady_now() - it->second < 2.0) {
+        nero_nx_unsafe = true;
+        nero_nx_unsafe_uuids.insert(key);
+      } else {
+        nero_other_unsafe = true;
+      }
+    }
+  }
+  const bool nero_was_stop = collision_state_machine_.getState() == StateMachine::State::STOP;
   collision_state_machine_.setStateWithMarginTime(
     (has_collision || nero_sight_.unsafe) ? StateMachine::State::STOP : StateMachine::State::GO,
     logger_.get_child("collision state_machine"), *clock_);
+  // NERO_IX_PRIORITY_NO_EXIT: a stop made only by such cars ends without the collision hold once each of them is judged
+  // yielding again (seen braking toward its line: a late braker, a signal as for any car); anything else that was
+  // unsafe meanwhile keeps the hold
+  if (has_collision && !nero_was_stop) {
+    nero_no_exit_only_stop_ = nero_nx_unsafe && !nero_other_unsafe;
+    nero_no_exit_stop_uuids_ = nero_nx_unsafe_uuids;
+  } else if (has_collision || nero_other_unsafe) {
+    nero_no_exit_only_stop_ = nero_no_exit_only_stop_ && !nero_other_unsafe;
+    nero_no_exit_stop_uuids_.insert(nero_nx_unsafe_uuids.begin(), nero_nx_unsafe_uuids.end());
+  }
+  if (
+    !has_collision && nero_no_exit_only_stop_ && !nero_no_exit_stop_uuids_.empty() &&
+    collision_state_machine_.getState() == StateMachine::State::STOP &&
+    std::all_of(nero_no_exit_stop_uuids_.begin(), nero_no_exit_stop_uuids_.end(), [&](const auto & k) {
+      return nero_priority_yield_uuids_.count(k) > 0;
+    })) {
+    collision_state_machine_.setState(StateMachine::State::GO);
+    nero_no_exit_only_stop_ = false;
+    nero_no_exit_stop_uuids_.clear();
+    nero_no_exit_stop_pose_ = std::nullopt;
+    RCLCPP_INFO(
+      logger_, "[NERO_IX] priority no_exit: lane %ld the no-exit car is braking toward its line: stop released",
+      lane_id_);
+  }
+  if (collision_state_machine_.getState() == StateMachine::State::GO) nero_no_exit_only_stop_ = false;
   const bool has_collision_with_margin =
     collision_state_machine_.getState() == StateMachine::State::STOP;
 
@@ -441,8 +487,18 @@ DecisionResult IntersectionModule::modifyPathVelocityDetail(PathWithLaneId * pat
   }
   // Only collision
   if (!is_occlusion_state && has_collision_with_margin) {
+    // NERO_IX_PRIORITY_NO_EXIT: a car that can take no way on goes straight across: ego stops where it keeps the margin
+    // from that straight band (the default stop line is drawn for the turn lanes' area)
+    auto nero_occlusion_stopline_idx = occlusion_stopline_idx;
+    if (const auto nx_idx = neroNoExitStopIndex(path, interpolated_path_info, closest_idx)) {
+      if (nx_idx.value() > closest_idx && nero_occlusion_stopline_idx >= nx_idx.value()) {
+        ++nero_occlusion_stopline_idx;  // the inserted point shifts the indices after it
+      }
+      if (nx_idx.value() > closest_idx && collision_stopline_idx >= nx_idx.value()) ++collision_stopline_idx;
+      collision_stopline_idx = std::min(collision_stopline_idx, nx_idx.value());
+    }
     return NonOccludedCollisionStop{
-      closest_idx, collision_stopline_idx, occlusion_stopline_idx, occlusion_diag};
+      closest_idx, collision_stopline_idx, nero_occlusion_stopline_idx, occlusion_diag};
   }
   // Occluded
   // utility functions
@@ -1391,6 +1447,88 @@ void IntersectionModule::updateTrafficSignalObservation()
   }
   last_tl_valid_observation_ = tl_info_opt.value();
   internal_debug_data_.tl_observation = tl_info_opt.value();
+}
+
+std::optional<size_t> IntersectionModule::neroNoExitStopIndex(
+  autoware_internal_planning_msgs::msg::PathWithLaneId * path,
+  const InterpolatedPathInfo & interpolated_path_info, const size_t closest_idx)
+{
+  // NERO_IX_PRIORITY_NO_EXIT=<margin m>: see scene_intersection_collision.cpp
+  static const double margin = [] {
+    const char * v = std::getenv("NERO_IX_PRIORITY_NO_EXIT");
+    return (v == nullptr || std::string(v).empty()) ? -1.0 : std::atof(v);
+  }();
+  if (margin <= 0.0 || path->points.empty()) return std::nullopt;
+  static const bool dbg_nx = [] {  // NERO_IX_PRIORITY_DEBUG=1: log only
+    const char * v = std::getenv("NERO_IX_PRIORITY_DEBUG");
+    return v != nullptr && std::string(v) == "1";
+  }();
+  const double now = nero_creep_steady_now();
+  std::vector<const autoware_utils::Polygon2d *> bands;
+  for (const auto & object_info : object_info_manager_.attentionObjects()) {
+    if (!object_info->unsafe_info()) continue;
+    const auto it = nero_no_exit_bands_.find(uuidKey(object_info->predicted_object().object_id));
+    if (it != nero_no_exit_bands_.end()) bands.push_back(&it->second);
+  }
+  const auto & ego_pose = planner_data_->current_odometry->pose;
+  if (!bands.empty()) {
+    // the last pose along ego's path whose footprint, grown by the margin, is clear of every band
+    const auto & path_ip = interpolated_path_info.path;
+    if (path_ip.points.empty()) return std::nullopt;
+    const auto local_footprint = planner_data_->vehicle_info_.createFootprint(margin, margin);
+    const size_t ego_ip = autoware::motion_utils::findNearestIndex(path_ip.points, ego_pose.position);
+    const size_t n_max = static_cast<size_t>(30.0 / std::max(0.05, interpolated_path_info.ds));
+    std::optional<size_t> clear_ip{std::nullopt};
+    bool hit = false;
+    double yaw = tf2::getYaw(ego_pose.orientation);
+    for (size_t i = ego_ip; i < path_ip.points.size() && i < ego_ip + n_max; ++i) {
+      // heading from the path's own geometry (an interpolated point's stored orientation can be degenerate at a
+      // duplicated stop-line point)
+      auto pose = path_ip.points.at(i).point.pose;
+      const auto & a = path_ip.points.at(i == 0 ? 0 : i - 1).point.pose.position;
+      const auto & b = path_ip.points.at(std::min(i + 1, path_ip.points.size() - 1)).point.pose.position;
+      if (std::hypot(b.x - a.x, b.y - a.y) > 1e-3) yaw = std::atan2(b.y - a.y, b.x - a.x);
+      pose.orientation = autoware_utils::create_quaternion_from_yaw(yaw);
+      const auto fp = autoware_utils::transform_vector(local_footprint, autoware_utils::pose2transform(pose));
+      if (std::any_of(bands.begin(), bands.end(), [&](const auto * band) { return bg::intersects(fp, *band); })) {
+        hit = true;
+        break;
+      }
+      clear_ip = i;
+    }
+    if (!hit) return std::nullopt;  // the band does not reach ego's path ahead: the default stop line holds
+    if (!clear_ip) {
+      nero_no_exit_stop_pose_ = ego_pose;  // ego is already within the margin: stop where it is
+    } else {
+      nero_no_exit_stop_pose_ = path_ip.points.at(clear_ip.value()).point.pose;
+      nero_no_exit_stop_pose_->orientation = ego_pose.orientation;  // only its position is used (path index)
+    }
+    if (dbg_nx) {
+      RCLCPP_INFO(
+        logger_, "[NERO_IX] priority no_exit dbg: lane %ld ego_ip %zu of %zu, clear_ip %ld, ego (%.2f, %.2f), stop (%.2f, %.2f)",
+        lane_id_, ego_ip, path_ip.points.size(), clear_ip ? static_cast<long>(clear_ip.value()) : -1L,
+        ego_pose.position.x, ego_pose.position.y, nero_no_exit_stop_pose_->position.x,
+        nero_no_exit_stop_pose_->position.y);
+    }
+    if (now - nero_no_exit_stop_time_ > 1.5) {
+      RCLCPP_INFO(
+        logger_, "[NERO_IX] priority no_exit: lane %ld stops %.1f m ahead, %.1f m clear of a no-exit car's straight path",
+        lane_id_,
+        autoware::motion_utils::calcSignedArcLength(
+          path->points, ego_pose.position, nero_no_exit_stop_pose_->position),
+        margin);
+    }
+    nero_no_exit_stop_time_ = now;
+  } else if (!nero_no_exit_stop_pose_ || now - nero_no_exit_stop_time_ > 1.5) {
+    nero_no_exit_stop_pose_ = std::nullopt;  // kept for the collision hold only
+    return std::nullopt;
+  }
+  const double dist = autoware::motion_utils::calcSignedArcLength(
+    path->points, ego_pose.position, nero_no_exit_stop_pose_->position);
+  if (dist <= 0.05) return closest_idx;
+  return util::insertPointIndex(
+    nero_no_exit_stop_pose_.value(), path, planner_data_->ego_nearest_dist_threshold,
+    planner_data_->ego_nearest_yaw_threshold);
 }
 
 std::optional<size_t> IntersectionModule::findWrongWayWatchStopIndex(
