@@ -34,6 +34,29 @@
 
 namespace autoware::lidar_centerpoint
 {
+namespace
+{
+// [nero 2026-10-31 cpshuffle] NERO_CP_SHUFFLE_FIX=1: shuffle the frame's points with the source-index
+// test of autoware_universe #11711 (shufflePointsSrcCheck_launch), so the network sees every point of
+// this frame and nothing left in the buffer by earlier frames. Unset (or any other value) = the car's
+// shufflePoints_launch exactly. State at file scope: the class layout stays as it is (PointPaintingTRT
+// in autoware_image_projection_based_fusion derives from CenterPointTRT).
+bool neroShuffleFix()
+{
+  static const bool on = [] {
+    const char * v = std::getenv("NERO_CP_SHUFFLE_FIX");
+    const bool b = v != nullptr && std::string(v) == "1";
+    if (b) {
+      RCLCPP_INFO(
+        rclcpp::get_logger("lidar_centerpoint"),
+        "[NERO_CP] NERO_CP_SHUFFLE_FIX=1: shufflePoints source-index check (autoware_universe #11711)");
+    }
+    return b;
+  }();
+  return on;
+}
+}  // namespace
+
 CenterPointTRT::CenterPointTRT(
   const TrtCommonConfig & encoder_param, const TrtCommonConfig & head_param,
   const DensificationParam & densification_param, const CenterPointConfig & config)
@@ -46,6 +69,8 @@ CenterPointTRT::CenterPointTRT(
   initTrt(encoder_param, head_param);
 
   cudaStreamCreate(&stream_);
+
+  neroShuffleFix();  // [nero 2026-10-31 cpshuffle] read the switch once, log it at start-up
 }
 
 CenterPointTRT::~CenterPointTRT()
@@ -219,9 +244,15 @@ bool CenterPointTRT::preprocess(
 
   const std::size_t count = vg_ptr_->generateSweepPoints(points_aux_d_.get(), stream_);
   const std::size_t random_offset = std::rand() % config_.cloud_capacity_;
-  CHECK_CUDA_ERROR(shufflePoints_launch(
-    points_aux_d_.get(), shuffle_indices_d_.get(), points_d_.get(), count, config_.cloud_capacity_,
-    random_offset, stream_));
+  if (neroShuffleFix()) {
+    CHECK_CUDA_ERROR(shufflePointsSrcCheck_launch(
+      points_aux_d_.get(), shuffle_indices_d_.get(), points_d_.get(), count,
+      config_.cloud_capacity_, random_offset, stream_));
+  } else {
+    CHECK_CUDA_ERROR(shufflePoints_launch(
+      points_aux_d_.get(), shuffle_indices_d_.get(), points_d_.get(), count,
+      config_.cloud_capacity_, random_offset, stream_));
+  }
 
   CHECK_CUDA_ERROR(cudaMemsetAsync(num_voxels_d_.get(), 0, sizeof(unsigned int), stream_));
   CHECK_CUDA_ERROR(

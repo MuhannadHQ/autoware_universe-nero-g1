@@ -29,6 +29,13 @@ cudaError_t shufflePoints_launch(
   const std::size_t points_size, const std::size_t max_size, const std::size_t offset,
   cudaStream_t stream);
 
+// [nero 2026-10-31 cpshuffle] NERO_CP_SHUFFLE_FIX: the same shuffle with the source-index test of
+// autoware_universe #11711 (every point of the frame used once, no stale buffer slots).
+cudaError_t shufflePointsSrcCheck_launch(
+  const float * points, const unsigned int * indices, float * shuffled_points,
+  const std::size_t points_size, const std::size_t max_size, const std::size_t offset,
+  cudaStream_t stream);
+
 cudaError_t generateVoxels_random_launch(
   const float * points, std::size_t points_size, float min_x_range, float max_x_range,
   float min_y_range, float max_y_range, float min_z_range, float max_z_range, float pillar_x_size,

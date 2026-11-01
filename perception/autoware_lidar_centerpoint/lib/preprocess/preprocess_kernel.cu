@@ -130,6 +130,54 @@ cudaError_t shufflePoints_launch(
   return err;
 }
 
+// [nero 2026-10-31 cpshuffle] NERO_CP_SHUFFLE_FIX: port of autoware_universe #11711 (5812e83ea,
+// "fix(lidar_centerpoint): correct index check in shufflePoints_kernel"). The kernel above tests the
+// DESTINATION index against this frame's point count, so the first points_size output slots read
+// random SOURCE slots over the whole cloud capacity: only ~points_size / max_size of them are this
+// frame's points, the rest are whatever earlier (larger) frames left in the buffer, or zeros. Testing
+// the SOURCE index instead puts every point of this frame exactly once (indices is a permutation of
+// [0, max_size)) at a random place and INFINITY (= out of range, dropped) everywhere else.
+__global__ void shufflePointsSrcCheck_kernel(
+  const float * points, const unsigned int * indices, float * shuffled_points,
+  const std::size_t points_size, const std::size_t max_size, const std::size_t offset)
+{
+  int point_idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (point_idx >= max_size) return;
+
+  int src_idx = indices[(point_idx + offset) % max_size];
+  int dst_idx = point_idx;
+
+  if (static_cast<std::size_t>(src_idx) >= points_size) {
+    shuffled_points[4 * dst_idx + 0] = INFINITY;
+    shuffled_points[4 * dst_idx + 1] = INFINITY;
+    shuffled_points[4 * dst_idx + 2] = INFINITY;
+    shuffled_points[4 * dst_idx + 3] = INFINITY;
+  } else {
+    shuffled_points[4 * dst_idx + 0] = points[4 * src_idx + 0];
+    shuffled_points[4 * dst_idx + 1] = points[4 * src_idx + 1];
+    shuffled_points[4 * dst_idx + 2] = points[4 * src_idx + 2];
+    shuffled_points[4 * dst_idx + 3] = points[4 * src_idx + 3];
+  }
+}
+
+cudaError_t shufflePointsSrcCheck_launch(
+  const float * points, const unsigned int * indices, float * shuffled_points,
+  const std::size_t points_size, const std::size_t max_size, const std::size_t offset,
+  cudaStream_t stream)
+{
+  dim3 blocks((max_size + 256 - 1) / 256);
+  dim3 threads(256);
+
+  if (blocks.x == 0) {
+    return cudaGetLastError();
+  }
+
+  shufflePointsSrcCheck_kernel<<<blocks, threads, 0, stream>>>(
+    points, indices, shuffled_points, points_size, max_size, offset);
+  cudaError_t err = cudaGetLastError();
+  return err;
+}
+
 __global__ void generateVoxels_random_kernel(
   const float * points, std::size_t points_size, float min_x_range, float max_x_range,
   float min_y_range, float max_y_range, float min_z_range, float max_z_range, float pillar_x_size,
