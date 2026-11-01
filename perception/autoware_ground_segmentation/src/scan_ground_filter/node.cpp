@@ -15,18 +15,113 @@
 #include "node.hpp"
 
 #include "grid_ground_filter.hpp"
+#include "nero_band_road.hpp"
 
 #include <autoware_utils/geometry/geometry.hpp>
 #include <autoware_utils/math/normalization.hpp>
 #include <autoware_utils/math/unit_conversion.hpp>
 #include <autoware_vehicle_info_utils/vehicle_info_utils.hpp>
 
+#include <chrono>
+#include <cstdlib>
+#include <cstring>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace autoware::ground_segmentation
 {
+namespace
+{
+// NERO_GROUND_BAND_ROAD (rampground, QUEUE PITCHG): per node instance, kept out of the class layout.
+struct NeroBandRoadState
+{
+  nero::BandRoad band_road;
+  bool debug = false;
+  std::vector<uint8_t> ng;
+  std::vector<float> xyz;
+  size_t frames = 0, points = 0;
+  float r_min = 0.0f, r_max = 0.0f, drop20 = 0.0f;
+  std::chrono::steady_clock::time_point last_log{};
+};
+std::mutex g_nero_band_road_mutex;
+std::unordered_map<const void *, std::unique_ptr<NeroBandRoadState>> g_nero_band_road;
+
+NeroBandRoadState * neroBandRoad(const void * node)
+{
+  std::lock_guard<std::mutex> lock(g_nero_band_road_mutex);
+  const auto it = g_nero_band_road.find(node);
+  return it == g_nero_band_road.end() ? nullptr : it->second.get();
+}
+
+// take out of the obstacle indices the points the band's road-referenced ceiling leaves out (nero_band_road.hpp)
+void neroApplyBandRoad(
+  NeroBandRoadState & nb, const sensor_msgs::msg::PointCloud2::ConstSharedPtr & input,
+  pcl::PointIndices & no_ground_indices, const rclcpp::Logger & logger)
+{
+  const size_t step = input->point_step;
+  const size_t n = static_cast<size_t>(input->width) * input->height;
+  if (!n || !step || input->data.size() < n * step) return;
+  int ox = -1, oy = -1, oz = -1;
+  bool f32 = true;
+  for (const auto & f : input->fields) {
+    if (f.name == "x" || f.name == "y" || f.name == "z") {
+      (f.name == "x" ? ox : f.name == "y" ? oy : oz) = static_cast<int>(f.offset);
+      f32 = f32 && f.datatype == sensor_msgs::msg::PointField::FLOAT32;
+    }
+  }
+  if (ox < 0 || oy < 0 || oz < 0 || !f32) return;
+  const float * xyz = nullptr;
+  size_t stride = 3;
+  if (ox == 0 && oy == 4 && oz == 8 && step % 4 == 0) {
+    xyz = reinterpret_cast<const float *>(input->data.data());
+    stride = step / 4;
+  } else {
+    nb.xyz.resize(3 * n);
+    for (size_t i = 0; i < n; ++i) {
+      std::memcpy(&nb.xyz[3 * i], &input->data[i * step + ox], 4);
+      std::memcpy(&nb.xyz[3 * i + 1], &input->data[i * step + oy], 4);
+      std::memcpy(&nb.xyz[3 * i + 2], &input->data[i * step + oz], 4);
+    }
+    xyz = nb.xyz.data();
+  }
+  nb.ng.assign(n, 0);
+  for (const auto i : no_ground_indices.indices) nb.ng[static_cast<size_t>(i) / step] = 1;
+  const auto st = nb.band_road.apply(xyz, stride, n, nb.ng);
+  if (st.removed) {
+    size_t k = 0;
+    for (const auto i : no_ground_indices.indices)
+      if (nb.ng[static_cast<size_t>(i) / step]) no_ground_indices.indices[k++] = i;
+    no_ground_indices.indices.resize(k);
+    if (nb.debug) {
+      RCLCPP_INFO(
+        logger,
+        "[NERO_GROUND_BAND_ROAD] frame %d.%09u: %zu obstacle points above road + %.2f m out (range %.1f-%.1f m, "
+        "lowest %.2f m over the road; road 20 m ahead at base z %+.2f m)",
+        input->header.stamp.sec, input->header.stamp.nanosec, st.removed, nb.band_road.band, st.r_min, st.r_max,
+        st.h_min, st.drop20);
+    }
+    if (!nb.frames || st.r_min < nb.r_min) nb.r_min = st.r_min;
+    if (!nb.frames || st.r_max > nb.r_max) nb.r_max = st.r_max;
+    if (!nb.frames || st.drop20 < nb.drop20) nb.drop20 = st.drop20;
+    ++nb.frames;
+    nb.points += st.removed;
+  }
+  const auto now = std::chrono::steady_clock::now();
+  if (nb.frames && now - nb.last_log >= std::chrono::seconds(1)) {
+    RCLCPP_INFO(
+      logger,
+      "[NERO_GROUND_BAND_ROAD] %zu frames / %zu obstacle points above road + %.2f m left out since the last line "
+      "(range %.1f-%.1f m; lowest road 20 m ahead at base z %+.2f m)",
+      nb.frames, nb.points, nb.band_road.band, nb.r_min, nb.r_max, nb.drop20);
+    nb.frames = nb.points = 0;
+    nb.last_log = now;
+  }
+}
+}  // namespace
+
 using autoware::pointcloud_preprocessor::get_param;
 using autoware::vehicle_info_utils::VehicleInfoUtils;
 using autoware_utils::calc_distance3d;
@@ -127,6 +222,26 @@ ScanGroundFilterComponent::ScanGroundFilterComponent(const rclcpp::NodeOptions &
 
       // set time keeper to grid
       grid_ground_filter_ptr_->setTimeKeeper(time_keeper_);
+    }
+  }
+
+  // NERO_GROUND_BAND_ROAD (rampground, QUEUE PITCHG): the obstacle band's ceiling from the road ahead (unset = the car)
+  if (const char * sw = std::getenv("NERO_GROUND_BAND_ROAD")) {
+    auto nb = std::make_unique<NeroBandRoadState>();
+    if (elevation_grid_mode_ && nb->band_road.parse(sw)) {
+      const char * dbg = std::getenv("NERO_GROUND_BAND_ROAD_DEBUG");
+      nb->debug = dbg && std::atoi(dbg) > 0;
+      const auto & b = nb->band_road;
+      RCLCPP_INFO(
+        get_logger(),
+        "[NERO_GROUND_BAND_ROAD] on: band %.2f + margin %.2f over the road, support %.2f (ground %.2f..), gate %.2f m / "
+        "%.1f deg, ahead within %.0f m and %.0f deg",
+        b.band, b.margin, b.support_h, b.ground_low, b.gate, b.gate_deg, b.rmax, b.cone_deg);
+      std::lock_guard<std::mutex> lock(g_nero_band_road_mutex);
+      g_nero_band_road[this] = std::move(nb);
+    } else {
+      RCLCPP_ERROR(
+        get_logger(), "[NERO_GROUND_BAND_ROAD] '%s' invalid or not elevation_grid_mode: switch off", sw);
     }
   }
 }
@@ -350,6 +465,7 @@ void ScanGroundFilterComponent::faster_filter(
 
   if (elevation_grid_mode_) {
     grid_ground_filter_ptr_->process(input, no_ground_indices);
+    if (auto * nb = neroBandRoad(this)) neroApplyBandRoad(*nb, input, no_ground_indices, get_logger());
   } else {
     std::vector<PointCloudVector> radial_ordered_points;
     convertPointcloud(input, radial_ordered_points);
