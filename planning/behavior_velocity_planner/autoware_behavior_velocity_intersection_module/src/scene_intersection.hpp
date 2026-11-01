@@ -432,6 +432,44 @@ private:
     double gap{0.0};  //! the footprint gap there [m]
   };
   void neroCrossingHold(PathWithLaneId * path);
+  //! NERO_IX_CROSSING_HOLD_CREEP (latecrosser, 2026-10-31): see
+  //! scene_intersection_nero_latecross.cpp; caps the path's speed from ego to the creep depth once
+  //! the crossing hold held ego (s_line = base_link arc length to the stop line)
+  void neroCrossingCreep(PathWithLaneId * path, double s_line, double nose_past, double v0);
+  bool nero_xc_armed_{false};
+  bool nero_xc_stood_{false};  //! ego stood since the creep was armed (the cap starts there)
+  double nero_xc_since_{0.0};
+  //! NERO_IX_CROSSING_HOLD_CREEP's probe (3rd field 1): while ego stands held with the creep armed,
+  //! every 2nd cycle the crossing hold judges the car's own departure (no cap); when the probes are
+  //! clear while the capped cycles hold, the creep is dropped for this departure
+  bool nero_xc_track_{false};    //! last cycle's result is read this cycle
+  bool nero_xc_probe_{false};    //! last tracked cycle was a probe
+  bool nero_xc_held_{false};     //! the last capped tracked cycle had a conflict
+  bool nero_xc_dropped_{false};  //! the creep was dropped (until the hold lets ego go)
+  int nero_xc_clear_{0};         //! probes in a row clear while the capped cycles held
+  double nero_xc_lc_{-1e9};      //! nero_xh_last_conflict_ when the tracked cycle began
+  //! NERO_IX_CROSSING_HOLD_VANISHED (latecrosser): the objects the crossing hold judges this cycle
+  //! = the planner's, plus moving vehicles that vanished next to ego's way, carried on at their
+  //! last velocity for a short time
+  const std::vector<autoware_perception_msgs::msg::PredictedObject> & neroCrossingObjects(
+    const PathWithLaneId & path, double s_end);
+  struct NeroVanished
+  {
+    double t_last{0.0};  //! objects stamp of its last report
+    bool ghost{false};   //! vanished inside the conflict: judged as moving on
+    bool logged{false};
+    autoware_perception_msgs::msg::PredictedObject last;
+  };
+  std::map<std::string, NeroVanished> nero_xv_;
+  std::vector<autoware_perception_msgs::msg::PredictedObject> nero_xv_objects_;
+  //! NERO_IX_CROSSING_HOLD_AGAIN_COMMIT (latecrosser): a moving ego committed for a vehicle that
+  //! moved again after it let ego go is not stopped for it inside its way (the stop of this cycle
+  //! is dropped); gap_go / gap_stop < 0: committed in an earlier cycle
+  void neroAgainCommit(
+    std::optional<NeroCrossingCause> & conflict, const std::string & id, double v0,
+    double nose_past, double gap_go, double gap_stop);
+  bool nero_xa_held_at_start_{false};  //! nero_xh_again_held_ when this cycle's object loop began
+  std::map<std::string, double> nero_xa_logged_;
   bool nero_xh_holding_{false};
   bool nero_xh_scope_logged_{false};
   double nero_xh_last_conflict_{-1e9};

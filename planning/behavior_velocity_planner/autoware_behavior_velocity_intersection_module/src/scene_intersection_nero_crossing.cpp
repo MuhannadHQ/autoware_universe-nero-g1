@@ -314,6 +314,9 @@ void IntersectionModule::neroCrossingHold(PathWithLaneId * path)
   const double v0 = std::abs(planner_data_->current_velocity->twist.linear.x);
   const bool standing = v0 < 0.1;
   if (standing) nero_xh_committed_.clear();  // a standing ego can always wait
+  // NERO_IX_CROSSING_HOLD_CREEP: after a hold, the first metres past the line at creep speed (into
+  // the path, so the passage below sees it)
+  neroCrossingCreep(path, s_line.value(), nose_past, v0);
   const double delay = standing ? p.delay : 0.0;
   const double s_end =
     s_line.value() + p.depth - front;  // base_link where the nose is <depth> past the line
@@ -423,7 +426,7 @@ void IntersectionModule::neroCrossingHold(PathWithLaneId * path)
   // the farthest footprint point from base_link (the prefilters below measure from base_link)
   const double half_diag_ego =
     std::hypot(std::max(front, rear), planner_data_->vehicle_info_.vehicle_width_m / 2.0);
-  for (const auto & object : planner_data_->predicted_objects->objects) {
+  for (const auto & object : neroCrossingObjects(*path, s_end)) {
     if (!isTargetCollisionVehicleType(object)) continue;
     const auto & tw = object.kinematics.initial_twist_with_covariance.twist.linear;
     const double v = std::hypot(tw.x, tw.y);
@@ -611,6 +614,8 @@ void IntersectionModule::neroCrossingHold(PathWithLaneId * path)
     if (v < p.v_min) continue;
     if (nero_xh_committed_.count(key)) {
       ++n_committed;
+      neroAgainCommit(
+        conflict, id, v0, nose_past, -1.0, -1.0);  // NERO_IX_CROSSING_HOLD_AGAIN_COMMIT
       continue;
     }
     ++n_targets;
@@ -763,6 +768,7 @@ void IntersectionModule::neroCrossingHold(PathWithLaneId * path)
         "going on keeps %.2f m, "
         "stopping (%.2f m) %.2f m",
         lane_id_, id.c_str(), v, v0, nose_past, gap_go, d_stop, gap_stop);
+      neroAgainCommit(conflict, id, v0, nose_past, gap_go, gap_stop);
       continue;
     }
     if (!conflict || c_obj->t < conflict->t) conflict = c_obj;
