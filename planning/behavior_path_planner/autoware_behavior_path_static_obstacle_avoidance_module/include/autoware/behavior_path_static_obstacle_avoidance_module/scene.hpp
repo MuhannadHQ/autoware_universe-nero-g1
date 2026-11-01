@@ -551,6 +551,7 @@ private:
   // beside = also a car level with ego (while holding: released only once it is behind ego's rear)
   std::optional<NeroCgwCar> neroCgwFindCar(const AvoidancePlanningData & data, bool beside) const;
   bool neroCorridorGiveway(AvoidancePlanningData & data) const;
+  std::string neroCrLingerBlocked(const AvoidancePlanningData & data, double shift) const;  // v7
   void neroInsertCgwStop(ShiftedPath & shifted_path) const;
   mutable bool nero_cgw_active_{false};
   mutable double nero_cgw_plan_t_{-1.0};      // the last (re-)plan
@@ -593,6 +594,15 @@ private:
   mutable double nero_tw_cap_{-1.0};
   mutable bool nero_tw_street_{false};  // the coming car has its own lane's room where it meets ego (not a corridor)
   mutable std::string nero_tw_plan_id_;  // the coming car of the last plan
+  // NERO_SOA_CORRIDOR_GIVEWAY_CRAMPED: passing a coming car on an open street (not cramped); the car whose late check stopped ego
+  mutable bool nero_cr_open_{false};
+  mutable std::string nero_cr_late_id_;
+  mutable double nero_cr_stop_d_{-1.0};
+  mutable std::string nero_cr_defer_id_;  // v4: an open-street meeting deferred until start_s before it
+  mutable double nero_cr_defer_until_{-1.0};
+  mutable double nero_cr_linger_until_{-1.0};  // v7: kept right after the last car until then
+  mutable std::unordered_map<std::string, std::deque<std::pair<double, double>>> nero_cr_lo_hist_;  // v7: t, box lo
+  mutable bool nero_cr_lingering_{false};  // v6: kept right after a car for the next one  // the late stop's distance (OPEN_STOP_DECEL), < 0: STOP_DECEL
   // standing UNKNOWNs of a solid height: when / where first seen standing still (t first, x, y, t last)
   mutable std::unordered_map<std::string, std::array<double, 4>> nero_tw_still_;
   void neroTwStillUpdate() const;

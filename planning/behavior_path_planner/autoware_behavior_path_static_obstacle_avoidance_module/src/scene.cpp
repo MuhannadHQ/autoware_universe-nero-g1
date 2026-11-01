@@ -617,6 +617,155 @@ double pass_cap(const double gap)
 }
 }  // namespace nero_tw
 
+namespace nero_cr
+{
+// NERO_SOA_CORRIDOR_GIVEWAY_CRAMPED="late_s,clear_m,open_m,slow_s,start_s,no_move_m,linger_s,hyst_m,gate_deg,inlane"
+// (2026-10-29, realsim job, then the weave job; Ahmed typed at the realsim drive: "fix the
+// avoidance it should only be in very cramped spaces where it would go right and make way"): the give-way (keep right,
+// wait / pass slowly) waited for a coming car whose line did not clear ego's keep-right body although the street left it
+// 1.7 m more room than it needed beside ego (realsim car run: "9b83 ... room beside 4.15 m (needs 2.41)" -> 0.25 m/s; the
+// set with twoway_1029 the same: its street rule only sets the pass speed of a car that already clears ego). With this
+// switch a coming car whose line does not clear ego's body is waited for only where it is cramped: ego as far right as
+// it can (the rightmost place clear of the standing objects on its right) leaves the car less than its width + 2 side_m
+// + open_m beside ego around where they meet (the one-lane corridor of 10-26e #24 measured 2.42 m for 2.40 needed; the
+// realsim streets 4.15-4.30 m for 2.41-2.46: open_m keeps every squeeze cramped). Elsewhere ego keeps
+// right as far as the car's line needs (at most that rightmost place) and passes it at most twoway's v_free (the car's
+// own obstacle_slow_down line for moving vehicles), none once the line leaves free_m: the driver has the room and moves
+// over. Never neglected: within slow_s of meeting a line still less than PASS_CLEAR_M off ego's keep-right body = a slow
+// close pass at PASS_V (as the corridor's); within late_s one still leaving less than clear_m stops ego (at OPEN_STOP_DECEL
+// where it can, latched for that car: from then on the corridor rules for it). The traffic atlas (10-29): oncoming drivers
+// make half their move over ~13 m before meeting the robot (v1 / v2 stopped 2.4 s = ~26 m out, -3.4, for a car about to
+// move). Needs NERO_SOA_CORRIDOR_GIVEWAY_TWOWAY.
+// obstacle_stop / AEB untouched. Unset: the give-way exactly as before.
+struct Env
+{
+  bool on{false};
+  double late_s{1.5};
+  double clear_m{0.3};
+  double open_m{1.0};
+  double slow_s{2.5};
+  double start_s{3.0};  // v4: on an open street the give-way (keep right for the meeting) starts this long before it
+  // v6 (Ahmed 10-29 on the car's two drives: "the static avoidance seems too strong" / "when there are cars on the oncoming
+  // lane it moves away from one then returns to center then moves away again then returns this is bad"; the car's log:
+  // 55 moves out in 2 drives, 77 of 112 oncoming cars' lines >= 1.0 m off the robot's body): no give-way at all for a
+  // coming car whose line clears ego's body where it is by no_move_m (outside obstacle_slow_down's 1.1 m band for moving
+  // vehicles: no move, no cap, whatever the street / corridor room says); and once kept right, no way back while
+  // another oncoming car that would need a move from the lane centre is due within linger_s: one return after the last
+  double no_move_m{-1.0};
+  double linger_s{-1.0};
+  // v7 (weave job, 2026-10-29; Ahmed on the car's drives: "when there are cars on the oncoming lane it moves away from one
+  // then returns to center then moves away again then returns this is bad"; the car's log: 55 moves out in two drives,
+  // 20 of 51 spells back at the centre < 5 s): every field below is one mechanism (<= 0: off = v6)
+  // - linger_s (redefined, time): after the last oncoming car the robot kept right for has passed, it stays kept right
+  //   linger_s (the clock starts again with every next car), then goes back once at the module's minimum lateral jerk;
+  //   v6 stayed only while the next car was already within the 45 m horizon (~4 s at speed: the sim stream with 10 s
+  //   between meetings went out / back / out 3 times like the field). Upstream: dynamic avoidance holds its avoidance
+  //   duration_to_hold_avoidance 3 s after an overtaking object; obstacle_slow_down exits after 5 cycles. The linger ends
+  //   early when the module has a target ahead that needs a shift (a parked car: its own plan, from the lane centre) or
+  //   the kept-right line would run into a standing object on the right within the next 4 s.
+  // - hyst_m: a car being passed stops ego ("runs into ego's way") only once its line comes PASS_CLEAR_M - hyst_m to
+  //   ego's keep-right body: the pass was decided at PASS_CLEAR_M, so with the same bar one cycle of box jitter stopped
+  //   ego at STOP_DECEL (field: 9 such stops, e.g. 950b / fe1a 0.1 s after "it clears ego: pass it slowly")
+  // - gate_deg: a moving vehicle starts a give-way only when it heads within gate_deg of straight against the path where
+  //   it is (moving UNKNOWNs: the heading of their own positions over >= 0.4 s); turning / crossing cars are the
+  //   intersection module's and obstacle_stop's (field #3 17:06: a turning car's low fragment; 15:56 #4: a car turning
+  //   across from a side road, the give-way kept right 0.84 and waited). Upstream dynamic avoidance: an oncoming object
+  //   within max_oncoming_object_angle 0.523 rad (30 deg). Holding, the car keeps being tracked as before.
+  // - inlane: while giving way, ego's keep-right / second line never leaves its own lane to the left: a standing object
+  //   past the meeting that ego can only pass out in the oncoming lane is waited for before it (field #10 17:23:38.9: the
+  //   second line round an object in ego's lane went to +2.52, into the oncoming stream -> "runs into ego's way: stop")
+  // - far: a moving car more than start_s from the meeting starts no give-way yet (no keep right, no wait) wherever the
+  //   comfortable stop for it is still ahead (its latest stop >= the comfortable stop + 0.3 s of driving + 1 m): the
+  //   cramped test (room beside ego around the meeting) read a junction mouth as cramped (field #7 17:11:59.6: a car 29 m
+  //   out at 1.5 m/s, "wait 6.9 m ahead", 12.8 -> 2.5 km/h; v4's deferral was for open places only)
+  // - leave_v: a moving car whose box moves toward its own side at >= leave_v m/s (its lowest edge rising steadily over
+  //   >= 0.5 s) is judged by where that edge will be when they meet (at most 1.5 s on): a car finishing a turn across
+  //   ego's lane into the oncoming lane is leaving ego's way (field #3 17:06:07: 3531's box diagonal across the lane ->
+  //   "wait 2.8 m ahead" at the hardest stop). Only for the start; a box moving toward ego gets no credit.
+  double hyst_m{-1.0};
+  double gate_deg{-1.0};
+  bool inlane{false};
+  bool far{false};
+  double leave_v{-1.0};
+};
+constexpr double OPEN_STOP_DECEL = 1.5;  // the late stop on an open street, where the room allows (else STOP_DECEL)
+const Env & env()
+{
+  static const Env e = [] {
+    Env r;
+    if (const char * v = std::getenv("NERO_SOA_CORRIDOR_GIVEWAY_CRAMPED"); v && *v && std::string(v) != "0") {
+      double ls = 1.5, cm = 0.3, om = 1.0, ss = 2.5, st = 3.0, nm = -1.0, lg = -1.0, hy = -1.0, gd = -1.0, il = 0.0,
+             fa = 0.0, lv = -1.0;
+      std::sscanf(
+        v, "%lf,%lf,%lf,%lf,%lf,%lf,%lf,%lf,%lf,%lf,%lf,%lf", &ls, &cm, &om, &ss, &st, &nm, &lg, &hy, &gd, &il, &fa, &lv);
+      r.on = true;
+      r.late_s = std::clamp(ls, 1.0, 6.0);
+      r.clear_m = std::clamp(cm, 0.0, 0.5);
+      r.open_m = std::max(0.0, om);
+      r.slow_s = std::max(r.late_s, ss);
+      r.start_s = std::max(r.slow_s, st);
+      r.no_move_m = nm;   // < 0: off (v5 and before)
+      r.linger_s = lg;    // < 0: off
+      r.hyst_m = hy > 0.0 ? std::min(hy, nero_cgw::PASS_CLEAR_M - 0.1) : -1.0;  // v7: the stop bar never below 0.1 m
+      r.gate_deg = gd > 0.0 ? std::clamp(gd, 10.0, 45.0) : -1.0;
+      r.inlane = il > 0.5;
+      r.far = fa > 0.5;
+      r.leave_v = lv > 0.0 ? std::max(lv, 0.3) : -1.0;
+    }
+    std::fprintf(
+      stderr,
+      "[NERO_SOA] corridor_giveway_cramped=%d (late %.1f s, clear %.2f m, open %.2f m, slow %.1f s, start %.1f s, no move %.2f m, "
+      "linger %.1f s, hyst %.2f m, gate %.0f deg, inlane %d, far %d, leave %.2f m/s)\n", r.on, r.late_s, r.clear_m, r.open_m,
+      r.slow_s, r.start_s, r.no_move_m, r.linger_s, r.hyst_m, r.gate_deg, r.inlane, r.far, r.leave_v);
+    return r;
+  }();
+  return e;
+}
+// the pass speed of a coming car on an open street (not cramped), its line gap m off ego's keep-right body where they
+// meet, ttm s before they meet: none once it leaves free_m; else v_free while it is still coming (it has the room to
+// move over), corridor_1027's PASS_V within late_s while it leaves less than PASS_CLEAR_M (a slow close pass, as the
+// corridor's)
+double open_cap(const double gap, const double ttm)
+{
+  if (gap >= nero_tw::env().free_m) return -1.0;
+  if (ttm < env().slow_s && gap < nero_cgw::PASS_CLEAR_M) return nero_cgw::PASS_V;
+  return nero_tw::env().v_free;
+}
+// time until ego's front meets the coming car
+double ttm(const double s_near, const double front, const double v_ego, const double v_car)
+{
+  return std::max(0.0, s_near - front) / std::max(v_ego + std::max(v_car, 0.0), 0.1);
+}
+}  // namespace nero_cr
+
+namespace nero_pk
+{
+// NERO_SOA_CORRIDOR_GIVEWAY_PARKED=1 (2026-10-29, weave job, problem 2; 10-29 17:05 #2 "too close": keeping right -0.30 ..
+// -0.44 for the oncoming fe1a / b797, the give-way passed the parked cars 5361 / 2962 at 0.30-0.38 / 0.47-0.54 m (box
+// corners from the robot's body); #1 "nice" 17:05 passed its parked cars at 0.53-0.69 m): while the give-way keeps right,
+// standing vehicles on the right get the module's OWN lateral margins for a parked vehicle instead of obstacle_stop's
+// (0.1 m + LAT_EXTRA 0.15): never closer than envelope_buffer_margin + lateral_hard_margin_for_parked_vehicle (the car:
+// 0.1 + 0.3), and the keep right for a coming car eats into the soft margin (+ lateral_soft_margin 0.35) only as far as the
+// car's minimum pass clearance (PASS_CLEAR_M + 0.1) needs; its pass speed then follows the smaller gap (twoway's / the
+// open-street cap). The module itself never passes a parked car closer than its hard margin either: the give-way's line
+// replaced the module's own shift round it while holding. Objects past the meeting (the second line) and the linger
+// keep the soft margin. Other standing objects keep obstacle_stop's margins. Unset: the give-way exactly as before.
+struct Env
+{
+  bool on{false};
+};
+const Env & env()
+{
+  static const Env e = [] {
+    Env r;
+    if (const char * v = std::getenv("NERO_SOA_CORRIDOR_GIVEWAY_PARKED"); v && *v && std::string(v) != "0") r.on = true;
+    std::fprintf(stderr, "[NERO_SOA] corridor_giveway_parked=%d\n", r.on);
+    return r;
+  }();
+  return e;
+}
+}  // namespace nero_pk
+
 namespace nero_ovl
 {
 bool lane_blocked()
@@ -3226,8 +3375,22 @@ std::optional<StaticObstacleAvoidanceModule::NeroCgwCar> StaticObstacleAvoidance
       data.arclength_from_ego.at(seg) +
       (pj ? pj->lonToSegment(seg, c) : autoware::motion_utils::calcLongitudinalOffsetToSegment(ref, seg, c));
     if (s_c < (beside ? -6.0 : 0.0)) continue;
+    // NERO_SOA_CORRIDOR_GIVEWAY_CRAMPED v7 leave_v: the box's lowest edge over the last second (every moving candidate,
+    // before the heading tests: a turning car is followed while it turns)
+    const std::string uuid(o.object_id.uuid.begin(), o.object_id.uuid.end());
+    if (nero_cr::env().on && nero_cr::env().leave_v > 0.0 && moving) {
+      auto & lh = nero_cr_lo_hist_[uuid];
+      lh.push_back({now, extent(o, seg).lo});
+      while (!lh.empty() && now - lh.front().first > 1.0) lh.pop_front();
+    }
     const double path_yaw = tf2::getYaw(ref.at(seg).point.pose.orientation);
     if (std::abs(autoware_utils::normalize_radian(yaw_obj - path_yaw)) <= 0.75 * M_PI) continue;
+    // NERO_SOA_CORRIDOR_GIVEWAY_CRAMPED v7 gate_deg: a moving car starts a give-way only heading within gate_deg of
+    // straight against the path where it is (a turning / crossing car is the intersection module's / obstacle_stop's)
+    const double gate =
+      nero_cr::env().on && nero_cr::env().gate_deg > 0.0 && !beside && moving ? M_PI - nero_cr::env().gate_deg * M_PI / 180.0
+                                                                             : -1.0;
+    if (gate > 0.0 && vehicle && std::abs(autoware_utils::normalize_radian(yaw_obj - path_yaw)) < gate) continue;
     double v_pos = 0.0;  // a moving UNKNOWN's speed toward ego from its own positions (its tracked speed ramps up late)
     if (moving && !vehicle) {
       // a moving UNKNOWN below 2 m/s (a car's first fragment, its tracked speed still ramping): only once its own
@@ -3246,6 +3409,14 @@ std::optional<StaticObstacleAvoidanceModule::NeroCgwCar> StaticObstacleAvoidance
       if (now - h.front()[0] >= 0.2) v_pos = std::max(0.0, toward(h.front()) / (now - h.front()[0]));
       seen.insert(std::string(o.object_id.uuid.begin(), o.object_id.uuid.end()));
       if (v < nero_cgw::UNKNOWN_MIN_V && !came) continue;
+      if (gate > 0.0) {
+        // v7 gate_deg: a moving UNKNOWN by the heading of its own positions over >= 0.4 s (a fragment's tracked heading
+        // is its box's: field #3's cea8 read "coming" while the car it belonged to turned across)
+        const auto & q0 = h.front();
+        const double dx = c.x - q0[1], dy = c.y - q0[2];
+        if (now - q0[0] < 0.4 || std::hypot(dx, dy) < 0.4) continue;
+        if (std::abs(autoware_utils::normalize_radian(std::atan2(dy, dx) - path_yaw)) < gate) continue;
+      }
     }
     const auto x = extent(o, seg);
     // beside / behind ego (while holding: only once fully behind its rear), or far
@@ -3290,7 +3461,27 @@ std::optional<StaticObstacleAvoidanceModule::NeroCgwCar> StaticObstacleAvoidance
     } else if (x.lo >= lane_left) {
       continue;
     }
-    if (!beside && lo_pred > e_hi + (moving ? nero_cgw::CONFLICT_MOVING_M : nero_cgw::CONFLICT_M)) continue;  // clear of ego
+    // NERO_SOA_CORRIDOR_GIVEWAY_CRAMPED v7 leave_v: a box moving steadily toward its own side counts where it will be
+    double lo_start = lo_pred;
+    if (!beside && nero_cr::env().on && nero_cr::env().leave_v > 0.0 && moving) {
+      const auto it = nero_cr_lo_hist_.find(uuid);
+      if (it != nero_cr_lo_hist_.end() && it->second.size() >= 3 && now - it->second.front().first >= 0.5) {
+        const auto & q = it->second;
+        bool steady = true;
+        for (size_t k = 1; k < q.size(); ++k) steady = steady && q[k].second >= q[k - 1].second - 0.05;
+        const double lv = (q.back().second - q.front().second) / std::max(q.back().first - q.front().first, 0.1);
+        if (steady && lv >= nero_cr::env().leave_v) {
+          const double ttm = std::max(0.0, x.s_near - vp.base_link2front) / std::max(getEgoSpeed() + std::max(v, v_pos), 0.1);
+          lo_start = lo_pred + lv * std::min(ttm, 1.5);
+          if (nero_tw::env().debug) {
+            RCLCPP_WARN(
+              getLogger(), "[NERO_SOA_CGWD] %s leaving ego's way: its edge %.2f moves %.2f m/s toward its side, %.2f when "
+              "they meet (%.1f s)", id.c_str(), lo_pred, lv, lo_start, ttm);
+          }
+        }
+      }
+    }
+    if (!beside && lo_start > e_hi + (moving ? nero_cgw::CONFLICT_MOVING_M : nero_cgw::CONFLICT_M)) continue;  // clear of ego
     if (best && best->s_near <= x.s_near) continue;
     NeroCgwCar r;
     r.id = id;
@@ -3305,8 +3496,79 @@ std::optional<StaticObstacleAvoidanceModule::NeroCgwCar> StaticObstacleAvoidance
   for (auto h = nero_cgw_hist_.begin(); h != nero_cgw_hist_.end();) {
     h = !h->second.empty() && now - h->second.back()[0] > 2.0 ? nero_cgw_hist_.erase(h) : std::next(h);
   }
+  for (auto h = nero_cr_lo_hist_.begin(); h != nero_cr_lo_hist_.end();) {
+    h = h->second.empty() || now - h->second.back().first > 2.0 ? nero_cr_lo_hist_.erase(h) : std::next(h);
+  }
   (void)seen;
   return best;
+}
+
+std::string StaticObstacleAvoidanceModule::neroCrLingerBlocked(const AvoidancePlanningData & data, const double shift) const
+{
+  // NERO_SOA_CORRIDOR_GIVEWAY_CRAMPED v7: why ego kept right at `shift` must not linger there: a target of the module ahead
+  // that needs a shift (its own plan from the lane centre takes over), or a standing object on the right that the kept-right
+  // line runs into within the next 4 s (obstacle_stop's lateral margin + LAT_EXTRA, as the give-way's own plan)
+  const auto & vp = planner_data_->parameters;
+  const double half_w = 0.5 * vp.vehicle_width;
+  const double look = std::max(15.0, getEgoSpeed() * 4.0 + vp.base_link2front);
+  char buf[96];
+  for (const auto & o : data.target_objects) {
+    if (o.avoid_required && o.longitudinal > 0.0 && o.longitudinal < look) {
+      std::snprintf(
+        buf, sizeof(buf), "target %02x%02x %.1f m ahead needs a shift", o.object.object_id.uuid[0], o.object.object_id.uuid[1],
+        o.longitudinal);
+      return buf;
+    }
+  }
+  const auto & ref = data.reference_path.points;
+  const auto & arc = data.arclength_from_ego;
+  if (!planner_data_->dynamic_object || ref.size() < 2 || arc.size() != ref.size()) return "";
+  // NERO_SOA_PROJ_FAST: neroCgwBox's numbers without a path copy per corner (it runs every cycle while lingering)
+  std::optional<nero_proj::Proj<std::decay_t<decltype(ref)>>> proj;
+  if (nero_proj::fast()) proj.emplace(ref);
+  const auto * pj = proj ? &proj.value() : nullptr;
+  for (const auto & o : planner_data_->dynamic_object->objects) {
+    const auto & tw = o.kinematics.initial_twist_with_covariance.twist.linear;
+    if (std::hypot(tw.x, tw.y) >= nero_cgw::STANDING_V) continue;
+    const auto & c = o.kinematics.initial_pose_with_covariance.pose.position;
+    if (std::hypot(c.x - getEgoPosition().x, c.y - getEgoPosition().y) > look + 10.0) continue;
+    const auto poly = autoware_utils::to_polygon2d(o.kinematics.initial_pose_with_covariance.pose, o.shape);
+    std::vector<geometry_msgs::msg::Point> cs;
+    for (const auto & q : poly.outer()) cs.push_back(autoware_utils::create_point(q.x(), q.y(), 0.0));
+    std::array<double, 4> b{1e9, -1e9, 1e9, -1e9};  // s0, s1, lo, hi (as neroCgwBox: every corner on the centre's segment)
+    if (!pj) {
+      b = neroCgwBox(data, cs);
+    } else {
+      const size_t seg = nero_cgw::seg_of(ref, c, pj);
+      bool ok = true;
+      for (const auto & p : cs) {
+        const double s = arc.at(seg) + pj->lonToSegment(seg, p);
+        const double l = pj->lateral(p, seg);
+        if (!std::isfinite(s) || !std::isfinite(l) || std::abs(s) > 1.0e4 || std::abs(l) > 1.0e3) ok = false;
+        b[0] = std::min(b[0], s);
+        b[1] = std::max(b[1], s);
+        b[2] = std::min(b[2], l);
+        b[3] = std::max(b[3], l);
+      }
+      if (!ok) continue;
+    }
+    if (b[1] < -vp.base_link2rear || b[0] > look || 0.5 * (b[2] + b[3]) >= shift) continue;  // on the right of ego's line
+    const auto lb = utils::getHighestProbLabel(o.classification);
+    double margin = (lb == ObjectClassification::UNKNOWN ? 0.3 : 0.1) + nero_cgw::LAT_EXTRA;
+    if (nero_pk::env().on && lb != ObjectClassification::UNKNOWN && lb != ObjectClassification::PEDESTRIAN &&
+        lb != ObjectClassification::BICYCLE && parameters_->object_parameters.count(lb)) {
+      // NERO_SOA_CORRIDOR_GIVEWAY_PARKED: a parked vehicle keeps the module's own margins (with the soft one)
+      const auto & op = parameters_->object_parameters.at(lb);
+      margin = std::max(margin, op.envelope_buffer_margin + op.lateral_hard_margin_for_parked_vehicle + op.lateral_soft_margin);
+    }
+    if (b[3] + margin + half_w > shift + 0.05) {
+      std::snprintf(
+        buf, sizeof(buf), "standing %02x%02x on the right %.1f m ahead needs ego at %.2f", o.object_id.uuid[0],
+        o.object_id.uuid[1], b[0], b[3] + margin + half_w);
+      return buf;
+    }
+  }
+  return "";
 }
 
 bool StaticObstacleAvoidanceModule::neroCorridorGiveway(AvoidancePlanningData & data) const
@@ -3336,6 +3598,7 @@ bool StaticObstacleAvoidanceModule::neroCorridorGiveway(AvoidancePlanningData & 
       }
       RCLCPP_WARN(getLogger(), "[NERO_SOA_CGW] %s back at %.2f: the hold ends", nero_cgw_id_.c_str(), ego_shift);
       nero_cgw_active_ = false;
+      nero_cr_open_ = false;  // NERO_SOA_CORRIDOR_GIVEWAY_CRAMPED
       nero_cgw_back_ = false;
       nero_cgw_back_past_.reset();
       nero_cgw_seen_.clear();
@@ -3363,6 +3626,8 @@ bool StaticObstacleAvoidanceModule::neroCorridorGiveway(AvoidancePlanningData & 
     } else {
       nero_cgw_gone_since_ = -1.0;
       nero_cgw_id_ = car->id;
+      nero_cr_linger_until_ = -1.0;  // NERO_SOA_CORRIDOR_GIVEWAY_CRAMPED v7: the linger clock starts again after this car
+      nero_cr_lingering_ = false;
       if (car->v < 0.3 && v_ego < 0.1) {
         if (nero_cgw_still_since_ < 0.0) nero_cgw_still_since_ = now;
         if (now - nero_cgw_still_since_ >= e.park_s) {
@@ -3376,21 +3641,43 @@ bool StaticObstacleAvoidanceModule::neroCorridorGiveway(AvoidancePlanningData & 
         nero_cgw_still_since_ = -1.0;
       }
       // passing a coming car slowly, but its line now runs into ego's keep-right body: stop at once (it re-plans next cycle)
+      // (NERO_SOA_CORRIDOR_GIVEWAY_CRAMPED: passing on an open street a car whose line was in ego's way from the start:
+      // only while it still runs into ego's keep-right body + clear_m late_s before they meet; latched for that car)
+      const double cr_ttm = nero_cr::ttm(car->s_near, vp.base_link2front, v_ego, car->v);
+      const bool cr_late = nero_cr_open_ && car->v > 0.0 && cr_ttm < nero_cr::env().late_s &&
+                           car->lo_pred < nero_cgw_shift_ + 0.5 * vp.vehicle_width + nero_cr::env().clear_m;
       if (
         !release && nero_cgw_pass_ &&
-        car->lo_pred < nero_cgw_shift_ + 0.5 * vp.vehicle_width +
-                         (nero_tw::env().on ? 1.0 : 0.5) * nero_cgw::PASS_CLEAR_M) {
+        (nero_cr_open_ ? cr_late
+                       : car->lo_pred < nero_cgw_shift_ + 0.5 * vp.vehicle_width +
+                                          (nero_tw::env().on ? 1.0 : 0.5) * nero_cgw::PASS_CLEAR_M -
+                                          (nero_cr::env().on && nero_cr::env().hyst_m > 0.0 ? nero_cr::env().hyst_m : 0.0))) {
+        if (nero_cr_open_) {
+          RCLCPP_WARN(
+            getLogger(), "[NERO_SOA_CGW] %s cramped: its line still leaves only %.2f m to ego's body %.1f s before they meet: "
+            "stop", car->id.c_str(), car->lo_pred - (nero_cgw_shift_ + 0.5 * vp.vehicle_width), cr_ttm);
+          nero_cr_late_id_ = car->id;
+          nero_cr_open_ = false;
+          // where the room allows, the stop at OPEN_STOP_DECEL (before where they meet, ego's front 1 m short of it)
+          const double s_meet_now = nero_tw::meet_s(car->s_near, v_ego, car->v);
+          const double d_soft = v_ego * v_ego / (2.0 * nero_cr::OPEN_STOP_DECEL);
+          const double d_hard = v_ego * v_ego / (2.0 * nero_cgw::STOP_DECEL);
+          nero_cr_stop_d_ = d_soft <= s_meet_now - vp.base_link2front - 1.0 ? d_soft : d_hard;
+        } else {
+          nero_cr_stop_d_ = -1.0;
+        }
         RCLCPP_WARN(getLogger(), "[NERO_SOA_CGW] %s runs into ego's way after all: stop", car->id.c_str());
         nero_cgw_pass_ = false;
         const auto p = autoware::motion_utils::calcLongitudinalOffsetPose(
-          data.reference_path.points, getEgoPosition(), v_ego * v_ego / (2.0 * nero_cgw::STOP_DECEL));
+          data.reference_path.points, getEgoPosition(),
+          nero_cr_stop_d_ > 0.0 ? nero_cr_stop_d_ : v_ego * v_ego / (2.0 * nero_cgw::STOP_DECEL));
         if (p) nero_cgw_stop_pose_ = p.value();
       }
       // NERO_SOA_CORRIDOR_GIVEWAY_TWOWAY: passing, the car's line came closer to ego's keep-right body: a lower pass speed
       // at once (it only rises at a re-plan)
       // (from 0.3 s after a plan: the previous path then holds the keep-right line the plan installed; sim tws c50_9 v2
       // read it one cycle after the plan, without the line, and dropped to 1.5 m/s for a car 0.8 m off)
-      if (!release && nero_cgw_pass_ && nero_tw::env().on && nero_tw_street_ && now - nero_cgw_plan_t_ >= 0.3) {
+      if (!release && nero_cgw_pass_ && !nero_cr_open_ && nero_tw::env().on && nero_tw_street_ && now - nero_cgw_plan_t_ >= 0.3) {
         // ego's body where they meet: the planned shift there (the keep-right line may still be under way)
         const double s_meet = nero_tw::meet_s(car->s_near, v_ego, car->v);
         const double gap = car->lo_pred - (neroTwShiftAt(s_meet) + 0.5 * vp.vehicle_width);
@@ -3399,6 +3686,19 @@ bool StaticObstacleAvoidanceModule::neroCorridorGiveway(AvoidancePlanningData & 
           RCLCPP_WARN(
             getLogger(), "[NERO_SOA_CGW] %s twoway: its line %.2f m off ego's body where they meet (%.1f m): pass at most "
             "%.2f m/s (was %.2f)", car->id.c_str(), gap, s_meet, cap, nero_tw_cap_);
+          nero_tw_cap_ = cap;
+        }
+      }
+      // NERO_SOA_CORRIDOR_GIVEWAY_CRAMPED: passing on an open street, the cap from the room its line leaves and the time to
+      // meet, each cycle (only lower between plans; from 0.3 s after a plan, as twoway's rule above)
+      if (!release && nero_cgw_pass_ && nero_cr_open_ && now - nero_cgw_plan_t_ >= 0.3) {
+        const double s_meet = nero_tw::meet_s(car->s_near, v_ego, car->v);
+        const double gap = car->lo_pred - (neroTwShiftAt(s_meet) + 0.5 * vp.vehicle_width);
+        const double cap = nero_cr::open_cap(gap, cr_ttm);
+        if (cap >= 0.0 && (nero_tw_cap_ < 0.0 || cap < nero_tw_cap_ - 0.05)) {
+          RCLCPP_WARN(
+            getLogger(), "[NERO_SOA_CGW] %s cramped: no; its line %.2f m off ego's body where they meet, %.1f s before: "
+            "pass at most %.2f m/s (was %.2f)", car->id.c_str(), gap, cr_ttm, cap, nero_tw_cap_);
           nero_tw_cap_ = cap;
         }
       }
@@ -3419,6 +3719,27 @@ bool StaticObstacleAvoidanceModule::neroCorridorGiveway(AvoidancePlanningData & 
       nero_cgw_pass_ = false;
       nero_cgw_stop_pose_.reset();
       const double ego_shift = helper_->getEgoShift();
+      // v7 linger_s: kept right for a car that has passed, stay kept right linger_s (no cap, no stop; any next oncoming car
+      // takes the hold over, never back left for it), then the one way back; ended early by a target ahead that needs a
+      // shift or a standing object on the right the kept-right line would run into
+      if (nero_cr::env().on && nero_cr::env().linger_s > 0.0 && !parked && ego_shift < -0.1) {
+        if (nero_cr_linger_until_ < 0.0) nero_cr_linger_until_ = now + nero_cr::env().linger_s;
+        const std::string blocked = now < nero_cr_linger_until_ ? neroCrLingerBlocked(data, ego_shift) : "time";
+        if (blocked.empty()) {
+          if (!nero_cr_lingering_) {
+            RCLCPP_WARN(
+              getLogger(), "[NERO_SOA_CGW] %s passed: stay kept right (%.2f) up to %.1f s for the next oncoming car",
+              nero_cgw_id_.c_str(), ego_shift, nero_cr::env().linger_s);
+          }
+          nero_cr_lingering_ = true;
+          return true;
+        }
+        if (nero_cr_lingering_) {
+          RCLCPP_WARN(getLogger(), "[NERO_SOA_CGW] %s linger ends (%s)", nero_cgw_id_.c_str(), blocked.c_str());
+        }
+      }
+      nero_cr_lingering_ = false;
+      nero_cr_linger_until_ = -1.0;
       // standing objects on the right seen while holding and no longer published: the module never planned a line for
       // them (sim c24 stop v13: the kerb fragment 8866c2, published only while ego held 16-19 m before it, hit at
       // 1.9 m/s after the hand-back; the car's stack registers its line while it is seen and keeps it). The way back
@@ -3493,6 +3814,7 @@ bool StaticObstacleAvoidanceModule::neroCorridorGiveway(AvoidancePlanningData & 
       nero_cgw_seen_.clear();
       RCLCPP_WARN(getLogger(), "[NERO_SOA_CGW] %s %s: the hold ends", nero_cgw_id_.c_str(), why.c_str());
       nero_cgw_active_ = false;
+      nero_cr_open_ = false;  // NERO_SOA_CORRIDOR_GIVEWAY_CRAMPED
       nero_cgw_gone_since_ = nero_cgw_still_since_ = -1.0;
       return false;
     }
@@ -3502,6 +3824,8 @@ bool StaticObstacleAvoidanceModule::neroCorridorGiveway(AvoidancePlanningData & 
     // re-plan below: objects seen since (the keep-right target), the car's progress (the wait place / pass)
   } else if (!car || (car->id == nero_cgw_released_id_ && now < nero_cgw_until_)) {
     return false;
+  } else if (nero_cr::env().on && car->id == nero_cr_defer_id_ && now < nero_cr_defer_until_) {
+    return false;  // NERO_SOA_CORRIDOR_GIVEWAY_CRAMPED v4: an open-street meeting still more than start_s away
   }
   const bool replan = nero_cgw_active_;
 
@@ -3526,6 +3850,7 @@ bool StaticObstacleAvoidanceModule::neroCorridorGiveway(AvoidancePlanningData & 
   {
     double s0, s1, lo, hi, margin;
     bool row{true};  // NERO_SOA_CORRIDOR_GIVEWAY_TWOWAY: a real parked-row object (neroTwRowObject)
+    double soft{0.0};  // NERO_SOA_CORRIDOR_GIVEWAY_PARKED: the module's own margin with the soft one (= margin when off)
   };
   std::vector<Obj> objs;
   // a coming car: also the stretch ego drives at its keep-right line while the car goes by (PASS_LOOK_M past where they
@@ -3562,6 +3887,18 @@ bool StaticObstacleAvoidanceModule::neroCorridorGiveway(AvoidancePlanningData & 
     if (b.s1 < -vp.base_link2rear - 1.0 || b.s0 > s_end) continue;
     b.margin = (utils::getHighestProbLabel(o.classification) == ObjectClassification::UNKNOWN ? 0.3 : 0.1) +
                nero_cgw::LAT_EXTRA;
+    b.soft = b.margin;
+    if (nero_pk::env().on) {
+      // NERO_SOA_CORRIDOR_GIVEWAY_PARKED: a standing vehicle: the module's own margins for a parked vehicle
+      const auto lb = utils::getHighestProbLabel(o.classification);
+      const bool veh = lb == ObjectClassification::CAR || lb == ObjectClassification::TRUCK || lb == ObjectClassification::BUS ||
+                       lb == ObjectClassification::TRAILER || lb == ObjectClassification::MOTORCYCLE;
+      if (veh && parameters_->object_parameters.count(lb)) {
+        const auto & op = parameters_->object_parameters.at(lb);
+        b.margin = std::max(b.margin, op.envelope_buffer_margin + op.lateral_hard_margin_for_parked_vehicle);
+        b.soft = std::max(b.margin, b.margin + op.lateral_soft_margin);
+      }
+    }
     b.row = !nero_tw::env().on || neroTwRowObject(o);
     objs.push_back(b);
   }
@@ -3569,29 +3906,57 @@ bool StaticObstacleAvoidanceModule::neroCorridorGiveway(AvoidancePlanningData & 
   // car's lane side: below the car's lowest edge) by its margin, at most IN_LANE_M inside the lane's right bound
   const auto right_room = neroInLaneShiftLimit(data, false, nero_cgw::IN_LANE_M);
   const double floor_c = right_room ? -right_room.value() : ego_shift;
-  const auto req = [&](const double s) {
+  // NERO_SOA_CORRIDOR_GIVEWAY_CRAMPED v7 inlane: an object ego could only pass out of its own lane is not passed while the
+  // car comes (obstacle_stop holds ego before it; the module's own plan after the car)
+  std::optional<double> cr_lane_max;
+  if (nero_cr::env().on && nero_cr::env().inlane) cr_lane_max = neroInLaneShiftLimit(data, true, nero_cgw::IN_LANE_M);
+  const auto req = [&](const double s, const bool soft = false) {
     double r = floor_c;
     for (const auto & b : objs) {
       if (0.5 * (b.lo + b.hi) >= car->lat_lo || b.s1 < s - vp.base_link2rear - 0.3 || b.s0 > s + vp.base_link2front + 0.3) {
         continue;
       }
-      r = std::max(r, b.hi + b.margin + half_w);
+      if (cr_lane_max && b.hi + b.margin + half_w > cr_lane_max.value()) continue;
+      r = std::max(r, b.hi + (soft ? b.soft : b.margin) + half_w);
     }
     return r;
   };
   // the room the car has beside ego's body (keeping right) at arc length s: to the nearest standing object on the
   // other side along the car's length, or the drivable area's left bound
+  // NERO_SOA_PROJ_FAST (realsim 2026-10-29, QUEUE CGWR): the bound's lateral offset only for the nearest bound point (the
+  // loop below called the path-copying calcLateralOffset at every new minimum: ~6 ms per call, 14-24 calls per plan at the
+  // 59808 junction = 72-145 ms CPU / 288-398 ms at the car's load -> MRMs, realsim set / candidate) and once per place per
+  // plan: the same numbers (the first bound point at the smallest distance, as the strict < kept it)
+  std::unordered_map<int64_t, double> nero_le_memo;
   const auto left_edge = [&](const double s) {
+    int64_t mkey = 0;
+    if (nero_proj::fast()) {
+      std::memcpy(&mkey, &s, sizeof(mkey));
+      const auto it = nero_le_memo.find(mkey);
+      if (it != nero_le_memo.end()) return it->second;
+    }
     double best = 1e9;
     if (!data.left_bound.empty()) {
       const auto p = autoware::motion_utils::calcLongitudinalOffsetPose(ref, getEgoPosition(), std::max(0.0, s));
       if (p) {
         double dmin = 1e9;
-        for (const auto & q : data.left_bound) {
-          const double d = autoware_utils::calc_distance2d(p->position, q);
-          if (d < dmin) {
-            dmin = d;
-            best = autoware::motion_utils::calcLateralOffset(ref, q);
+        if (nero_proj::fast()) {
+          const geometry_msgs::msg::Point * qmin = nullptr;
+          for (const auto & q : data.left_bound) {
+            const double d = autoware_utils::calc_distance2d(p->position, q);
+            if (d < dmin) {
+              dmin = d;
+              qmin = &q;
+            }
+          }
+          if (qmin) best = autoware::motion_utils::calcLateralOffset(ref, *qmin);
+        } else {
+          for (const auto & q : data.left_bound) {
+            const double d = autoware_utils::calc_distance2d(p->position, q);
+            if (d < dmin) {
+              dmin = d;
+              best = autoware::motion_utils::calcLateralOffset(ref, q);
+            }
           }
         }
       }
@@ -3602,6 +3967,7 @@ bool StaticObstacleAvoidanceModule::neroCorridorGiveway(AvoidancePlanningData & 
       }
       best = std::min(best, b.lo);
     }
+    if (nero_proj::fast()) nero_le_memo.emplace(mkey, best);
     return best;
   };
   double tgt = floor_c;
@@ -3686,10 +4052,16 @@ bool StaticObstacleAvoidanceModule::neroCorridorGiveway(AvoidancePlanningData & 
   bool pass = false;
   double on_need = -1.0;    // passing: where (arc length of ego's base_link) a standing object past the meeting first
   double on_shift = -1e9;   // needs ego further left, and how far
+  double on_shift_hard = -1e9;  // NERO_SOA_CORRIDOR_GIVEWAY_PARKED: the same with the hard margins (a line merged into the
+                                // first one runs while the car still comes: never with the soft margin; sim knife v7c)
   if (car->v > 0.0) {
     const double s_meet = std::max(0.0, car->s_near * v_ego / std::max(v_ego + car->v, 0.1));
     double t = floor_c;
-    for (double s = 0.0; s <= std::max(s_meet, s_stop) + vp.base_link2front; s += nero_cgw::STEP) t = std::max(t, req(s));
+    double t_soft = floor_c;  // NERO_SOA_CORRIDOR_GIVEWAY_PARKED: the same with the module's soft margin to parked vehicles
+    for (double s = 0.0; s <= std::max(s_meet, s_stop) + vp.base_link2front; s += nero_cgw::STEP) {
+      t = std::max(t, req(s));
+      t_soft = std::max(t_soft, req(s, true));
+    }
     if (car->lo_pred >= t + half_w + nero_cgw::PASS_CLEAR_M) {
       pass = true;
       // as far right as the car needs (its line PASS_CLEAR_M + 0.1 off ego's body), at least KEEP_RIGHT_M, never left of
@@ -3699,20 +4071,123 @@ bool StaticObstacleAvoidanceModule::neroCorridorGiveway(AvoidancePlanningData & 
       // NERO_SOA_CORRIDOR_GIVEWAY_TWOWAY: the same car still coming: the line never moves back left for it (holding, the
       // car search does not predict its parked row again: sim tws crazy_rowA v6 relaxed -0.61 -> -0.30 and the car
       // swinging round its parked car met the robot there); only the right side (t) moves it left
-      if (nero_tw::env().on && replan && car->id == nero_tw_plan_id_) {
-        tgt = std::max(t, std::min(tgt, nero_cgw_shift_));
+      if (
+        nero_tw::env().on && replan &&
+        (car->id == nero_tw_plan_id_ || (nero_cr::env().on && nero_cr::env().linger_s > 0.0))) {
+        tgt = std::max(t, std::min(tgt, nero_cgw_shift_));  // (v6: for the next car of a stream too: one way back, at the end)
+      }
+      // NERO_SOA_CORRIDOR_GIVEWAY_PARKED: into the parked vehicles' soft margin only as far as the car's minimum pass
+      // clearance needs (never past their hard margin: t)
+      if (nero_pk::env().on) {
+        tgt = std::max(tgt, std::min(t_soft, std::max(t, car->lo_pred - half_w - nero_cgw::PASS_CLEAR_M - 0.1)));
       }
       // ... and ego drives that line on while the car goes by, until the hold ends: standing objects PASS_LOOK_M past
       // the meeting that need ego further left (sim c24 squeeze_plag v17: the kerb fragment bf50aa, obstacle_stop
       // braked -2.94) are cleared just in time by a second line that ends where the first of them begins, not while
       // the car still comes (v18 moved 0.2 m left at the meeting for fragments 6-10 m past it)
+      // (NERO_SOA_CORRIDOR_GIVEWAY_PARKED: with the soft margin: the car is gone there)
+      const bool pk = nero_pk::env().on;
       const double s_from = std::max(s_meet, s_stop) + vp.base_link2front;
       for (double s = s_from; s <= s_from + nero_cgw::PASS_LOOK_M; s += nero_cgw::STEP) {
-        if (req(s) > tgt + 0.05) {
+        if (req(s, pk) > tgt + 0.05) {
           if (on_need < 0.0) on_need = s;
-          on_shift = std::max(on_shift, req(s));
+          on_shift = std::max(on_shift, req(s, pk));
+          on_shift_hard = std::max(on_shift_hard, req(s));
         }
       }
+    }
+  }
+  // NERO_SOA_CORRIDOR_GIVEWAY_CRAMPED: a coming car that does not clear ego's keep-right body is waited for only where it
+  // is cramped (ego as far right as it can leaves it less than its width + 2 side_m beside ego around the meeting)
+  // v6 (a): a coming car whose line clears ego's body where it is by no_move_m: no give-way for it (no move, no cap)
+  if (
+    nero_cr::env().on && nero_cr::env().no_move_m > 0.0 && !replan && car->v > 0.0 &&
+    car->lo_pred - (ego_shift + half_w) >= nero_cr::env().no_move_m) {
+    nero_cr_defer_id_ = car->id;
+    nero_cr_defer_until_ = now + 0.3;
+    return false;
+  }
+  // NERO_SOA_CORRIDOR_GIVEWAY_CRAMPED v7 far, a STANDING car (facing ego) beyond a stop line / junction lanelet that ego
+  // reaches first and can still stop at comfortably: ego stops there anyway, the give-way waits until ego is past it or
+  // slower than 2 m/s (field #7 replayed: c695 standing 30.5 m out at a junction mouth, the stop line ~22 m ahead ->
+  // "wait 7.3 m ahead", 23 m before it). Never for a car before the next stop (#24's corridor: its stop line lies 80 m
+  // on; a deferral there by time alone stood the robot for good once obstacle_stop had stopped it, sim c24 stop v7d).
+  if (nero_cr::env().on && nero_cr::env().far && !replan && car->v <= 0.0 && v_ego >= 2.0) {
+    for (const double d : neroStopsAhead(data)) {
+      if (d > 0.0 && d < car->s_near - 1.0 && d - vp.base_link2front >= s_cmf) {
+        nero_cr_defer_id_ = car->id;
+        nero_cr_defer_until_ = now + 0.3;
+        return false;
+      }
+    }
+  }
+  bool cr_open = false;
+  double cr_room = -1.0;
+  if (nero_cr::env().on && nero_tw::env().on && car->v > 0.0 && car->id != nero_cr_late_id_) {
+    const double s_m = nero_tw::meet_s(car->s_near, v_ego, car->v);
+    double t_r = floor_c;
+    double t_r_soft = floor_c;  // NERO_SOA_CORRIDOR_GIVEWAY_PARKED
+    for (double s = 0.0; s <= s_m + vp.base_link2front + nero_cgw::STEP; s += nero_cgw::STEP) {
+      t_r = std::max(t_r, req(s));
+      t_r_soft = std::max(t_r_soft, req(s, true));
+    }
+    cr_room = 1e9;
+    for (double s = std::max(0.0, s_m - 3.0); s <= s_m + 3.0; s += nero_cgw::STEP) {
+      cr_room = std::min(cr_room, left_edge(s) - (t_r + half_w));
+    }
+    // v4 (Ahmed at the realsim drive: "it held the right for a long time"): on an open street the give-way starts only
+    // start_s before they meet (the keep-right line + its pass cap for the meeting itself, then back): v3 kept right
+    // from first sight 26-34 m out, ~10 s per oncoming car. Re-checked every 0.3 s until then.
+    const double cr_ttm0 = nero_cr::ttm(car->s_near, vp.base_link2front, v_ego, car->v);
+    if (nero_tw::env().debug) {
+      RCLCPP_WARN(
+        getLogger(), "[NERO_SOA_CGWD] %s cramped test: room beside ego %.2f m around the meeting (needs %.2f + %.2f), %.1f s "
+        "before it%s", car->id.c_str(), cr_room, need, nero_cr::env().open_m, cr_ttm0, replan ? " (re-plan)" : "");
+    }
+    // v7 far: wherever the comfortable stop for the car is still ahead (cramped or not), no give-way before start_s
+    const bool cr_far = nero_cr::env().far && cr_ttm0 > nero_cr::env().start_s &&
+                        s_stop >= s_cmf + v_ego * 0.3 + 1.0;
+    if (!replan && ((cr_room >= need + nero_cr::env().open_m && cr_ttm0 > nero_cr::env().start_s) || cr_far)) {
+      nero_cr_defer_id_ = car->id;
+      nero_cr_defer_until_ = now + 0.3;
+      return false;
+    }
+    if (!pass && cr_room >= need + nero_cr::env().open_m) {
+      cr_open = true;
+      pass = true;
+      tgt = std::max(
+        t_r, std::min({ego_shift, car->lo_pred - half_w - nero_tw::keep_clear(tw_street) - 0.1, -nero_cgw::KEEP_RIGHT_M}));
+      if (replan && (car->id == nero_tw_plan_id_ || nero_cr::env().linger_s > 0.0)) {
+        tgt = std::max(t_r, std::min(tgt, nero_cgw_shift_));  // as twoway: never back left for the same car (v6: nor the next)
+      }
+      if (nero_pk::env().on) {  // NERO_SOA_CORRIDOR_GIVEWAY_PARKED (as the pass above)
+        tgt = std::max(tgt, std::min(t_r_soft, std::max(t_r, car->lo_pred - half_w - nero_cgw::PASS_CLEAR_M - 0.1)));
+      }
+      // ... and as a pass: standing objects PASS_LOOK_M past the meeting that need ego further left get the second line
+      const bool pk = nero_pk::env().on;
+      const double s_from = std::max(s_m, s_stop) + vp.base_link2front;
+      for (double s = s_from; s <= s_from + nero_cgw::PASS_LOOK_M; s += nero_cgw::STEP) {
+        if (req(s, pk) > tgt + 0.05) {
+          if (on_need < 0.0) on_need = s;
+          on_shift = std::max(on_shift, req(s, pk));
+          on_shift_hard = std::max(on_shift_hard, req(s));
+        }
+      }
+    }
+  }
+  // NERO_SOA_CORRIDOR_GIVEWAY_CRAMPED v7 inlane: a standing object past the meeting that ego could only pass out of its
+  // own lane (into the oncoming lane the car comes down) gets no second line: ego keeps right and passes the car, the
+  // object stays in its path, and obstacle_stop's own stop before it (known from far: soft) holds ego there; after the
+  // car the module's own plan takes over (the linger ends for a target that needs a shift). A wait of the give-way's own
+  // at the car's latest stop braked -3.4 (sim park10 v7a).
+  if (nero_cr::env().on && nero_cr::env().inlane && pass && on_need >= 0.0) {
+    const auto lr = neroInLaneShiftLimit(data, true, nero_cgw::IN_LANE_M);
+    if (lr && on_shift > lr.value()) {
+      RCLCPP_WARN(
+        getLogger(), "[NERO_SOA_CGW] %s inlane: a standing object %.1f m ahead needs ego at %.2f, out of its lane (max %.2f): "
+        "no second line (obstacle_stop's stop before it)", car->id.c_str(), on_need, on_shift, lr.value());
+      on_need = -1.0;
+      on_shift = -1e9;
     }
   }
   if (!pass && car->v <= 0.0) {
@@ -3755,7 +4230,7 @@ bool StaticObstacleAvoidanceModule::neroCorridorGiveway(AvoidancePlanningData & 
       on_start = on_need - len;
       on_len = len;
     } else {
-      tgt = std::max(tgt, on_shift);
+      tgt = std::max(tgt, nero_pk::env().on ? on_shift_hard : on_shift);
       ease = std::max(nero_ovl::MIN_EASE_DISTANCE, helper_->getNominalAvoidanceDistance(std::abs(tgt - ego_shift)));
       ease = std::min(ease, std::max(nero_ovl::MIN_EASE_DISTANCE, on_need));
     }
@@ -3770,8 +4245,20 @@ bool StaticObstacleAvoidanceModule::neroCorridorGiveway(AvoidancePlanningData & 
     const bool new_line = !replan || std::abs(tgt - nero_cgw_shift_) > 0.1 || std::abs(on - nero_cgw_on_) > 0.1;
     const double sh_meet =
       new_line ? ego_shift + (tgt - ego_shift) * std::min(1.0, s_m / std::max(ease, 0.1)) : neroTwShiftAt(s_m);
-    const double cap = !pass ? -1.0 : tw_street ? nero_tw::pass_cap(car->lo_pred - (sh_meet + half_w)) : nero_cgw::PASS_V;
-    if (pass && (std::abs(cap - nero_tw_cap_) > 0.05 || tw_street != nero_tw_street_ || !nero_cgw_pass_ || !replan)) {
+    const double cap = !pass                                         ? -1.0
+                       : cr_open ? nero_cr::open_cap(
+                                     car->lo_pred - (sh_meet + half_w),
+                                     nero_cr::ttm(car->s_near, vp.base_link2front, v_ego, car->v))
+                       : tw_street ? nero_tw::pass_cap(car->lo_pred - (sh_meet + half_w))
+                                   : nero_cgw::PASS_V;
+    if (cr_open && (!nero_cr_open_ || std::abs(cap - nero_tw_cap_) > 0.05 || !replan)) {
+      RCLCPP_WARN(
+        getLogger(), "[NERO_SOA_CGW] %s cramped: no (room beside ego %.2f m where they meet, needs %.2f + %.2f): keep right "
+        "%.2f, no wait, its line %.2f m off ego's body: %s %.2f m/s", car->id.c_str(), cr_room, need, nero_cr::env().open_m, tgt,
+        car->lo_pred - (sh_meet + half_w), cap < 0.0 ? "no slow-down" : "pass at most", cap);
+    }
+    nero_cr_open_ = cr_open;
+    if (!cr_open && pass && (std::abs(cap - nero_tw_cap_) > 0.05 || tw_street != nero_tw_street_ || !nero_cgw_pass_ || !replan)) {
       RCLCPP_WARN(
         getLogger(), "[NERO_SOA_CGW] %s twoway: %s (its lane's room %.2f m, needs %.2f), its line %.2f m off ego's "
         "body where they meet (%.2f, keep right %.2f): %s %.2f m/s", car->id.c_str(), tw_street ? "a street" : "a corridor",
