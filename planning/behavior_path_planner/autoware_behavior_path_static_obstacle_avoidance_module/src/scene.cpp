@@ -34,6 +34,7 @@
 #include <autoware_lanelet2_extension/utility/utilities.hpp>
 #include <autoware_utils/geometry/geometry.hpp>
 #include <autoware_utils/math/normalization.hpp>
+#include <boost/geometry/algorithms/convex_hull.hpp>
 #include <magic_enum.hpp>
 #include <tf2/utils.h>
 #include <lanelet2_core/geometry/LineString.h>
@@ -362,6 +363,79 @@ bool debug()
     return v && std::atoi(v) > 0;
   }();
   return r;
+}
+// NERO_SOA_RETURN_CLEAR_PLACE="unseen_s,match_m,merge_v,partial,grow_m" (2026-10-31, kerbhold job, QUEUE RCLH, capture 10-27
+// #7 "bad" 20:47:27, lanelet 41966): the hold above is decided from scratch every cycle against the objects of that
+// cycle. Out of its lane past a parked car, it held for a kerb UNKNOWN (90eca0da) for one cycle; the module then made
+// its own line for that object and for its new id at the same place (c5bde076), sized on the polygon of that moment, and
+// the hold found it "clear"; back in the lane it no longer looked. The fragment's polygon flickered 0.2-0.45 m toward the
+// path, the line passed it at 0.32 m and obstacle_stop stopped the robot at once at 18.6 km/h (operator took over).
+// With the switch, every standing object the hold runs into is remembered as a PLACE: the convex hull of everything
+// seen there (any id, any reported speed below merge_v, within match_m of the hull and PLACE_CENTRE_M of the first
+// centre). A place stays while something is seen there (gone for unseen_s: dropped) until ego's rear is LON_MARGIN past
+// it, and counts as a standing object every cycle, also with the body back in its lane: any plan point within
+// obstacle_stop's margin + LAT_EXTRA of its hull is held, and a return toward the lane stops grow_m further from it (a
+// fragment's polygon can still grow toward the path as ego nears: field 0.45 m of flicker, the S3 growth 0.4 m). With
+// partial = 1 the hold eases toward the lane to that shift (at least the module's own lateral margin for the class, hard
+// + soft + envelope buffer; never past the shift that keeps the body in its lane) instead of staying out at ego's shift
+// (no longer in the next lane than needed; the whole profile is checked as before, else the full hold). A place that grew toward a shift already held gets a step out of at most STEP_OUT_MAX, only with no moving
+// vehicle beside ego on that side (Ahmed 10-23: never a step toward a car alongside); otherwise the shift is held.
+struct PlaceCfg
+{
+  bool on{false};
+  double unseen_s{1.0};
+  double match_m{1.0};
+  double merge_v{2.0};
+  bool partial{true};
+  double grow_m{0.4};
+};
+const PlaceCfg & place_cfg()
+{
+  static const PlaceCfg c = [] {
+    PlaceCfg r;
+    const char * v = std::getenv("NERO_SOA_RETURN_CLEAR_PLACE");
+    double a[5] = {r.unseen_s, r.match_m, r.merge_v, 1.0, r.grow_m};
+    if (v && std::sscanf(v, "%lf,%lf,%lf,%lf,%lf", &a[0], &a[1], &a[2], &a[3], &a[4]) >= 1 && a[0] > 0.0) {
+      r.on = true;
+      r.unseen_s = a[0];
+      r.match_m = a[1];
+      r.merge_v = a[2];
+      r.partial = a[3] > 0.0;
+      r.grow_m = std::max(0.0, a[4]);
+    }
+    std::fprintf(
+      stderr, "[NERO_SOA] return_clear_place=%d (%.2f,%.2f,%.2f,%d,%.2f)\n", r.on, r.unseen_s, r.match_m, r.merge_v,
+      r.partial, r.grow_m);
+    return r;
+  }();
+  return c;
+}
+constexpr double PLACE_CENTRE_M = 3.0;  // a place never wanders along a kerb: its objects stay this near its first centre
+constexpr double STEP_OUT_MAX = 0.3;    // a place that grew toward the shift held: at most this much further out
+constexpr double SIDE_LAT_M = 3.0;      // ... and only with no moving vehicle this near the body on that side
+constexpr double SIDE_BACK_M = 15.0;    //     from this far behind ego
+constexpr double SIDE_FRONT_M = 40.0;   //     to this far ahead (an oncoming car on that side too)
+constexpr double SIDE_MIN_V = 1.0;      //     moving = from this speed
+constexpr double PARTIAL_BUFFER = 0.05; // the eased shift keeps this much more than the module's own margin
+constexpr double PARTIAL_STEP = 0.3;    // ... else once more this much further out, else the full hold
+struct Place
+{
+  autoware_utils::Polygon2d hull;  // the convex hull of everything seen there (map frame)
+  geometry_msgs::msg::Point c0;    // the centre of the object first held there
+  double margin{0.0};              // obstacle_stop's lateral margin for the class + LAT_EXTRA (UNKNOWN wins)
+  double keep{0.0};                // the module's own lateral margin for the class (largest seen)
+  double last_seen{0.0};
+  std::string ids;                 // every id seen there, in order
+};
+std::vector<Place> & places()
+{
+  static std::vector<Place> p;  // file scope: the manager replaces module instances
+  return p;
+}
+double & places_t()
+{
+  static double t = -1.0;
+  return t;
 }
 }  // namespace nero_rcl
 
@@ -2580,26 +2654,122 @@ void StaticObstacleAvoidanceModule::neroReturnClear(AvoidancePlanningData & data
 {
   const auto ego_shift = helper_->getEgoShift();
   const auto room = neroInLaneShiftLimit(data, ego_shift > 0.0, 0.0);
-  if (!room || std::abs(ego_shift) <= room.value() || nero_paused_ || nero_returning_ || nero_cgw_active_) {
-    nero_rcl_holding_ = false;  // the body is in its lane, or overtake v6's pause / quick return / the give-way has it
-    return;
-  }
   const auto & sp = data.candidate_path;
   const auto & ref = data.reference_path.points;
-  if (
-    ref.size() < 2 || sp.path.points.size() != ref.size() || sp.shift_length.size() != ref.size() ||
-    data.arclength_from_ego.size() != ref.size() || !planner_data_->dynamic_object) {
-    return;
-  }
+  const bool valid =
+    ref.size() >= 2 && sp.path.points.size() == ref.size() && sp.shift_length.size() == ref.size() &&
+    data.arclength_from_ego.size() == ref.size() && planner_data_->dynamic_object;
   const auto t_start = std::chrono::steady_clock::now();
   const auto & vp = planner_data_->parameters;
   const double half_w = 0.5 * vp.vehicle_width;
+  const auto stop_margin = [](const uint8_t label) {
+    return (label == ObjectClassification::UNKNOWN ? 0.3 : 0.1) + nero_rcl::LAT_EXTRA;
+  };
+  const auto keep_margin = [&](const uint8_t label) {  // the module's own lateral margin for the class
+    const auto it = parameters_->object_parameters.find(label);
+    if (it == parameters_->object_parameters.end()) return stop_margin(label);
+    const auto & op = it->second;
+    return std::max(stop_margin(label), op.lateral_hard_margin + op.lateral_soft_margin + op.envelope_buffer_margin);
+  };
+  const auto uuid_id = [](const unique_identifier_msgs::msg::UUID & u) {
+    char id[8];
+    std::snprintf(id, sizeof(id), "%02x%02x", u.uuid[0], u.uuid[1]);
+    return std::string(id);
+  };
+
+  // NERO_SOA_RETURN_CLEAR_PLACE: the places held before, joined by what is seen there now, dropped when gone or passed
+  const auto & pc = nero_rcl::place_cfg();
+  auto & places = nero_rcl::places();
+  struct PlaceAt
+  {
+    size_t k;
+    double s_near, s_far, l_lo, l_hi;
+  };
+  std::vector<PlaceAt> place_at;
+  std::optional<nero_proj::Proj<std::decay_t<decltype(ref)>>> proj;
+  const auto sl_of = [&](const double x, const double y) {  // arc length from ego / lateral (+ left) along the path
+    const auto q = autoware_utils::create_point(x, y, 0.0);
+    const size_t seg = nero_cgw::seg_of(ref, q, &proj.value());
+    return std::make_pair(
+      data.arclength_from_ego.at(seg) + proj->lonToSegment(seg, q), proj->lateral(q, seg));
+  };
+  const double now = clock_->now().seconds();
+  if (pc.on && valid) {
+    if (now < nero_rcl::places_t() - 1.0) places.clear();  // the clock went back: another run
+    nero_rcl::places_t() = now;
+    proj.emplace(ref);
+    for (const auto & o : planner_data_->dynamic_object->objects) {
+      if (places.empty()) break;
+      const auto & tw = o.kinematics.initial_twist_with_covariance.twist.linear;
+      if (std::hypot(tw.x, tw.y) >= pc.merge_v) continue;  // a passing car never joins a place
+      const auto & c = o.kinematics.initial_pose_with_covariance.pose.position;
+      std::optional<autoware_utils::Polygon2d> poly;
+      for (auto & pl : places) {
+        if (std::hypot(c.x - pl.c0.x, c.y - pl.c0.y) > nero_rcl::PLACE_CENTRE_M) continue;
+        if (!poly) poly = autoware_utils::to_polygon2d(o.kinematics.initial_pose_with_covariance.pose, o.shape);
+        if (boost::geometry::distance(poly.value(), pl.hull) > pc.match_m) continue;
+        autoware_utils::Polygon2d all = pl.hull;
+        for (const auto & q : poly->outer()) all.outer().push_back(q);
+        autoware_utils::Polygon2d hull;
+        boost::geometry::convex_hull(all, hull);
+        pl.hull = hull;
+        pl.last_seen = now;
+        const auto label = utils::getHighestProbLabel(o.classification);
+        pl.margin = std::max(pl.margin, stop_margin(label));
+        pl.keep = std::max(pl.keep, keep_margin(label));
+        const auto id = uuid_id(o.object_id);
+        if (pl.ids.find(id) == std::string::npos) {
+          pl.ids += ">" + id;
+          RCLCPP_WARN(
+            getLogger(), "[NERO_SOA_RCL] place %s: %s seen there now (v %.2f): the hold carries on with the place",
+            pl.ids.c_str(), id.c_str(), std::hypot(tw.x, tw.y));
+        }
+        break;
+      }
+    }
+    for (size_t k = 0; k < places.size();) {
+      PlaceAt at{k, 1e9, -1e9, 1e9, -1e9};
+      for (const auto & q : places.at(k).hull.outer()) {
+        const auto [s_q, l_q] = sl_of(q.x(), q.y());
+        if (!std::isfinite(s_q) || !std::isfinite(l_q)) continue;
+        at.s_near = std::min(at.s_near, s_q);
+        at.s_far = std::max(at.s_far, s_q);
+        at.l_lo = std::min(at.l_lo, l_q);
+        at.l_hi = std::max(at.l_hi, l_q);
+      }
+      const bool gone = now - places.at(k).last_seen > pc.unseen_s;
+      const bool passed = at.s_far < -vp.base_link2rear - nero_rcl::LON_MARGIN;
+      if (gone || passed || at.s_near > nero_rcl::HORIZON + 30.0) {
+        RCLCPP_INFO(
+          getLogger(), "[NERO_SOA_RCL] place %s released: %s", places.at(k).ids.c_str(),
+          gone ? "nothing seen there" : (passed ? "ego's rear is past it" : "far away"));
+        places.erase(places.begin() + static_cast<std::ptrdiff_t>(k));
+        continue;
+      }
+      place_at.push_back(at);
+      ++k;
+    }
+  }
+  if (
+    !room || (std::abs(ego_shift) <= room.value() && place_at.empty()) || nero_paused_ || nero_returning_ ||
+    nero_cgw_active_) {
+    nero_rcl_holding_ = false;  // the body is in its lane, or overtake v6's pause / quick return / the give-way has it
+    return;
+  }
+  if (!valid) {
+    return;
+  }
   struct Standing
   {
     autoware_utils::Polygon2d poly;
     double margin;        // obstacle_stop's lateral margin for the class (UNKNOWN 0.3, others 0.1) + LAT_EXTRA
     double s_near, s_far; // its nearest / farthest point along the reference path from ego
     std::string id;
+    double keep{0.0};     // NERO_SOA_RETURN_CLEAR_PLACE: the module's own lateral margin for the class
+    int place{-1};        // ... a remembered place (index into places), not an object of this cycle
+    double l_lo{0.0}, l_hi{0.0};
+    bool l_ok{false};
+    geometry_msgs::msg::Point c;
   };
   // standing objects near enough to matter: along the next HORIZON m, laterally between the lane centre and ego's
   // shift (plus the body and the margin)
@@ -2621,6 +2791,10 @@ void StaticObstacleAvoidanceModule::neroReturnClear(AvoidancePlanningData & data
     st.margin =
       (utils::getHighestProbLabel(o.classification) == ObjectClassification::UNKNOWN ? 0.3 : 0.1) +
       nero_rcl::LAT_EXTRA;
+    if (pc.on) {
+      st.keep = keep_margin(utils::getHighestProbLabel(o.classification));
+      st.c = c;
+    }
     st.s_near = s_c - r;
     st.s_far = s_c + r;
     if (st.s_far < -vp.base_link2rear || st.s_near > nero_rcl::HORIZON + 30.0) continue;  // behind ego / far ahead
@@ -2631,6 +2805,24 @@ void StaticObstacleAvoidanceModule::neroReturnClear(AvoidancePlanningData & data
     st.id = id;
     objs.push_back(st);
   }
+  const size_t n_cur = objs.size();  // NERO_SOA_RETURN_CLEAR_PLACE: the remembered places follow the objects of now
+  for (const auto & at : place_at) {
+    const auto & pl = places.at(at.k);
+    Standing st;
+    st.poly = pl.hull;
+    st.margin = pl.margin;
+    st.keep = pl.keep;
+    st.s_near = at.s_near;
+    st.s_far = at.s_far;
+    st.id = "@" + pl.ids.substr(1);
+    st.place = static_cast<int>(at.k);
+    st.l_lo = at.l_lo;
+    st.l_hi = at.l_hi;
+    st.l_ok = true;
+    st.c = pl.c0;
+    objs.push_back(st);
+  }
+  const bool any_place = objs.size() > n_cur;
   const auto footprint = [&](const geometry_msgs::msg::Pose & p) {
     return autoware_utils::to_footprint(p, vp.base_link2front, vp.base_link2rear, vp.vehicle_width);
   };
@@ -2644,32 +2836,132 @@ void StaticObstacleAvoidanceModule::neroReturnClear(AvoidancePlanningData & data
   // the module's plan where it brings the body back toward the lane: the standing objects it runs into there that a
   // body holding ego's shift at the same place clears
   std::vector<size_t> hit;
+  std::vector<size_t> grown;  // NERO_SOA_RETURN_CLEAR_PLACE: places the shift held itself comes too near (they grew)
   double last_s = -1e9;
   for (size_t i = ego_idx; i < ref.size(); ++i) {
     const double s = data.arclength_from_ego.at(i);
     if (s > nero_rcl::HORIZON) break;
-    if (s < 0.0 || std::abs(sp.shift_length.at(i)) > std::abs(ego_shift) - nero_rcl::TOWARD_EPS) continue;
+    // a remembered place counts wherever the plan passes it, not only where the plan comes back toward the lane
+    const bool back = std::abs(sp.shift_length.at(i)) <= std::abs(ego_shift) - nero_rcl::TOWARD_EPS;
+    if (s < 0.0 || (!back && !any_place)) continue;
     if (s - last_s < STEP) continue;
     last_s = s;
     std::optional<autoware_utils::Polygon2d> f_plan;
     for (size_t k = 0; k < objs.size(); ++k) {
+      if (!back && objs.at(k).place < 0) continue;
       if (!near_s(objs.at(k), s) || std::find(hit.begin(), hit.end(), k) != hit.end()) continue;
       if (!f_plan) f_plan = footprint(sp.path.points.at(i).point.pose);
-      if (boost::geometry::distance(f_plan.value(), objs.at(k).poly) >= objs.at(k).margin) continue;
+      // a return toward the lane stops grow_m further from a place (it never pushes ego out)
+      const double m_hit = objs.at(k).margin + (back && objs.at(k).place >= 0 ? pc.grow_m : 0.0);
+      if (boost::geometry::distance(f_plan.value(), objs.at(k).poly) >= m_hit) continue;
       const auto f_hold = footprint(autoware_utils::calc_offset_pose(ref.at(i).point.pose, 0.0, ego_shift, 0.0));
-      if (boost::geometry::distance(f_hold, objs.at(k).poly) < objs.at(k).margin) continue;  // in the way out there too
+      if (boost::geometry::distance(f_hold, objs.at(k).poly) < objs.at(k).margin) {  // in the way out there too
+        if (objs.at(k).place >= 0 && std::find(grown.begin(), grown.end(), k) == grown.end()) grown.push_back(k);
+        continue;
+      }
       hit.push_back(k);
     }
   }
   const auto elapsed_ms = [&] {
     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_start).count();
   };
-  if (hit.empty()) {
+  // NERO_SOA_RETURN_CLEAR_PLACE: the shift to hold (target) and the distance over which the body eases to it from ego
+  double target = ego_shift;
+  double ease = 0.0;
+  bool reduce = false;           // eases toward the lane: the module's own margins to everything on the way
+  std::string how;
+  std::vector<size_t> held = hit;
+  std::vector<size_t> unheld;    // places that grew where no step out is allowed: held as close as ego is, not checked
+  if (pc.on && (!hit.empty() || !grown.empty())) {
+    const auto extent = [&](Standing & o) {
+      if (o.l_ok) return;
+      o.l_lo = 1e9;
+      o.l_hi = -1e9;
+      for (const auto & q : o.poly.outer()) {
+        const double l_q = sl_of(q.x(), q.y()).second;
+        if (!std::isfinite(l_q)) continue;
+        o.l_lo = std::min(o.l_lo, l_q);
+        o.l_hi = std::max(o.l_hi, l_q);
+      }
+      o.l_ok = o.l_lo <= o.l_hi;
+    };
+    double l_mid = 0.0;
+    for (const auto & ks : {hit, grown}) {
+      for (const auto k : ks) {
+        extent(objs.at(k));
+        l_mid += objs.at(k).l_lo + objs.at(k).l_hi;
+      }
+    }
+    // ego keeps to its shift's side, or (in its lane) away from what it holds for
+    const double sgn = std::abs(ego_shift) > 1.0e-3 ? (ego_shift > 0.0 ? 1.0 : -1.0) : (l_mid <= 0.0 ? 1.0 : -1.0);
+    const double u_e = sgn * ego_shift;
+    double need_keep = 0.0;  // the smallest shift (toward sgn) that keeps the module's own margin from them
+    double need_stop = 0.0;  // ... obstacle_stop's margin + LAT_EXTRA
+    double need_grow = 0.0;  // ... that margin + grow_m (room for the polygon to grow)
+    const auto need = [&](const std::vector<size_t> & ks) {
+      for (const auto k : ks) {
+        const auto & o = objs.at(k);
+        if (!o.l_ok || sgn * 0.5 * (o.l_lo + o.l_hi) >= u_e) continue;  // only what lies on the lane side of ego
+        const double u_edge = sgn > 0.0 ? o.l_hi : -o.l_lo;  // its edge toward ego's side
+        need_keep = std::max(need_keep, u_edge + half_w + std::max(o.keep, o.margin));
+        need_stop = std::max(need_stop, u_edge + half_w + o.margin);
+        need_grow = std::max(need_grow, u_edge + half_w + std::max(o.keep, o.margin + pc.grow_m));
+      }
+    };
+    need(hit);
+    need(grown);
+    // a step out toward sgn only with no moving vehicle beside ego on that side (from SIDE_BACK_M behind to
+    // SIDE_FRONT_M ahead, within SIDE_LAT_M of the body)
+    const auto side_free = [&] {
+      for (const auto & o : planner_data_->dynamic_object->objects) {
+        const auto & tw = o.kinematics.initial_twist_with_covariance.twist.linear;
+        if (std::hypot(tw.x, tw.y) < nero_rcl::SIDE_MIN_V) continue;
+        const auto & c = o.kinematics.initial_pose_with_covariance.pose.position;
+        if (std::hypot(c.x - getEgoPosition().x, c.y - getEgoPosition().y) > nero_rcl::SIDE_BACK_M + 10.0) continue;
+        const auto [s_c, l_c] = sl_of(c.x, c.y);
+        const double r = 0.5 * std::hypot(o.shape.dimensions.x, o.shape.dimensions.y);
+        if (!std::isfinite(s_c) || s_c + r < -nero_rcl::SIDE_BACK_M || s_c - r > nero_rcl::SIDE_FRONT_M) continue;
+        const double body = u_e + half_w;
+        if (sgn * l_c + r < body) continue;  // not beside ego on that side
+        if (sgn * l_c - r - body > nero_rcl::SIDE_LAT_M) continue;
+        return std::string("a moving object beside ego on that side (") + uuid_id(o.object_id) + ")";
+      }
+      return std::string();
+    };
+    if (!grown.empty() && need_stop > u_e + 0.02) {
+      const double step = need_stop - u_e;
+      const auto beside = step <= nero_rcl::STEP_OUT_MAX ? side_free() : std::string("more than the step allowed");
+      if (beside.empty()) {
+        target = sgn * need_stop;
+        ease = std::max(nero_ovl::MIN_EASE_DISTANCE, helper_->getSharpAvoidanceDistance(step));
+        how = "steps out";
+        held.insert(held.end(), grown.begin(), grown.end());
+      } else {
+        how = "no step out: " + beside;
+        unheld = grown;
+      }
+    } else if (!grown.empty()) {
+      held.insert(held.end(), grown.begin(), grown.end());
+    }
+    // + PARTIAL_BUFFER: the analytic need (lateral offsets) and the footprint check differ by mm on a curved path
+    // toward the lane down to the growth allowance, but not further out than the body in its lane needs
+    const double eased = std::max(need_keep, std::min(need_grow, room.value()));
+    if (pc.partial && how.empty() && !hit.empty() && eased + nero_rcl::PARTIAL_BUFFER < u_e - 0.05) {
+      target = sgn * std::max(0.0, eased + nero_rcl::PARTIAL_BUFFER);
+      ease = helper_->getNominalAvoidanceDistance(u_e - std::abs(target));
+      reduce = true;
+      how = "eases toward the lane";
+    }
+  }
+  if (held.empty()) {
     nero_rcl_holding_ = false;
     if (nero_rcl::debug()) {
       RCLCPP_INFO_THROTTLE(
         getLogger(), *clock_, 1000, "[NERO_SOA_RCL] out (shift %.2f): the plan back is clear (%zu objects, %.2f ms)",
         ego_shift, objs.size(), elapsed_ms());
+    }
+    if (!how.empty()) {
+      RCLCPP_WARN_THROTTLE(getLogger(), *clock_, 1000, "[NERO_SOA_RCL] shift %.2f kept: %s", ego_shift, how.c_str());
     }
     return;
   }
@@ -2684,8 +2976,13 @@ void StaticObstacleAvoidanceModule::neroReturnClear(AvoidancePlanningData & data
   // in the way back pushes the start past it; the hold itself must be clear
   double start = 0.0;
   std::string who;
-  for (const auto k : hit) {
+  for (const auto k : held) {
     auto & o = objs.at(k);
+    if (o.place >= 0) {  // NERO_SOA_RETURN_CLEAR_PLACE: a place's far end is exact already
+      start = std::max(start, o.s_far + vp.base_link2rear + nero_rcl::LON_MARGIN);
+      who += (who.empty() ? "" : ",") + o.id;
+      continue;
+    }
     o.s_far = -1e9;  // the exact far end of the objects the plan ran into
     for (const auto & q : o.poly.outer()) {
       o.s_far = std::max(
@@ -2696,62 +2993,151 @@ void StaticObstacleAvoidanceModule::neroReturnClear(AvoidancePlanningData & data
     who += (who.empty() ? "" : ",") + objs.at(k).id;
   }
   const double v = std::max(getEgoSpeed(), 1.0);
-  const double len_nominal = helper_->getNominalAvoidanceDistance(std::abs(ego_shift));
-  const double len_sharp = std::max(
-    nero_ovl::MIN_EASE_DISTANCE, autoware::motion_utils::calc_longitudinal_dist_from_jerk(
-                                   std::abs(ego_shift), parameters_->lateral_max_jerk_map.back(), v));
-  const auto y = [&](const double s, const double st, const double len) {
-    if (s <= st) return ego_shift;
-    if (s >= st + len) return 0.0;
-    const double x = (s - st) / std::max(len, 0.1);
-    return ego_shift * (1.0 - x * x * (3.0 - 2.0 * x));
+  struct Attempt
+  {
+    double target, ease;
+    bool reduce;
   };
+  double ease_start = 0.0;  // the ease toward the target starts here (past whatever it would come too near)
+  std::vector<Attempt> attempts{{target, ease, reduce}};
+  if (reduce && std::abs(target) + nero_rcl::PARTIAL_STEP < std::abs(ego_shift) - 0.05) {
+    // a little further out before the full hold (a standing object on the way back that needs a bit more room)
+    const double t2 = target + (ego_shift > 0.0 ? 1.0 : -1.0) * nero_rcl::PARTIAL_STEP;
+    attempts.push_back({t2, helper_->getNominalAvoidanceDistance(std::abs(ego_shift - t2)), true});
+  }
+  if (std::abs(target - ego_shift) > 1.0e-3 && how != "steps out") attempts.push_back({ego_shift, 0.0, false});
   std::string why = "no way back before the stop line / junction";
-  for (const double len : {len_nominal, len_sharp}) {
-    double st = start;
-    for (int iter = 0; iter < 20 && st + len <= limit; ++iter) {
-      double far = -1e9;
-      std::string blocker;
-      bool hold_blocked = false;
-      double last = -1e9;
-      for (size_t i = ego_idx; i < ref.size(); ++i) {
-        const double s = data.arclength_from_ego.at(i);
-        if (s > st + len + vp.base_link2front) break;
-        if (s < 0.0 || s - last < STEP) continue;
-        last = s;
-        std::optional<autoware_utils::Polygon2d> f;
-        for (const auto & o : objs) {
-          if (!near_s(o, s)) continue;
-          if (!f) f = footprint(autoware_utils::calc_offset_pose(ref.at(i).point.pose, 0.0, y(s, st, len), 0.0));
-          if (boost::geometry::distance(f.value(), o.poly) >= o.margin) continue;
-          if (s <= st) {
-            hold_blocked = true;
-            blocker = o.id;
-          } else if (o.s_far > far) {
-            far = o.s_far;
-            blocker = o.id;
+  for (const auto & at : attempts) {
+    target = at.target;
+    ease = at.ease;
+    ease_start = 0.0;
+    const double len_nominal = helper_->getNominalAvoidanceDistance(std::abs(target));
+    const double len_sharp = std::max(
+      nero_ovl::MIN_EASE_DISTANCE, autoware::motion_utils::calc_longitudinal_dist_from_jerk(
+                                     std::abs(target), parameters_->lateral_max_jerk_map.back(), v));
+    const auto y = [&](const double s, const double st, const double len) {
+      double h = target;
+      if (ease > 0.0 && s < ease_start + ease) {
+        const double x = std::max(s - ease_start, 0.0) / ease;
+        h = ego_shift + (target - ego_shift) * x * x * (3.0 - 2.0 * x);
+      }
+      if (s <= st) return h;
+      if (s >= st + len) return 0.0;
+      const double x = (s - st) / std::max(len, 0.1);
+      return target * (1.0 - x * x * (3.0 - 2.0 * x));
+    };
+    for (const double len : {len_nominal, len_sharp}) {
+      double st = std::max(start, ease_start + ease);
+      for (int iter = 0; iter < 20 && st + len <= limit; ++iter) {
+        double far = -1e9;
+        std::string blocker;
+        bool hold_blocked = false;
+        double blocker_far = -1e9;
+        double last = -1e9;
+        for (size_t i = ego_idx; i < ref.size(); ++i) {
+          const double s = data.arclength_from_ego.at(i);
+          if (s > st + len + vp.base_link2front) break;
+          if (s < 0.0 || s - last < STEP) continue;
+          last = s;
+          std::optional<autoware_utils::Polygon2d> f;
+          for (size_t k = 0; k < objs.size(); ++k) {
+            const auto & o = objs.at(k);
+            if (!near_s(o, s) || std::find(unheld.begin(), unheld.end(), k) != unheld.end()) continue;
+            if (!f) f = footprint(autoware_utils::calc_offset_pose(ref.at(i).point.pose, 0.0, y(s, st, len), 0.0));
+            // easing toward the lane keeps the module's own margins to everything on the way
+            const double m = at.reduce && s >= ease_start && s <= st ? std::max(o.margin, o.keep) : o.margin;
+            if (boost::geometry::distance(f.value(), o.poly) >= m) continue;
+            if (s <= st) {
+              hold_blocked = true;
+              blocker = o.id;
+              blocker_far = std::max(blocker_far, o.s_far);
+            } else if (o.s_far > far) {
+              far = o.s_far;
+              blocker = o.id;
+            }
           }
+          if (hold_blocked) break;
         }
-        if (hold_blocked) break;
+        if (hold_blocked) {
+          // easing toward the lane: start the ease once the body is past what it came too near, if it still fits
+          const double later = blocker_far + vp.base_link2rear + 0.5;
+          if (at.reduce && later > ease_start && later + ease <= start) {
+            ease_start = later;
+            st = std::max(start, ease_start + ease);
+            continue;
+          }
+          why = "holding the shift runs into " + blocker;
+          break;
+        }
+        if (far < -1e8) {
+          if (std::abs(target - ego_shift) <= 1.0e-3) {
+            neroFreezeShift(data, ego_shift, 0.0, st, len);
+          } else {
+            // NERO_SOA_RETURN_CLEAR_PLACE: ego's shift up to ease_start, eased to the target, held to st, back to the
+            // centre over len
+            neroFreezeShift(data, ego_shift, 0.0, ease_start, ease, target);
+            const auto & pts = data.reference_path.points;
+            const auto i0 = std::max(
+              ego_idx, utils::static_obstacle_avoidance::findPathIndexFromArclength(data.arclength_from_ego, st));
+            const auto i1 =
+              utils::static_obstacle_avoidance::findPathIndexFromArclength(data.arclength_from_ego, st + len);
+            if (i1 > i0 + 1 && std::abs(target) > 1.0e-2) {
+              ShiftLine back;
+              back.start = pts.at(i0).point.pose;
+              back.end = pts.at(i1).point.pose;
+              back.start_shift_length = target;
+              back.end_shift_length = 0.0;
+              path_shifter_.addShiftLine(back);
+            }
+          }
+          data.new_shift_line.clear();
+          data.safe_shift_line.clear();
+          if (!pc.on) {
+            RCLCPP_WARN_THROTTLE(
+              getLogger(), *clock_, 1000,
+              "[NERO_SOA_RCL] the way back toward the lane ran into %s: shift %.2f held, back from %.1f m over %.1f m "
+              "(stop line / junction %.1f m; %zu objects, %.2f ms)",
+              who.c_str(), ego_shift, st, len, limit, objs.size(), elapsed_ms());
+          } else {
+            RCLCPP_WARN_THROTTLE(
+              getLogger(), *clock_, 1000,
+              "[NERO_SOA_RCL] the way back toward the lane ran into %s: shift %.2f -> %.2f held (%s from %.1f m over "
+              "%.1f m), back from %.1f m over %.1f m (stop line / junction %.1f m; %zu objects, %zu places, %.2f ms)",
+              who.c_str(), ego_shift, target, how.empty() ? "kept" : how.c_str(), ease_start, ease, st, len, limit,
+              objs.size(), places.size(), elapsed_ms());
+            // every object of this cycle it held for is a place from now on (or joins the one it is at)
+            for (const auto k : held) {
+              const auto & o = objs.at(k);
+              if (o.place >= 0) continue;
+              bool known = false;
+              for (const auto & pl : places) {
+                if (
+                  std::hypot(o.c.x - pl.c0.x, o.c.y - pl.c0.y) <= nero_rcl::PLACE_CENTRE_M &&
+                  boost::geometry::distance(o.poly, pl.hull) <= pc.match_m) {
+                  known = true;
+                  break;
+                }
+              }
+              if (known) continue;
+              nero_rcl::Place pl;
+              boost::geometry::convex_hull(o.poly, pl.hull);
+              pl.c0 = o.c;
+              pl.margin = o.margin;
+              pl.keep = std::max(o.keep, o.margin);
+              pl.last_seen = now;
+              pl.ids = ">" + o.id;
+              places.push_back(pl);
+              RCLCPP_WARN(
+                getLogger(), "[NERO_SOA_RCL] place %s held: kept until ego's rear is %.1f m past it",
+                o.id.c_str(), nero_rcl::LON_MARGIN);
+            }
+          }
+          nero_rcl_holding_ = true;
+          return;
+        }
+        st = std::max(st, far + vp.base_link2rear + nero_rcl::LON_MARGIN);
+        why = "way back blocked up to " + blocker;
       }
-      if (hold_blocked) {
-        why = "holding the shift runs into " + blocker;
-        break;
-      }
-      if (far < -1e8) {
-        neroFreezeShift(data, ego_shift, 0.0, st, len);
-        data.new_shift_line.clear();
-        data.safe_shift_line.clear();
-        RCLCPP_WARN_THROTTLE(
-          getLogger(), *clock_, 1000,
-          "[NERO_SOA_RCL] the way back toward the lane ran into %s: shift %.2f held, back from %.1f m over %.1f m "
-          "(stop line / junction %.1f m; %zu objects, %.2f ms)",
-          who.c_str(), ego_shift, st, len, limit, objs.size(), elapsed_ms());
-        nero_rcl_holding_ = true;
-        return;
-      }
-      st = std::max(st, far + vp.base_link2rear + nero_rcl::LON_MARGIN);
-      why = "way back blocked up to " + blocker;
     }
   }
   nero_rcl_holding_ = false;
