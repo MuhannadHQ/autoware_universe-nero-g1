@@ -48,5 +48,13 @@
     <group>
       <include file="$(find-pkg-share autoware_remaining_distance_time_calculator)/launch/remaining_distance_time_calculator.launch.xml"/>
     </group>
+
+    <!-- [nero 2026-11-02 TRJ2] NERO_STAGE_WATCH=1: a read-only observer of the planning chain (autoware_nero_stage_watch).
+         When the trajectory stalls it names the stage and what the planning processes' threads did ([NERO_STAGE_WATCH]
+         lines in /rosout). It publishes nothing. Unset, empty, 0, false or off: not launched (any other value launches
+         it; never a launch error). -->
+    <group if="$(eval &quot;'$(env NERO_STAGE_WATCH 0)'.strip().lower() not in ('', '0', 'false', 'off', 'no')&quot;)">
+      <node pkg="autoware_nero_stage_watch" exec="nero_stage_watch" name="nero_stage_watch" output="screen"/>
+    </group>
   </group>
 </launch>

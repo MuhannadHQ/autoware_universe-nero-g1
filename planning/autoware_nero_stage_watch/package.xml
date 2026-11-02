@@ -1,0 +1,16 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>autoware_nero_stage_watch</name>
+  <version>0.1.0</version>
+  <description>NERO_STAGE_WATCH (trajstall, QUEUE TRJ2): names the planning stage of a trajectory stall and what its threads did</description>
+  <maintainer email="ahmed.q@usenero.com">Ahmed_Alqurashi</maintainer>
+  <license>Apache License 2.0</license>
+  <buildtool_depend>ament_cmake_auto</buildtool_depend>
+  <depend>rclcpp</depend>
+  <exec_depend>autoware_planning_msgs</exec_depend>
+  <exec_depend>autoware_internal_planning_msgs</exec_depend>
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

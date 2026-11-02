@@ -1,0 +1,6 @@
+cmake_minimum_required(VERSION 3.14)
+project(autoware_nero_stage_watch)
+find_package(autoware_cmake REQUIRED)
+autoware_package()
+ament_auto_add_executable(nero_stage_watch src/stage_watch_node.cpp)
+ament_auto_package()
