@@ -8,8 +8,31 @@
   <arg name="input/objects"/>
   <arg name="output/objects"/>
 
+  <!-- [nero 2026-11-01 VALRANGE] NERO_VAL_BODY set: the same validator loaded into the pointcloud container, so that it
+       reads the raw concatenated cloud intra-process (the vehicle lower-body evidence); unset: the stock node -->
+  <arg name="nero_pointcloud_container" default="/pointcloud_container"/>
+  <arg name="nero_raw_pointcloud" default="/sensing/lidar/concatenated/pointcloud"/>
+  <let name="nero_val_body" value="$(env NERO_VAL_BODY '')"/>
+
   <!-- Validator -->
-  <group if="$(eval &quot;'$(var objects_validation_method)'=='obstacle_pointcloud'&quot;)">
+  <group if="$(eval &quot;'$(var objects_validation_method)'=='obstacle_pointcloud' and '$(var nero_val_body)'!=''&quot;)">
+    <load_composable_node target="$(var nero_pointcloud_container)">
+      <composable_node
+        pkg="autoware_detected_object_validation"
+        plugin="autoware::detected_object_validation::obstacle_pointcloud::ObstaclePointCloudBasedValidator"
+        name="obstacle_pointcloud_based_validator_node"
+        namespace="/perception/object_recognition/detection"
+      >
+        <remap from="~/input/detected_objects" to="$(var input/objects)"/>
+        <remap from="~/input/obstacle_pointcloud" to="$(var input/obstacle_pointcloud)"/>
+        <remap from="~/input/raw_pointcloud" to="$(var nero_raw_pointcloud)"/>
+        <remap from="~/output/objects" to="$(var output/objects)"/>
+        <param from="$(var object_recognition_detection_obstacle_pointcloud_based_validator_param_path)"/>
+        <extra_arg name="use_intra_process_comms" value="true"/>
+      </composable_node>
+    </load_composable_node>
+  </group>
+  <group if="$(eval &quot;'$(var objects_validation_method)'=='obstacle_pointcloud' and '$(var nero_val_body)'==''&quot;)">
     <include file="$(find-pkg-share autoware_detected_object_validation)/launch/obstacle_pointcloud_based_validator.launch.xml">
       <arg name="input/detected_objects" value="$(var input/objects)"/>
       <arg name="input/obstacle_pointcloud" value="$(var input/obstacle_pointcloud)"/>
