@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "scene_intersection.hpp"
+#include "nero_yield_intent.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -400,6 +401,42 @@ DecisionResult IntersectionModule::modifyPathVelocityDetail(PathWithLaneId * pat
       lane_id_);
   }
   if (collision_state_machine_.getState() == StateMachine::State::GO) nero_no_exit_only_stop_ = false;
+  // NERO_IX_YIELD_INTENT (yieldsignal, 2026-11-01): a collision stop whose every cause since it began now yields to ego
+  // (braked, stands / crawls clear of ego's path: left out of the attention objects this cycle) ends without the
+  // collision hold: the driver's stop is the signal (Ahmed 11-01). Anything else that was unsafe meanwhile (another car,
+  // the sight rule) keeps the hold as before.
+  if (nero_yield_intent::param().on) {
+    std::set<std::string> unsafe_now;
+    for (const auto & object_info : object_info_manager_.attentionObjects()) {
+      if (object_info->unsafe_info()) unsafe_now.insert(uuidKey(object_info->predicted_object().object_id));
+    }
+    if (!nero_was_stop) {
+      nero_yi_stop_causes_.clear();
+      nero_yi_stop_other_ = false;
+    }
+    if (has_collision || nero_sight_.unsafe) {
+      nero_yi_stop_causes_.insert(unsafe_now.begin(), unsafe_now.end());
+      nero_yi_stop_other_ = nero_yi_stop_other_ || nero_sight_.unsafe || (has_collision && unsafe_now.empty());
+    }
+    if (
+      !has_collision && !nero_sight_.unsafe && !nero_yi_stop_other_ && !nero_yi_stop_causes_.empty() &&
+      collision_state_machine_.getState() == StateMachine::State::STOP &&
+      std::all_of(nero_yi_stop_causes_.begin(), nero_yi_stop_causes_.end(), [&](const auto & k) {
+        return nero_yi_yielders_.count(k) > 0;
+      })) {
+      collision_state_machine_.setState(StateMachine::State::GO);
+      RCLCPP_INFO(
+        logger_,
+        "[NERO_IX] yield_intent: lane %ld the collision stop's %zu cause(s) all yield to ego now: stop released "
+        "without the %.1f s hold",
+        lane_id_, nero_yi_stop_causes_.size(), planner_param_.collision_detection.collision_detection_hold_time);
+      nero_yi_stop_causes_.clear();
+    }
+    if (collision_state_machine_.getState() == StateMachine::State::GO) {
+      nero_yi_stop_causes_.clear();
+      nero_yi_stop_other_ = false;
+    }
+  }
   const bool has_collision_with_margin =
     collision_state_machine_.getState() == StateMachine::State::STOP;
 

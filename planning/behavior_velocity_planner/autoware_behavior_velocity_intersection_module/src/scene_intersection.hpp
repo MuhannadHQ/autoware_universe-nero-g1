@@ -19,6 +19,7 @@
 #include "interpolated_path_info.hpp"
 #include "intersection_lanelets.hpp"
 #include "intersection_stoplines.hpp"
+#include "nero_yield_intent.hpp"  // NERO_IX_YIELD_INTENT (Was)
 #include "object_manager.hpp"
 #include "result.hpp"
 
@@ -697,6 +698,16 @@ private:
   //! NERO_IX_PRIORITY_NO_EXIT: the collision stop now held was made only by such cars (their uuidKey()s)
   bool nero_no_exit_only_stop_{false};
   std::set<std::string> nero_no_exit_stop_uuids_;
+  //! NERO_IX_YIELD_INTENT (yieldsignal, 2026-11-01): uuidKey() of the vehicles left out of the attention objects this
+  //! cycle because they braked and stand / crawl for ego (nero_yield_intent.hpp)
+  std::set<std::string> nero_yi_yielders_;
+  //! NERO_IX_YIELD_INTENT: this module's yielders of the last / this cycle (key()s), mapped check and crosshold apart
+  nero_yield_intent::Was nero_yi_was_;
+  nero_yield_intent::Was nero_xh_yi_was_;
+  //! NERO_IX_YIELD_INTENT: every object unsafe since the collision stop now held began (uuidKey()), and whether
+  //! anything else (the sight rule) made it unsafe: the stop ends without the hold only when all of them yield now
+  std::set<std::string> nero_yi_stop_causes_;
+  bool nero_yi_stop_other_{false};
   //! NERO_IX_PRIORITY_NO_EXIT: position history of the cars with a priority verdict, uuidKey() -> (stamp, x, y): their
   //! direction of motion over the last second (the tracker's heading is noisier)
   std::map<std::string, std::vector<std::array<double, 3>>> nero_priority_xy_hist_;

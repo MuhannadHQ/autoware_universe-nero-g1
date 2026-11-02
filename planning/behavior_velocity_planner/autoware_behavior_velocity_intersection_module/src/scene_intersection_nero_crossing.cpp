@@ -77,6 +77,7 @@
 // above exactly.
 
 #include "scene_intersection.hpp"
+#include "nero_yield_intent.hpp"
 
 #include <autoware/behavior_velocity_planner_common/utilization/boost_geometry_helper.hpp>
 #include <autoware/behavior_velocity_planner_common/utilization/util.hpp>
@@ -809,6 +810,8 @@ void IntersectionModule::neroCrossingHold(PathWithLaneId * path)
   using Conflict = NeroCrossingCause;
   std::optional<Conflict> conflict;
   int n_targets = 0, n_committed = 0;
+  std::set<std::string> nero_yi_ids;  // NERO_IX_YIELD_INTENT: short ids let go this cycle because they yield
+  if (nero_yield_intent::param().on) nero_xh_yi_was_.next(t_obj);
   // the farthest footprint point from base_link (the prefilters below measure from base_link)
   const double half_diag_ego =
     std::hypot(std::max(front, rear), planner_data_->vehicle_info_.vehicle_width_m / 2.0);
@@ -861,6 +864,66 @@ void IntersectionModule::neroCrossingHold(PathWithLaneId * path)
       }
     }
     const std::string id = autoware_utils::to_hex_string(object.object_id).substr(0, 4);
+    // NERO_IX_YIELD_INTENT (yieldsignal, 2026-11-01, QUEUE YSIG): a vehicle that braked (reported >= v_in within t_win)
+    // and now stands / crawls since, not speeding up, nothing standing right ahead of it, within <near> m of ego's way,
+    // whose stop (v x 2 s + v^2 / 4 ahead) stays <margin> m clear of ego's footprints along its way, while ego stands at
+    // most 2.5 m past the line: it brakes for ego and waits = let go now (crosswait's let-go: its re-arm stops / holds
+    // ego again if it moves toward ego's way; crosswait's "stood" needs ego to have stood 2 s and the car 2 s without
+    // 0.5 m of approach, which with its braking tail and the tracker's lag is ~1.8 s after its stop)
+    if (
+      nero_yield_intent::param().on && nero_yield_intent::is_vehicle(object) && yp.on && standing &&
+      nose_past <= 2.5 && !ego.empty()) {
+      const auto & yip = nero_yield_intent::param();
+      auto & yh = nero_yield_intent::update(object, t_obj);
+      const auto yv = nero_yield_intent::view(yh, t_obj);
+      const std::string ykey = nero_yield_intent::key(object);
+      const bool was_yielder = nero_xh_yi_was_.was(ykey);  // in this module, last cycle
+      bool yielder = false;
+      double clear = -1.0, d_c = std::numeric_limits<double>::infinity();
+      bool is_queued = false;
+      if (yv.yielding_motion) {
+        for (const auto & e : ego) {
+          d_c = std::min(d_c, std::hypot(opose.position.x - e.c.x, opose.position.y - e.c.y));
+        }
+        const double d_stop_o = yv.v * 2.0 + yv.v * yv.v / 4.0;
+        auto stop_pose = opose;
+        const double oyaw = tf2::getYaw(opose.orientation);
+        const double sgn = tw.x < 0.0 ? -1.0 : 1.0;
+        stop_pose.position.x += sgn * d_stop_o * std::cos(oyaw);
+        stop_pose.position.y += sgn * d_stop_o * std::sin(oyaw);
+        const auto stop_poly = autoware_utils::to_polygon2d(stop_pose, object.shape);
+        clear = std::numeric_limits<double>::infinity();
+        for (const auto & e : ego) clear = std::min(clear, static_cast<double>(bg::distance(stop_poly, e.fp)));
+        is_queued =
+          clear > yip.margin &&
+          nero_yield_intent::queued(object, *planner_data_->predicted_objects, nero_xh_yi_was_);
+        yielder = clear > yip.margin && d_c <= yp.near && !is_queued;
+      }
+      if (yielder) {
+        if (!was_yielder) {
+          RCLCPP_INFO(
+            logger_,
+            "[NERO_IX] crossing_hold: lane %ld %s braked from %.1f m/s (%.1f s ago), stands %.1f s / crawls %.1f s at "
+            "%.2f m/s (gained %.2f in 1 s), its stop %.2f m clear of ego's way, %.1f m off it (ego stood %.1f s, "
+            "nose %+.2f): yields to ego, let go",
+            lane_id_, id.c_str(), yv.v_peak, yv.since_fast, yv.stand_s, yv.crawl_s, yv.v, yv.gain_1s, clear, d_c,
+            ego_stood, nose_past);
+        }
+        nero_xh_yi_was_.now.insert(ykey);
+        nero_xh_letgo_.insert(key);
+        nero_xh_revoked_.erase(key);
+        nero_yi_ids.insert(id);
+        continue;  // it braked for ego and waits
+      }
+      if (was_yielder) {
+        RCLCPP_INFO(
+          logger_,
+          "[NERO_IX] crossing_hold: lane %ld %s no longer yields (v %.2f, gained %.2f in 1 s, stands %.1f s / crawls "
+          "%.1f s, clear %.2f, %.1f m off%s; ego v %.2f, nose %+.2f): judged by the rules above",
+          lane_id_, id.c_str(), yv.v, yv.gain_1s, yv.stand_s, yv.crawl_s, clear, d_c, is_queued ? ", queued" : "",
+          v0, nose_past);
+      }
+    }
     // slow movers: a vehicle (not UNKNOWN: those count from <v_min> on) slower than <v_slow> that
     // has moved >= 1 m in the last 5 s within <slow_r> of ego's way and is not leaving it holds a
     // standing ego (a car manoeuvring or creeping at the mouth: its prediction says little about
@@ -1227,7 +1290,8 @@ void IntersectionModule::neroCrossingHold(PathWithLaneId * path)
     nero_xh_cause_ = *conflict;
   } else if (
     nero_xh_holding_ &&
-    (now - nero_xh_last_conflict_ >= p.release || (!standing && n_committed > 0))) {
+    (now - nero_xh_last_conflict_ >= p.release || (!standing && n_committed > 0) ||
+     nero_yi_ids.count(nero_xh_cause_.id) > 0)) {  // NERO_IX_YIELD_INTENT: the last holder now yields: no release wait
     nero_xh_holding_ = false;
   }
   if (!nero_xh_holding_) nero_xh_again_held_ = false;

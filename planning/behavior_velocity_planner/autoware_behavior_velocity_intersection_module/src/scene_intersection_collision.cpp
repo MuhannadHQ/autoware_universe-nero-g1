@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "scene_intersection.hpp"
+#include "nero_yield_intent.hpp"
 
 #include <chrono>
 #include <cstdio>
@@ -1215,6 +1216,10 @@ void IntersectionModule::updateObjectInfoManagerArea()
 
   // NERO_IX_PRIORITY_FROM_SIGNS: classify the lanes once, then flag yielding objects every cycle
   nero_priority_yield_uuids_.clear();
+  nero_yi_yielders_.clear();  // NERO_IX_YIELD_INTENT
+  if (nero_yield_intent::param().on) {
+    nero_yi_was_.next(rclcpp::Time(planner_data_->predicted_objects->header.stamp).seconds());
+  }
   nero_priority_pv_.clear();
   nero_priority_pv_late_.clear();
   if (nero_priority_from_signs() && !nero_priority_lanes_) {
@@ -1272,7 +1277,7 @@ void IntersectionModule::updateObjectInfoManagerArea()
 
   // NERO_IX_CREEP: ego's path = the centreline of its turn lanelet and of the lanelet after it
   autoware_utils::LineString2d nero_ego_path;
-  if (nero_creep_ix().v_creep > 0.0) {
+  if (nero_creep_ix().v_creep > 0.0 || nero_yield_intent::param().on) {  // (also NERO_IX_YIELD_INTENT's clear check)
     for (const auto & p : assigned_lanelet.centerline2d()) nero_ego_path.emplace_back(p.x(), p.y());
     const auto nexts = planner_data_->route_handler_->getRoutingGraphPtr()->following(assigned_lanelet);
     if (!nexts.empty()) {
@@ -1414,6 +1419,66 @@ void IntersectionModule::updateObjectInfoManagerArea()
       }
     }
 
+    // NERO_IX_YIELD_INTENT (yieldsignal, 2026-11-01, QUEUE YSIG): a vehicle that braked and now stands / crawls while
+    // ego waits, nothing standing right ahead of it, whose stop (the creep rule's reach) stays clear of ego's path, is
+    // yielding to ego: left out of the attention objects (so out of the TTC check and of yield-stuck), re-judged every
+    // cycle (it is a full target again the cycle it speeds up). The car's creep rule needs 2 s at <= 2 m/s and the
+    // stock check keeps a braking car "crossing" at its current speed until it is below 0.5 m/s, then the 1.5 s hold
+    if (
+      nero_yield_intent::param().on && nero_yield_intent::is_vehicle(predicted_object) && nero_ego_path.size() >= 2 &&
+      !is_wrong_way_on_ego_lane) {
+      const auto & yp = nero_yield_intent::param();
+      const double t_yi = rclcpp::Time(planner_data_->predicted_objects->header.stamp).seconds();
+      auto & yh = nero_yield_intent::update(predicted_object, t_yi);
+      const auto yv = nero_yield_intent::view(yh, t_yi);
+      const double ego_v_yi = std::abs(planner_data_->current_velocity->twist.linear.x);
+      const std::string ykey = nero_yield_intent::key(predicted_object);
+      const bool was_yielder = nero_yi_was_.was(ykey);  // in this module, last cycle
+      bool yielder = false;
+      double clear = -1.0;
+      bool is_queued = false;
+      // (ego's speed gates only the start of a yield: once ego goes on it, only the car's own motion ends it)
+      if (yv.yielding_motion && (ego_v_yi < yp.ego_v || was_yielder)) {
+        const auto & cp = nero_creep_ix();
+        const double t_react = cp.v_creep > 0.0 ? cp.t_react : 0.5;
+        const double t_pass = cp.v_creep > 0.0 ? cp.t_pass : 1.5;
+        const double a_stop = cp.v_creep > 0.0 ? cp.a_stop : 2.0;
+        const double v = yv.v;
+        const double d_stop = v * (t_react + t_pass) + v * v / (2.0 * a_stop);
+        auto stop_pose = predicted_object.kinematics.initial_pose_with_covariance.pose;
+        const double yaw = tf2::getYaw(stop_pose.orientation);
+        const double sgn = predicted_object.kinematics.initial_twist_with_covariance.twist.linear.x < 0.0 ? -1.0 : 1.0;
+        stop_pose.position.x += sgn * d_stop * std::cos(yaw);
+        stop_pose.position.y += sgn * d_stop * std::sin(yaw);
+        const auto stop_poly = autoware_utils::to_polygon2d(stop_pose, predicted_object.shape);
+        clear = bg::distance(stop_poly, nero_ego_path) - nero_half_width;
+        is_queued = clear > yp.margin &&
+                    nero_yield_intent::queued(predicted_object, *planner_data_->predicted_objects, nero_yi_was_);
+        yielder = clear > yp.margin && !is_queued;
+      }
+      const std::string yid = nero_hex_id(predicted_object);
+      if (yielder) {
+        if (!was_yielder) {
+          RCLCPP_INFO(
+            logger_,
+            "[NERO_IX] yield_intent: lane %ld %s braked from %.1f m/s (%.1f s ago), stands %.1f s / crawls %.1f s at "
+            "%.2f m/s (gained %.2f in 1 s), its stop %.2f m clear of ego's path (ego v %.2f): yielding, left out",
+            lane_id_, yid.c_str(), yv.v_peak, yv.since_fast, yv.stand_s, yv.crawl_s, yv.v, yv.gain_1s, clear,
+            ego_v_yi);
+        }
+        nero_yi_was_.now.insert(ykey);
+        nero_yi_yielders_.insert(uuidKey(predicted_object.object_id));
+        continue;  // it braked for ego and waits: yielding
+      }
+      if (was_yielder) {
+        RCLCPP_INFO(
+          logger_,
+          "[NERO_IX] yield_intent: lane %ld %s no longer yields (v %.2f, gained %.2f in 1 s, stands %.1f s / crawls "
+          "%.1f s, clear %.2f%s, ego v %.2f): judged as any vehicle",
+          lane_id_, yid.c_str(), yv.v, yv.gain_1s, yv.stand_s, yv.crawl_s, clear, is_queued ? ", queued" : "",
+          ego_v_yi);
+      }
+    }
     if (nero_creep_ix().v_creep > 0.0 && nero_ego_path.size() >= 2 && !is_wrong_way_on_ego_lane) {
       double v = 0.0, acc = 0.0;
       if (nero_is_creeper(predicted_object, &v, &acc)) {
