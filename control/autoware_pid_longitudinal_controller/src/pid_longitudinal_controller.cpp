@@ -19,9 +19,13 @@
 #include "autoware_utils/geometry/geometry.hpp"
 #include "autoware_utils/math/normalization.hpp"
 
+#include "autoware_internal_planning_msgs/msg/scenario.hpp"
+
 #include <fmt/format.h>
 
 #include <algorithm>
+#include <atomic>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
@@ -54,6 +58,72 @@ NeroSlopeStop & neroSlopeStop(const void * controller)
   static std::unordered_map<const void *, NeroSlopeStop> states;
   std::lock_guard<std::mutex> lock(mutex);
   return states[controller];
+}
+
+// [nero] NERO_PID_START_LEAD / NERO_PID_ROLLING_RESET (pulloff, QUEUE PULLOFF): settings and state per
+// controller, outside the class layout (the trajectory follower node allocates the class: no new members).
+// The yhs chassis follows the velocity TARGET with its own speed loop (positive acceleration is not sent);
+// at a departure the target is the plan at the robot's own position, which only rises as the robot moves.
+// START_LEAD gives the target from the plan's own time profile, lead_s ahead (faded out by v_end).
+struct NeroStartLead
+{
+  bool enabled{false};
+  double lead_s{0.0};
+  double v_end{0.0};
+  double clear_m{0.0};
+  bool active{false};
+  bool rolling_reset{false};
+  double revoke_acc{0.0};  // < 0: a firmer stop when the plan takes a lead-driven departure back
+  bool lead_last{false};   // the lead changed the target in the last DRIVE cycle
+  bool revoked{false};     // STOPPING because the plan took a lead-driven departure back
+  // the planning scenario: the lead acts in LaneDriving only (a Parking pull-out keeps the car's start: Ahmed's open
+  // decision PULLOUT is about the exit speed there); 0 = none received yet (no lead), 1 = LaneDriving, 2 = other
+  std::atomic<int> scenario{0};
+  // a lead-driven departure cut short (a release taken back, any stop before v_end) marks the place as contested:
+  // the next departures there get the car's start until the robot has left (v_end reached, or CONTEST_CLEAR_M driven)
+  bool contested{false};
+  double contest_dist{0.0};
+  rclcpp::Subscription<autoware_internal_planning_msgs::msg::Scenario>::SharedPtr scenario_sub;
+  // per departure (for the log line)
+  double t0{0.0};
+  double max_gain{0.0};
+  double dist{0.0};
+  bool applied{false};
+};
+NeroStartLead & neroStartLead(const void * controller)
+{
+  static std::mutex mutex;
+  static std::unordered_map<const void *, NeroStartLead> states;
+  std::lock_guard<std::mutex> lock(mutex);
+  return states[controller];
+}
+
+// The plan's speed lead_s seconds ahead of point `from` along the plan's OWN speeds (forward only).
+// Returns a negative value when the plan stops (a point slower than 1 mm/s) inside the lead window.
+double neroPlanSpeedAhead(
+  const autoware_planning_msgs::msg::Trajectory & traj, const size_t from, const double lead_s)
+{
+  const auto & pts = traj.points;
+  if (pts.empty() || from >= pts.size()) {
+    return -1.0;
+  }
+  double t = 0.0;
+  for (size_t i = from; i + 1 < pts.size(); ++i) {
+    const double v0 = std::max(0.0, static_cast<double>(pts[i].longitudinal_velocity_mps));
+    const double v1 = std::max(0.0, static_cast<double>(pts[i + 1].longitudinal_velocity_mps));
+    if (v1 < 1e-3) {
+      return -1.0;
+    }
+    const double dx = pts[i + 1].pose.position.x - pts[i].pose.position.x;
+    const double dy = pts[i + 1].pose.position.y - pts[i].pose.position.y;
+    const double dt = std::hypot(dx, dy) / std::max(0.5 * (v0 + v1), 0.05);
+    if (t + dt >= lead_s) {
+      const double r = dt > 1e-9 ? (lead_s - t) / dt : 1.0;
+      return v0 + r * (v1 - v0);
+    }
+    t += dt;
+  }
+  return std::max(0.0, static_cast<double>(pts.back().longitudinal_velocity_mps));
 }
 }  // namespace
 
@@ -255,6 +325,42 @@ PidLongitudinalController::PidLongitudinalController(
     } else {
       RCLCPP_ERROR(logger_, "[NERO_PID_SLOPE_STOP] bad value '%s': off", e);
     }
+  }
+
+  // [nero] NERO_PID_START_LEAD=<lead_s>,<v_end_mps>,<clear_m> (pulloff, QUEUE PULLOFF)
+  if (const char * e = std::getenv("NERO_PID_START_LEAD"); e && *e) {
+    auto & p = neroStartLead(this);
+    double l = 0.0, ve = 0.0, c = 0.0, ra = 0.0;
+    const int n = std::sscanf(e, "%lf,%lf,%lf,%lf", &l, &ve, &c, &ra);
+    if ((n == 3 || n == 4) && l > 0.0 && l <= 2.0 && ve > 0.0 && c >= 0.0 && ra <= 0.0 && ra >= -3.4) {
+      p.enabled = true;
+      p.lead_s = l;
+      p.v_end = ve;
+      p.clear_m = c;
+      p.revoke_acc = n == 4 ? ra : 0.0;
+      p.scenario_sub = node.create_subscription<autoware_internal_planning_msgs::msg::Scenario>(
+        "/planning/scenario_planning/scenario", rclcpp::QoS{1},
+        [&p](const autoware_internal_planning_msgs::msg::Scenario::ConstSharedPtr msg) {
+          p.scenario =
+            msg->current_scenario == autoware_internal_planning_msgs::msg::Scenario::LANEDRIVING ? 1 : 2;
+        });
+      RCLCPP_INFO(
+        logger_,
+        "[NERO_PID_START_LEAD] on: after a stop the velocity target is the plan's own speed %.2f s "
+        "ahead (faded out by %.2f m/s), never below the car's target, not with a stop point within "
+        "%.1f m; a departure the plan takes back stops at <= %.2f m/s2 (0 = the car's smooth stop)",
+        l, ve, c, p.revoke_acc);
+    } else {
+      RCLCPP_ERROR(logger_, "[NERO_PID_START_LEAD] bad value '%s': off", e);
+    }
+  }
+  // [nero] NERO_PID_ROLLING_RESET=1 (pulloff; upstream #10684 d1b44201c): STOPPING -> DRIVE resets the
+  // jerk filter's previous raw acceleration (the car reset m_prev_ctrl_cmd: the smooth stop's negative
+  // acceleration was kept, the brake stayed on after a release while still rolling)
+  if (const char * e = std::getenv("NERO_PID_ROLLING_RESET"); e && std::string(e) == "1") {
+    neroStartLead(this).rolling_reset = true;
+    RCLCPP_INFO(
+      logger_, "[NERO_PID_ROLLING_RESET] on: STOPPING -> DRIVE starts the jerk filter from >= 0");
   }
 
   // ego nearest index search
@@ -751,6 +857,16 @@ void PidLongitudinalController::updateControlState(const ControlData & control_d
 
     if (m_enable_smooth_stop) {
       if (stopping_condition) {
+        // [nero] NERO_PID_START_LEAD 4th field: the plan took a lead-driven departure back (the stop point was
+        // beyond clear_m in the last cycle and is within the stopping distance now): a firmer stop
+        if (auto & nl = neroStartLead(this); nl.revoke_acc < 0.0 && nl.lead_last) {
+          nl.revoked = true;
+          RCLCPP_INFO(
+            logger_,
+            "[NERO_PID_START_LEAD] departure taken back at %.2f m/s (stop point %.2f m): stop at <= "
+            "%.2f m/s2",
+            current_vel, stop_dist, nl.revoke_acc);
+        }
         // predictions after input time delay
         const double pred_vel_in_target = control_data.state_after_delay.vel;
         const double pred_stop_dist =
@@ -780,7 +896,25 @@ void PidLongitudinalController::updateControlState(const ControlData & control_d
       m_pid_vel.reset();
       m_lpf_vel_error->reset(0.0);
       // prevent the car from taking a long time to start to move
-      m_prev_ctrl_cmd.acc = std::max(0.0, m_prev_raw_ctrl_cmd.acc);
+      auto & nl = neroStartLead(this);
+      if (nl.rolling_reset) {
+        // [nero] NERO_PID_ROLLING_RESET (upstream #10684): reset the value the jerk filter starts from
+        RCLCPP_INFO(
+          logger_,
+          "[NERO_PID_ROLLING_RESET] STOPPING -> DRIVE at %.2f m/s: jerk filter starts from %.2f "
+          "(car: %.2f)",
+          current_vel, std::max(0.0, m_prev_raw_ctrl_cmd.acc), m_prev_raw_ctrl_cmd.acc);
+        m_prev_raw_ctrl_cmd.acc = std::max(0.0, m_prev_raw_ctrl_cmd.acc);
+      } else {
+        m_prev_ctrl_cmd.acc = std::max(0.0, m_prev_raw_ctrl_cmd.acc);
+      }
+      if (nl.enabled && std::abs(current_vel) < nl.v_end) {
+        nl.active = true;
+        nl.t0 = clock_->now().seconds();
+        nl.max_gain = 0.0;
+        nl.dist = 0.0;
+        nl.applied = false;
+      }
       return changeControlState(ControlState::DRIVE);
     }
     return;
@@ -825,6 +959,14 @@ void PidLongitudinalController::updateControlState(const ControlData & control_d
       m_pid_vel.reset();
       m_lpf_vel_error->reset(0.0);
       m_lpf_acc_error->reset(0.0);
+      if (auto & nl = neroStartLead(this); nl.enabled) {
+        // [nero] NERO_PID_START_LEAD: a departure from standstill
+        nl.active = true;
+        nl.t0 = clock_->now().seconds();
+        nl.max_gain = 0.0;
+        nl.dist = 0.0;
+        nl.applied = false;
+      }
       return changeControlState(ControlState::DRIVE);
     }
 
@@ -854,6 +996,37 @@ PidLongitudinalController::Motion PidLongitudinalController::calcCtrlCmd(
   const ControlData & control_data)
 {
   const size_t target_idx = control_data.target_idx;
+
+  // [nero] NERO_PID_START_LEAD: a departure ends when the controller leaves DRIVE (a stop, an emergency)
+  if (auto & nl = neroStartLead(this); m_control_state != ControlState::DRIVE) {
+    nl.lead_last = false;
+    if (m_control_state != ControlState::STOPPING) {
+      nl.revoked = false;
+    }
+  }
+  if (auto & nl = neroStartLead(this); nl.active && m_control_state != ControlState::DRIVE) {
+    RCLCPP_INFO(
+      logger_,
+      "[NERO_PID_START_LEAD] departure interrupted (state %d) after %.1f s, %.1f m: %s, max target "
+      "gain %.2f m/s%s",
+      static_cast<int>(m_control_state), clock_->now().seconds() - nl.t0, nl.dist,
+      nl.applied ? "applied" : "never applied", nl.max_gain,
+      nl.applied ? "; contested: the car's start here until the robot has left" : "");
+    if (nl.applied) {
+      nl.contested = true;
+      nl.contest_dist = 0.0;
+    }
+    nl.active = false;
+  }
+  // [nero] NERO_PID_START_LEAD: a contested place is left after CONTEST_CLEAR_M driven (or v_end, below)
+  if (auto & nl = neroStartLead(this); nl.contested) {
+    constexpr double CONTEST_CLEAR_M = 15.0;
+    nl.contest_dist += std::abs(control_data.current_motion.vel) * control_data.dt;
+    if (nl.contest_dist > CONTEST_CLEAR_M) {
+      nl.contested = false;
+      RCLCPP_INFO(logger_, "[NERO_PID_START_LEAD] place left (%.1f m driven): lead again", nl.contest_dist);
+    }
+  }
 
   // velocity and acceleration command
   Motion ctrl_cmd_as_pedal_pos{
@@ -885,8 +1058,56 @@ PidLongitudinalController::Motion PidLongitudinalController::calcCtrlCmd(
       if (m_control_state == ControlState::DRIVE) {
         raw_ctrl_cmd.vel = control_data.interpolated_traj.points.at(control_data.target_idx)
                              .longitudinal_velocity_mps;
-        raw_ctrl_cmd.acc = applyVelocityFeedback(control_data);
-        raw_ctrl_cmd = keepBrakeBeforeStop(control_data, raw_ctrl_cmd, target_idx);
+        // [nero] NERO_PID_START_LEAD: during a departure, the plan's own speed lead_s ahead (faded out
+        // by v_end) when it is higher than the car's target and no stop point is within clear_m
+        double nero_lead_vel = -1.0;
+        neroStartLead(this).revoked = false;
+        if (auto & nl = neroStartLead(this); nl.active) {
+          const double v = std::abs(control_data.current_motion.vel);
+          nl.dist += v * control_data.dt;
+          if (v >= nl.v_end || control_data.shift != Shift::Forward) {
+            RCLCPP_INFO(
+              logger_,
+              "[NERO_PID_START_LEAD] departure end at %.2f m/s after %.1f s, %.1f m: %s, max "
+              "target gain %.2f m/s",
+              v, clock_->now().seconds() - nl.t0, nl.dist, nl.applied ? "applied" : "never applied",
+              nl.max_gain);
+            nl.active = false;
+            if (nl.contested) {
+              RCLCPP_INFO(logger_, "[NERO_PID_START_LEAD] place left (%.2f m/s): lead again", v);
+            }
+            nl.contested = false;
+          } else if (control_data.stop_dist > nl.clear_m && nl.scenario == 1 && !nl.contested) {
+            const double lead = nl.lead_s * std::clamp(1.0 - v / nl.v_end, 0.0, 1.0);
+            const double ahead =
+              neroPlanSpeedAhead(control_data.interpolated_traj, control_data.nearest_idx, lead);
+            if (ahead > raw_ctrl_cmd.vel + 1e-3) {
+              nero_lead_vel = ahead;
+              nl.max_gain = std::max(nl.max_gain, ahead - raw_ctrl_cmd.vel);
+              if (!nl.applied) {
+                RCLCPP_INFO(
+                  logger_,
+                  "[NERO_PID_START_LEAD] departure: target %.2f -> %.2f m/s (lead %.2f s, robot "
+                  "%.2f m/s, stop point %.1f m ahead)",
+                  raw_ctrl_cmd.vel, ahead, lead, v, control_data.stop_dist);
+              }
+              nl.applied = true;
+            }
+          }
+        }
+        neroStartLead(this).lead_last = nero_lead_vel > 0.0;
+        if (nero_lead_vel > 0.0) {
+          // the feedback (and the brake it may ask for) follows the same target
+          ControlData lead_data = control_data;
+          lead_data.interpolated_traj.points.at(control_data.target_idx).longitudinal_velocity_mps =
+            static_cast<float>(nero_lead_vel);
+          raw_ctrl_cmd.vel = nero_lead_vel;
+          raw_ctrl_cmd.acc = applyVelocityFeedback(lead_data);
+          raw_ctrl_cmd = keepBrakeBeforeStop(lead_data, raw_ctrl_cmd, target_idx);
+        } else {
+          raw_ctrl_cmd.acc = applyVelocityFeedback(control_data);
+          raw_ctrl_cmd = keepBrakeBeforeStop(control_data, raw_ctrl_cmd, target_idx);
+        }
 
         RCLCPP_DEBUG(
           logger_,
@@ -901,6 +1122,10 @@ PidLongitudinalController::Motion PidLongitudinalController::calcCtrlCmd(
           control_data.stop_dist, control_data.current_motion.vel, control_data.current_motion.acc,
           m_vel_hist, m_delay_compensation_time, m_debug_values);
         raw_ctrl_cmd.vel = m_stopped_state_params.vel;
+        // [nero] NERO_PID_START_LEAD: a departure the plan took back stops firmer (never softer than the car)
+        if (const auto & nl = neroStartLead(this); nl.revoked) {
+          raw_ctrl_cmd.acc = std::min(raw_ctrl_cmd.acc, nl.revoke_acc);
+        }
 
         RCLCPP_DEBUG(
           logger_, "[smooth stop]: Smooth stopping. vel: %3.3f, acc: %3.3f", raw_ctrl_cmd.vel,

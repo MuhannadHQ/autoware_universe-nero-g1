@@ -24,16 +24,68 @@
 #include "tf2/utils.h"
 #include "tf2_ros/create_timer_ros.h"
 
+#include "autoware_internal_planning_msgs/msg/scenario.hpp"
+
 #include <algorithm>
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
 #include <deque>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
 namespace autoware::motion::control::mpc_lateral_controller
 {
+namespace
+{
+// [nero] NERO_MPC_CONVERGE_WINDOW=<s> (pulloff, QUEUE PULLOFF): the steadiness window of isMpcConverged() (the MPC's own
+// steering solution within mpc_converged_threshold_rps over the window). Upstream hard-codes 1.0 s; the PID keeps
+// the robot stopped until the steering is converged (keep_stopped_until_steer_convergence), so after a release that
+// moves the solution (the reference speed 0 -> 0.25 with the robot off the path) or after an engage (empty history)
+// the robot waits ~1 s more. LaneDriving only: in Parking (freespace segments, the pull-out from the spot: Ahmed's
+// open decision PULLOUT) and before the first scenario message the window stays 1.0 s (the car).
+// File scope: the trajectory follower node allocates the class (no new members).
+struct NeroMpcScenario
+{
+  std::atomic<int> scenario{0};  // 0 = no message yet, 1 = LaneDriving, 2 = other
+  rclcpp::Subscription<autoware_internal_planning_msgs::msg::Scenario>::SharedPtr sub;
+};
+NeroMpcScenario & neroMpcScenario(const void * controller)
+{
+  static std::mutex mutex;
+  static std::unordered_map<const void *, NeroMpcScenario> states;
+  std::lock_guard<std::mutex> lock(mutex);
+  return states[controller];
+}
+double neroMpcConvergeWindow()
+{
+  static const double w = []() {
+    const char * e = std::getenv("NERO_MPC_CONVERGE_WINDOW");
+    if (!e || !*e) {
+      return 1.0;
+    }
+    char * end = nullptr;
+    const double v = std::strtod(e, &end);
+    if (end == e || !(v >= 0.1 && v <= 1.0)) {
+      fprintf(stderr, "[NERO_MPC_CONVERGE_WINDOW] bad value '%s': 1.0 s (the car)\n", e);
+      return 1.0;
+    }
+    fprintf(
+      stderr,
+      "[NERO_MPC_CONVERGE_WINDOW] on: steadiness window %.2f s in LaneDriving (car 1.0 s; Parking and "
+      "before the first scenario message: 1.0 s)\n",
+      v);
+    return v;
+  }();
+  return w;
+}
+}  // namespace
+
 
 MpcLateralController::MpcLateralController(
   rclcpp::Node & node, std::shared_ptr<diagnostic_updater::Updater> diag_updater)
@@ -142,6 +194,23 @@ MpcLateralController::MpcLateralController(
   m_pub_debug_values =
     node.create_publisher<Float32MultiArrayStamped>("~/output/lateral_diagnostic", 1);
   m_pub_steer_offset = node.create_publisher<Float32Stamped>("~/output/estimated_steer_offset", 1);
+
+  // [nero] NERO_MPC_CONVERGE_WINDOW: the planning scenario (the window acts in LaneDriving only)
+  if (neroMpcConvergeWindow() < 1.0) {
+    auto & ns = neroMpcScenario(this);
+    const auto logger = logger_;
+    ns.sub = node.create_subscription<autoware_internal_planning_msgs::msg::Scenario>(
+      "/planning/scenario_planning/scenario", rclcpp::QoS{1},
+      [&ns, logger](const autoware_internal_planning_msgs::msg::Scenario::ConstSharedPtr msg) {
+        const int s =
+          msg->current_scenario == autoware_internal_planning_msgs::msg::Scenario::LANEDRIVING ? 1 : 2;
+        if (ns.scenario.exchange(s) != s) {
+          RCLCPP_INFO(
+            logger, "[NERO_MPC_CONVERGE_WINDOW] scenario %s: steadiness window %.2f s",
+            msg->current_scenario.c_str(), s == 1 ? neroMpcConvergeWindow() : 1.0);
+        }
+      });
+  }
 
   declareMPCparameters(node);
 
@@ -520,11 +589,14 @@ void MpcLateralController::setSteeringToHistory(const Lateral & steering)
   m_mpc_steering_history.emplace_back(steering, time);
 
   // Check the history is filled or not.
-  if (rclcpp::Duration(time - m_mpc_steering_history.begin()->second).seconds() >= 1.0) {
+  // [nero] NERO_MPC_CONVERGE_WINDOW: the window (1.0 s unless set, and outside LaneDriving)
+  const double window =
+    neroMpcConvergeWindow() < 1.0 && neroMpcScenario(this).scenario == 1 ? neroMpcConvergeWindow() : 1.0;
+  if (rclcpp::Duration(time - m_mpc_steering_history.begin()->second).seconds() >= window) {
     m_is_mpc_history_filled = true;
-    // remove old data that is older than 1 sec
+    // remove old data that is older than the window
     for (auto itr = m_mpc_steering_history.begin(); itr != m_mpc_steering_history.end(); ++itr) {
-      if (rclcpp::Duration(time - itr->second).seconds() > 1.0) {
+      if (rclcpp::Duration(time - itr->second).seconds() > window) {
         m_mpc_steering_history.erase(m_mpc_steering_history.begin());
       } else {
         break;
