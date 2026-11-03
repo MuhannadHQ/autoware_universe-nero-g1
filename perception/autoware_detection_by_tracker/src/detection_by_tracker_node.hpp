@@ -71,6 +71,27 @@ private:
   std::shared_ptr<autoware::shape_estimation::ShapeEstimator> shape_estimator_;
   std::shared_ptr<autoware::euclidean_cluster::EuclideanClusterInterface> cluster_;
   std::shared_ptr<Debugger> debugger_;
+
+  // NERO_DBT_VISIBLE_END=<tol m>[,<sensor x m>] (parkghost 2026-11-02): a merged vehicle box's end facing the lidar may
+  // not stand in front of the vehicle's visible end (the surface the lidar hits right behind it), and a vehicle's cluster
+  // holds no points of a tracked pedestrian / bicycle / motorcycle (the reference-pose corrector extends a partly seen
+  // vehicle toward the tracker's own prediction: the box followed the prediction and a standing vehicle's track ran off)
+  double nero_ve_tol_{-1.0};
+  double nero_ve_sensor_x_{0.6};
+  uint64_t nero_ve_boxes_{0};
+  uint64_t nero_ve_moved_{0};
+  uint64_t nero_ve_unresolved_{0};
+  double nero_ve_moved_sum_{0.0};
+  double nero_ve_moved_max_{0.0};
+  uint64_t nero_ve_others_points_{0};
+  std::vector<float> nero_fs_r1_;  // nearest hit range per bearing bin of this frame's clusters (inf = no hit)
+  void neroDropOthersPoints(
+    const autoware_perception_msgs::msg::DetectedObjects & tracked_objects, pcl::PointCloud<pcl::PointXYZ> & cluster);
+  rclcpp::Time nero_ve_last_log_{0, 0, RCL_ROS_TIME};
+  void neroBuildFirstHits(const tier4_perception_msgs::msg::DetectedObjectsWithFeature & clusters);
+  double neroSeenFreeDepth(
+    double cx, double cy, double c, double s, const std::vector<std::pair<double, double>> & outline) const;
+  bool neroFitSeenSpace(autoware_perception_msgs::msg::DetectedObject & object);
   std::map<uint8_t, int> max_search_distance_for_merger_;
   std::map<uint8_t, int> max_search_distance_for_divider_;
 

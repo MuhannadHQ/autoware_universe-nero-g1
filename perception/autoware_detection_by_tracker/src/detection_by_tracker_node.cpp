@@ -22,8 +22,14 @@
 
 #include <Eigen/Core>
 #include <Eigen/Geometry>
+#include <sensor_msgs/point_cloud2_iterator.hpp>
 
+#include <algorithm>
 #include <chrono>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -119,6 +125,150 @@ DetectionByTracker::DetectionByTracker(const rclcpp::NodeOptions & node_options)
     false, 10, 10000, 0.7, 0.3, 0);
   debugger_ = std::make_shared<Debugger>(this);
   published_time_publisher_ = std::make_unique<autoware_utils::PublishedTimePublisher>(this);
+
+  if (const char * env = std::getenv("NERO_DBT_VISIBLE_END"); env != nullptr && env[0] != '\0') {
+    double v[2] = {0.3, 0.6};
+    const int n = std::sscanf(env, "%lf,%lf", &v[0], &v[1]);
+    if (n >= 1 && v[0] >= 0.0) {
+      nero_ve_tol_ = v[0];
+      nero_ve_sensor_x_ = v[1];
+      RCLCPP_INFO(
+        get_logger(),
+        "[NERO_DBT_VISIBLE_END] on: a merged vehicle box's end facing the lidar stands at most %.2f m in front of the "
+        "vehicle's visible end (first hits per bearing from x %.2f m in base_link); points of tracked pedestrians / "
+        "bicycles / motorcycles are not a vehicle's",
+        nero_ve_tol_, nero_ve_sensor_x_);
+    } else {
+      RCLCPP_ERROR(get_logger(), "[NERO_DBT_VISIBLE_END] malformed '%s': stock placement", env);
+    }
+  }
+}
+
+// NERO_DBT_VISIBLE_END: remove the points inside (box + 0.2 m) of any tracked pedestrian, bicycle or motorcycle
+void DetectionByTracker::neroDropOthersPoints(
+  const autoware_perception_msgs::msg::DetectedObjects & tracked_objects, pcl::PointCloud<pcl::PointXYZ> & cluster)
+{
+  using Label = autoware_perception_msgs::msg::ObjectClassification;
+  constexpr double margin = 0.2;
+  for (const auto & other : tracked_objects.objects) {
+    const auto l = other.classification.front().label;
+    if (l != Label::PEDESTRIAN && l != Label::BICYCLE && l != Label::MOTORCYCLE) continue;
+    const auto & p = other.kinematics.pose_with_covariance.pose;
+    const double yaw = tf2::getYaw(p.orientation);
+    const double c = std::cos(yaw);
+    const double s = std::sin(yaw);
+    double hl = 0.5 * other.shape.dimensions.x + margin;
+    double hw = 0.5 * other.shape.dimensions.y + margin;
+    if (other.shape.type == autoware_perception_msgs::msg::Shape::CYLINDER) hw = hl;
+    const size_t before = cluster.points.size();
+    cluster.points.erase(
+      std::remove_if(
+        cluster.points.begin(), cluster.points.end(),
+        [&](const pcl::PointXYZ & q) {
+          const double dx = q.x - p.position.x;
+          const double dy = q.y - p.position.y;
+          return std::abs(c * dx + s * dy) <= hl && std::abs(-s * dx + c * dy) <= hw;
+        }),
+      cluster.points.end());
+    nero_ve_others_points_ += before - cluster.points.size();
+  }
+  cluster.width = static_cast<uint32_t>(cluster.points.size());
+  cluster.height = 1;
+}
+
+namespace
+{
+constexpr int kNeroBins = 1440;  // 0.25 deg bearing bins
+constexpr double kNeroBinRad = 2.0 * M_PI / kNeroBins;
+inline int neroBin(double a)
+{
+  int b = static_cast<int>(std::floor((a + M_PI) / kNeroBinRad));
+  return b < 0 ? 0 : (b >= kNeroBins ? kNeroBins - 1 : b);
+}
+}  // namespace
+
+// NERO_DBT_VISIBLE_END: the nearest obstacle point per bearing (from the sensor) over every cluster of this frame
+void DetectionByTracker::neroBuildFirstHits(const tier4_perception_msgs::msg::DetectedObjectsWithFeature & clusters)
+{
+  nero_fs_r1_.assign(kNeroBins, std::numeric_limits<float>::infinity());
+  for (const auto & fo : clusters.feature_objects) {
+    const auto & pc = fo.feature.cluster;
+    if (pc.width * pc.height == 0) continue;
+    sensor_msgs::PointCloud2ConstIterator<float> ix(pc, "x"), iy(pc, "y");
+    for (; ix != ix.end(); ++ix, ++iy) {
+      const double dx = *ix - nero_ve_sensor_x_;
+      const double dy = *iy;
+      const int b = neroBin(std::atan2(dy, dx));
+      const float r = static_cast<float>(std::hypot(dx, dy));
+      if (r < nero_fs_r1_[b]) nero_fs_r1_[b] = r;
+    }
+  }
+}
+
+// how far the sampled end edge (box frame offsets, box centre (cx, cy), axes (c, s)) stands in front of the surface
+// the lidar hits right behind it: per sample the nearest hit within +-tol across its ray minus its range, counted only
+// when that hit lies 0..3 m behind the sample (the vehicle's own visible end; a far hit = the sample is beside the
+// object, not in front of it). The largest over the samples (<= 0: none).
+double DetectionByTracker::neroSeenFreeDepth(
+  double cx, double cy, double c, double s, const std::vector<std::pair<double, double>> & outline) const
+{
+  constexpr double kLocal = 3.0;
+  double worst = -std::numeric_limits<double>::infinity();
+  for (const auto & [u, w] : outline) {
+    const double dx = cx + c * u - s * w - nero_ve_sensor_x_;
+    const double dy = cy + s * u + c * w;
+    const double r = std::hypot(dx, dy);
+    if (r < 1.0) continue;
+    const int b = neroBin(std::atan2(dy, dx));
+    const int half = static_cast<int>(std::ceil(std::atan2(nero_ve_tol_, r) / kNeroBinRad));
+    float r1 = std::numeric_limits<float>::infinity();
+    for (int k = -half; k <= half; ++k) r1 = std::min(r1, nero_fs_r1_[(b + k + kNeroBins) % kNeroBins]);
+    const double depth = static_cast<double>(r1) - r;
+    if (depth > kLocal) continue;  // no hit, or only far behind: not in front of this vehicle's own end
+    worst = std::max(worst, depth);
+  }
+  return worst;
+}
+
+// NERO_DBT_VISIBLE_END: the end of a vehicle box that faces the lidar may not stand more than tol in front of the
+// vehicle's visible end (the surface the lidar hits on the same bearings, within 3 m behind it): the box (size and yaw
+// kept) slides back along its length by the least amount (<= 1.5 m) that ends this. Boxes seen from the side (no end
+// faces the lidar), their sides and far ends are never changed; no such slide within 1.5 m: stock placement.
+// Returns true when the box moved.
+bool DetectionByTracker::neroFitSeenSpace(autoware_perception_msgs::msg::DetectedObject & object)
+{
+  if (nero_fs_r1_.empty()) return false;
+  auto & pose = object.kinematics.pose_with_covariance.pose;
+  const double yaw = tf2::getYaw(pose.orientation);
+  const double c = std::cos(yaw);
+  const double s = std::sin(yaw);
+  const double hl = 0.5 * object.shape.dimensions.x;
+  const double hw = 0.5 * object.shape.dimensions.y;
+  const double x0 = pose.position.x;
+  const double y0 = pose.position.y;
+  const double su = c * (nero_ve_sensor_x_ - x0) + s * (0.0 - y0);
+  if (std::abs(su) <= hl) return false;  // no end faces the lidar
+  const double n = su > 0.0 ? 1.0 : -1.0;  // the end facing the lidar
+  std::vector<std::pair<double, double>> edge;
+  const double w_in = std::max(0.0, hw - 0.2);  // the end edge without its corners
+  const int nw = std::max(2, static_cast<int>(std::ceil(2.0 * w_in / 0.2)));
+  edge.reserve(nw + 1);
+  for (int i = 0; i <= nw; ++i) edge.emplace_back(n * hl, -w_in + 2.0 * w_in * i / nw);
+  ++nero_ve_boxes_;
+  if (neroSeenFreeDepth(x0, y0, c, s, edge) <= nero_ve_tol_) return false;
+  for (int i = 1; i <= 15; ++i) {
+    const double d = -n * 0.1 * i;  // back along the length, away from the lidar
+    if (neroSeenFreeDepth(x0 + c * d, y0 + s * d, c, s, edge) <= nero_ve_tol_) {
+      pose.position.x += c * d;
+      pose.position.y += s * d;
+      ++nero_ve_moved_;
+      nero_ve_moved_sum_ += std::abs(d);
+      nero_ve_moved_max_ = std::max(nero_ve_moved_max_, std::abs(d));
+      return true;
+    }
+  }
+  ++nero_ve_unresolved_;
+  return false;
 }
 
 void DetectionByTracker::setMaxSearchRange()
@@ -172,6 +322,8 @@ void DetectionByTracker::onObjects(
   debugger_->publishInitialObjects(*input_msg);
   debugger_->publishTrackedObjects(tracked_objects);
 
+  if (nero_ve_tol_ >= 0.0) neroBuildFirstHits(*input_msg);
+
   // merge over segmented objects
   tier4_perception_msgs::msg::DetectedObjectsWithFeature merged_objects;
   autoware_perception_msgs::msg::DetectedObjects no_found_tracked_objects;
@@ -196,6 +348,20 @@ void DetectionByTracker::onObjects(
   objects_pub_->publish(detected_objects);
   published_time_publisher_->publish_if_subscribed(objects_pub_, detected_objects.header.stamp);
   debugger_->publishProcessingTime();
+  if (nero_ve_tol_ >= 0.0) {
+    const rclcpp::Time now(input_msg->header.stamp, RCL_ROS_TIME);
+    if (nero_ve_last_log_.nanoseconds() == 0) nero_ve_last_log_ = now;
+    if ((now - nero_ve_last_log_).seconds() >= 10.0) {
+      RCLCPP_INFO(
+        get_logger(),
+        "[NERO_DBT_VISIBLE_END] merged vehicle boxes since start %lu, slid back to the visible end %lu (mean %.2f "
+        "m, max %.2f m), not resolvable (stock) %lu, points of tracked pedestrians / bicycles left out %lu",
+        static_cast<unsigned long>(nero_ve_boxes_), static_cast<unsigned long>(nero_ve_moved_),
+        nero_ve_moved_ > 0 ? nero_ve_moved_sum_ / nero_ve_moved_ : 0.0, nero_ve_moved_max_,
+        static_cast<unsigned long>(nero_ve_unresolved_), static_cast<unsigned long>(nero_ve_others_points_));
+      nero_ve_last_log_ = now;
+    }
+  }
 }
 
 void DetectionByTracker::divideUnderSegmentedObjects(
@@ -380,6 +546,10 @@ void DetectionByTracker::mergeOverSegmentedObjects(
       pcl_merged_cluster += pcl_cluster;
     }
 
+    // NERO_DBT_VISIBLE_END: points a tracked pedestrian / bicycle / motorcycle explains are not this vehicle's
+    if (nero_ve_tol_ >= 0.0 && autoware::object_recognition_utils::isCarLikeVehicle(label)) {
+      neroDropOthersPoints(tracked_objects, pcl_merged_cluster);
+    }
     if (pcl_merged_cluster.points.empty()) {  // if clusters aren't found
       out_no_found_tracked_objects.objects.push_back(tracked_object);
       continue;
@@ -399,6 +569,10 @@ void DetectionByTracker::mergeOverSegmentedObjects(
     if (!is_shape_estimated) {
       out_no_found_tracked_objects.objects.push_back(tracked_object);
       continue;
+    }
+
+    if (nero_ve_tol_ >= 0.0 && autoware::object_recognition_utils::isCarLikeVehicle(label)) {
+      neroFitSeenSpace(feature_object.object);
     }
 
     feature_object.object.existence_probability =
