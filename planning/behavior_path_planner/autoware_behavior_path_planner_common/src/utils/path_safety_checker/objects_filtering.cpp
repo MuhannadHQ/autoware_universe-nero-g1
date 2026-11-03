@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "autoware/behavior_path_planner_common/utils/path_safety_checker/objects_filtering.hpp"
+#include "autoware/behavior_path_planner_common/utils/nero_mu.hpp"  // NERO_BPP_PROJ_FAST
 
 #include "autoware/behavior_path_planner_common/utils/utils.hpp"
 #include "autoware/object_recognition_utils/predicted_path_utils.hpp"
@@ -44,7 +45,7 @@ bool position_filter(
 {
   if (path_points.empty()) return false;
 
-  const auto dist_ego_to_obj = autoware::motion_utils::calcSignedArcLength(
+  const auto dist_ego_to_obj = nero_mu::calcSignedArcLength(
     path_points, current_pose, object.kinematics.initial_pose_with_covariance.pose.position);
 
   return (backward_distance < dist_ego_to_obj && dist_ego_to_obj < forward_distance);

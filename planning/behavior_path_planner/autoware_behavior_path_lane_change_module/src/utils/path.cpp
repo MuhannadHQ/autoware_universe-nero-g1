@@ -32,9 +32,14 @@
 #include <fmt/format.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
+#include <memory>
+#include <optional>
 #include <vector>
 
 namespace
@@ -507,6 +512,67 @@ LaneChangePath construct_candidate_path(
   return candidate_path;
 }
 
+namespace
+{
+// NERO_LC_FRENET_REF_MEMO (bppstall job 2026-11-03, QUEUE TRJ2: 11-02 13:27:50-59 the robot stood at the 153664 lane-change
+// hold while cars passed and behavior_path_planner's cycle grew to 0.48-0.50 s -> trajectory-rate WARN -> emergency stops).
+// In generate_frenet_candidates every prepare metric (57 at a wait near the lane end) built its own target-lane reference
+// path (getCenterLinePath + resamplePathWithSpline) and Spline2D (an iterative linear solve). Both depend only on the
+// lane-changing start pose and the length cap; the prepare segment ends on a PATH POINT (clipPathLength), so many metrics
+// share the same start pose. Profiled at F (planning sim, no load): 22-25 % of behavior_path_planner's CPU. Metrics with
+// bit-identical (start pose, length cap) now share ONE reference path + spline within the same call (nothing is kept
+// across cycles: the same numbers by construction). 0 / unset = the car; 1 = share; 2 = check (re-compute every reuse,
+// compare bit for bit, count, print).
+int nero_frenet_ref_memo_mode()
+{
+  static const int m = [] {
+    const char * v = std::getenv("NERO_LC_FRENET_REF_MEMO");
+    const int r = v ? std::atoi(v) : 0;
+    if (r > 0) {
+      std::fprintf(stderr, "[NERO_LC_FRENET_REF_MEMO] %d (1: share the target reference per start pose, 2: check)\n", r);
+    }
+    return r;
+  }();
+  return m;
+}
+
+struct NeroFrenetRef
+{
+  std::array<uint64_t, 8> key{};
+  PathWithLaneId path;
+  std::vector<double> sums;
+  std::optional<Spline2D> spline;
+};
+
+std::array<uint64_t, 8> nero_frenet_ref_key(const Pose & p, const double len)
+{
+  const double v[8] = {p.position.x,    p.position.y,    p.position.z,    p.orientation.x,
+                       p.orientation.y, p.orientation.z, p.orientation.w, len};
+  std::array<uint64_t, 8> k{};
+  std::memcpy(k.data(), v, sizeof(v));
+  return k;
+}
+
+bool nero_same_ref(const NeroFrenetRef & a, const NeroFrenetRef & b)
+{
+  if (a.path.points.size() != b.path.points.size() || a.sums.size() != b.sums.size()) return false;
+  if (std::memcmp(a.sums.data(), b.sums.data(), a.sums.size() * sizeof(double)) != 0) return false;
+  for (size_t i = 0; i < a.path.points.size(); ++i) {
+    const auto & x = a.path.points[i];
+    const auto & y = b.path.points[i];
+    if (x.lane_ids != y.lane_ids) return false;
+    const double u[8] = {x.point.pose.position.x,    x.point.pose.position.y,    x.point.pose.position.z,
+                         x.point.pose.orientation.x, x.point.pose.orientation.y, x.point.pose.orientation.z,
+                         x.point.pose.orientation.w, x.point.longitudinal_velocity_mps};
+    const double w[8] = {y.point.pose.position.x,    y.point.pose.position.y,    y.point.pose.position.z,
+                         y.point.pose.orientation.x, y.point.pose.orientation.y, y.point.pose.orientation.z,
+                         y.point.pose.orientation.w, y.point.longitudinal_velocity_mps};
+    if (std::memcmp(u, w, sizeof(u)) != 0) return false;
+  }
+  return true;
+}
+}  // namespace
+
 std::vector<lane_change::TrajectoryGroup> generate_frenet_candidates(
   const CommonDataPtr & common_data_ptr, const PathWithLaneId & prev_module_path,
   const std::vector<LaneChangePhaseMetrics> & prep_metrics)
@@ -524,6 +590,12 @@ std::vector<lane_change::TrajectoryGroup> generate_frenet_candidates(
   {
     size_t prep_fail{0}, ref_empty{0}, no_sampling{0}, generated{0}, duplicate{0}, out_of_bound{0};
   } nero_count;
+
+  // NERO_LC_FRENET_REF_MEMO: the target references of this call, by (start pose, length cap)
+  const int nero_ref_memo = nero_frenet_ref_memo_mode();
+  std::vector<std::shared_ptr<NeroFrenetRef>> nero_refs;
+  size_t nero_ref_hits = 0;
+  size_t nero_ref_mismatch = 0;
 
   for (const auto & metric : prep_metrics) {
     PathWithLaneId prepare_segment;
@@ -572,23 +644,55 @@ std::vector<lane_change::TrajectoryGroup> generate_frenet_candidates(
     }
 
     constexpr auto resample_interval = 0.5;
-    const auto target_lane_reference_path = get_reference_path_from_target_lane(
-      common_data_ptr, lc_start_pose, max_lane_changing_length, resample_interval);
+    const auto nero_compute_ref = [&]() {
+      auto r = std::make_shared<NeroFrenetRef>();
+      r->path = get_reference_path_from_target_lane(
+        common_data_ptr, lc_start_pose, max_lane_changing_length, resample_interval);
+      if (r->path.points.empty()) {
+        return r;
+      }
+      r->sums.push_back(0.0);
+      r->sums.reserve(r->path.points.size() - 1);
+      double ref_s = 0.0;
+      for (auto it = r->path.points.begin(); std::next(it) != r->path.points.end(); ++it) {
+        ref_s += autoware_utils::calc_distance2d(*it, *std::next(it));
+        r->sums.push_back(ref_s);
+      }
+      r->spline.emplace(init_reference_spline(r->path.points));
+      return r;
+    };
+    std::shared_ptr<const NeroFrenetRef> nero_ref;
+    if (nero_ref_memo > 0) {  // NERO_LC_FRENET_REF_MEMO
+      const auto key = nero_frenet_ref_key(lc_start_pose, max_lane_changing_length);
+      for (const auto & e : nero_refs) {
+        if (e->key == key) {
+          nero_ref = e;
+          break;
+        }
+      }
+      if (!nero_ref) {
+        auto r = nero_compute_ref();
+        r->key = key;
+        nero_refs.push_back(r);
+        nero_ref = r;
+      } else {
+        ++nero_ref_hits;
+        if (nero_ref_memo == 2 && !nero_same_ref(*nero_compute_ref(), *nero_ref)) {
+          ++nero_ref_mismatch;
+        }
+      }
+    } else {
+      nero_ref = nero_compute_ref();
+    }
+    const auto & target_lane_reference_path = nero_ref->path;
     if (target_lane_reference_path.points.empty()) {
       ++nero_count.ref_empty;
       continue;
     }
 
-    std::vector<double> target_ref_path_sums{0.0};
-    target_ref_path_sums.reserve(target_lane_reference_path.points.size() - 1);
-    double ref_s = 0.0;
-    for (auto it = target_lane_reference_path.points.begin();
-         std::next(it) != target_lane_reference_path.points.end(); ++it) {
-      ref_s += autoware_utils::calc_distance2d(*it, *std::next(it));
-      target_ref_path_sums.push_back(ref_s);
-    }
+    const auto & target_ref_path_sums = nero_ref->sums;
 
-    const auto reference_spline = init_reference_spline(target_lane_reference_path.points);
+    const auto & reference_spline = *nero_ref->spline;
 
     const auto initial_state = init_frenet_state(
       reference_spline.frenet({lc_start_pose.position.x, lc_start_pose.position.y}), metric);
@@ -645,6 +749,32 @@ std::vector<lane_change::TrajectoryGroup> generate_frenet_candidates(
   };
 
   ranges::for_each(trajectory_groups, limit_vel);
+
+  if (nero_ref_memo == 2) {  // NERO_LC_FRENET_REF_MEMO check mode: totals (stderr; also at exit)
+    struct Totals
+    {
+      size_t calls{0}, hits{0}, refs{0}, bad{0};
+      ~Totals()
+      {
+        if (calls > 0) {
+          std::fprintf(
+            stderr,
+            "[NERO_LC_FRENET_REF_MEMO] check total: %zu searches, %zu references built, %zu reused, %zu mismatches\n",
+            calls, refs, hits, bad);
+        }
+      }
+    };
+    static Totals t;
+    ++t.calls;
+    t.hits += nero_ref_hits;
+    t.refs += nero_refs.size();
+    t.bad += nero_ref_mismatch;
+    if (nero_ref_mismatch > 0 || t.calls % 50 == 0) {
+      std::fprintf(
+        stderr, "[NERO_LC_FRENET_REF_MEMO] check: %zu searches, %zu references built, %zu reused, %zu mismatches\n",
+        t.calls, t.refs, t.hits, t.bad);
+    }
+  }
 
   static const bool nero_debug = std::getenv("NERO_LC_DEBUG") != nullptr;
   static double nero_last = 0.0;

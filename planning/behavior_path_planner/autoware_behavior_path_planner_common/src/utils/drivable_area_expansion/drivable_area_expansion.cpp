@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "autoware/behavior_path_planner_common/utils/drivable_area_expansion/drivable_area_expansion.hpp"
+#include "autoware/behavior_path_planner_common/utils/nero_mu.hpp"  // NERO_BPP_PROJ_FAST
 
 #include "autoware/behavior_path_planner_common/utils/drivable_area_expansion/footprints.hpp"
 #include "autoware/behavior_path_planner_common/utils/drivable_area_expansion/map_utils.hpp"
@@ -56,7 +57,7 @@ void reuse_previous_poses(
   std::vector<double> cropped_curvatures;
   const auto ego_is_behind =
     prev_poses.size() > 1 &&
-    autoware::motion_utils::calcLongitudinalOffsetToSegment(prev_poses, 0, ego_point) < 0.0;
+    nero_mu::calcLongitudinalOffsetToSegment(prev_poses, 0, ego_point) < 0.0;
   const auto ego_is_far =
     !prev_poses.empty() && autoware_utils::calc_distance2d(ego_point, prev_poses.front()) < 0.0;
   // make sure the reused points are not behind the current original drivable area
@@ -71,8 +72,8 @@ void reuse_previous_poses(
 
   if (!ego_is_behind && !ego_is_far && prev_poses.size() > 1 && !prev_poses_across_bounds) {
     const auto first_idx =
-      autoware::motion_utils::findNearestSegmentIndex(prev_poses, path.points.front().point.pose);
-    const auto deviation = autoware::motion_utils::calcLateralOffset(
+      nero_mu::findNearestSegmentIndex(prev_poses, path.points.front().point.pose);
+    const auto deviation = nero_mu::calcLateralOffset(
       prev_poses, path.points.front().point.pose.position);
     if (first_idx && deviation < params.max_reuse_deviation) {
       LineString2d path_ls;
@@ -105,7 +106,7 @@ void reuse_previous_poses(
   } else {
     const auto initial_arc_length = autoware::motion_utils::calcArcLength(cropped_poses);
     const auto max_path_arc_length = autoware::motion_utils::calcArcLength(path.points);
-    const auto first_arc_length = autoware::motion_utils::calcSignedArcLength(
+    const auto first_arc_length = nero_mu::calcSignedArcLength(
       path.points, path.points.front().point.pose.position, cropped_poses.back().position);
     for (auto arc_length = first_arc_length + params.resample_interval;
          (params.max_path_arc_length <= 0.0 ||

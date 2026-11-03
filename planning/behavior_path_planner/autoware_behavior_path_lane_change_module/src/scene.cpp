@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "autoware/behavior_path_lane_change_module/scene.hpp"
+#include "autoware/behavior_path_planner_common/utils/nero_mu.hpp"  // NERO_BPP_PROJ_FAST
 #include <cstdio>
 #include <array>
 
@@ -236,7 +237,7 @@ autoware::behavior_path_planner::utils::path_safety_checker::RSSparams nero_prep
 
 namespace autoware::behavior_path_planner
 {
-using autoware::motion_utils::calcSignedArcLength;
+using nero_mu::calcSignedArcLength;  // NERO_BPP_PROJ_FAST (nero_mu.hpp)
 using utils::lane_change::create_lanes_polygon;
 namespace calculation = utils::lane_change::calculation;
 using utils::path_safety_checker::filter::velocity_filter;
@@ -360,7 +361,7 @@ void NormalLaneChange::update_transient_data(const bool is_approved)
 
   const auto & p = *common_data_ptr_->bpp_param_ptr;
   const auto nearest_seg_idx =
-    autoware::motion_utils::findFirstNearestSegmentIndexWithSoftConstraints(
+    nero_mu::findFirstNearestSegmentIndexWithSoftConstraints(
       prev_module_output_.path.points, common_data_ptr_->get_ego_pose(),
       p.ego_nearest_dist_threshold, p.ego_nearest_yaw_threshold);
   transient_data.current_path_velocity =
@@ -624,7 +625,7 @@ void NormalLaneChange::update_transient_data(const bool is_approved)
         }
       }
       const double ego_lat =
-        std::max(0.0, sgn * autoware::motion_utils::calcLateralOffset(path.points, ego_pose.position));
+        std::max(0.0, sgn * nero_mu::calcLateralOffset(path.points, ego_pose.position));
       double & held = inch_cmd_held[this];
       static std::unordered_map<const NormalLaneChange *, bool> inch_pulling_back;
       bool & pulling = inch_pulling_back[this];
@@ -1047,7 +1048,7 @@ TurnSignalInfo NormalLaneChange::get_terminal_turn_signal_info() const
                       lane_change_param.min_length_for_turn_signal_activation +
                       common_param.base_link2front;
   const double path_length = autoware::motion_utils::calcArcLength(path.points);
-  const auto start_pose = autoware::motion_utils::calcLongitudinalOffsetPose(
+  const auto start_pose = nero_mu::calcLongitudinalOffsetPose(
     path.points, 0, std::max(path_length - buffer, 0.0));
 
   if (!start_pose) return original_turn_signal_info;
@@ -1627,7 +1628,7 @@ bool NormalLaneChange::isAbleToReturnCurrentLane() const
     return true;
   }
 
-  const auto nearest_idx = autoware::motion_utils::findFirstNearestSegmentIndexWithSoftConstraints(
+  const auto nearest_idx = nero_mu::findFirstNearestSegmentIndexWithSoftConstraints(
     status_.lane_change_path.path.points, getEgoPose(),
     planner_data_->parameters.ego_nearest_dist_threshold,
     planner_data_->parameters.ego_nearest_yaw_threshold);
@@ -1682,7 +1683,7 @@ bool NormalLaneChange::isAbleToStopSafely() const
     return false;
   }
 
-  const auto nearest_idx = autoware::motion_utils::findFirstNearestSegmentIndexWithSoftConstraints(
+  const auto nearest_idx = nero_mu::findFirstNearestSegmentIndexWithSoftConstraints(
     status_.lane_change_path.path.points, getEgoPose(),
     planner_data_->parameters.ego_nearest_dist_threshold,
     planner_data_->parameters.ego_nearest_yaw_threshold);
@@ -1836,7 +1837,7 @@ FilteredLanesObjects NormalLaneChange::filter_objects() const
   for (const auto & object : objects.objects) {
     auto ext_object = utils::lane_change::transform(object, *lane_change_parameters_);
     const auto & ext_obj_pose = ext_object.initial_pose;
-    ext_object.dist_from_ego = autoware::motion_utils::calcSignedArcLength(
+    ext_object.dist_from_ego = nero_mu::calcSignedArcLength(
       current_lanes_ref_path.points, current_pose.position, ext_obj_pose.position);
 
     const auto is_before_terminal =
@@ -3048,7 +3049,7 @@ bool NormalLaneChange::calcAbortPath()
     //   reference_lane_segment = terminal_path->path;
     // }
     const auto return_pose = shifted_path.path.points.at(abort_return_idx).point.pose;
-    const auto seg_idx = autoware::motion_utils::findFirstNearestSegmentIndexWithSoftConstraints(
+    const auto seg_idx = nero_mu::findFirstNearestSegmentIndexWithSoftConstraints(
       reference_lane_segment.points, return_pose, common_param.ego_nearest_dist_threshold,
       common_param.ego_nearest_yaw_threshold);
     reference_lane_segment.points = autoware::motion_utils::cropPoints(

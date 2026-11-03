@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "autoware/behavior_path_planner_common/utils/path_safety_checker/safety_check.hpp"
+#include "autoware/behavior_path_planner_common/utils/nero_mu.hpp"  // NERO_BPP_PROJ_FAST
 
 #include "autoware/behavior_path_planner_common/utils/path_safety_checker/objects_filtering.hpp"
 #include "autoware/interpolation/linear_interpolation.hpp"
@@ -40,11 +41,11 @@ namespace autoware::behavior_path_planner::utils::path_safety_checker
 
 namespace bg = boost::geometry;
 
-using autoware::motion_utils::calcLongitudinalOffsetPoint;
-using autoware::motion_utils::calcLongitudinalOffsetPose;
-using autoware::motion_utils::calcLongitudinalOffsetToSegment;
+using nero_mu::calcLongitudinalOffsetPoint;  // NERO_BPP_PROJ_FAST (nero_mu.hpp)
+using nero_mu::calcLongitudinalOffsetPose;  // NERO_BPP_PROJ_FAST (nero_mu.hpp)
+using nero_mu::calcLongitudinalOffsetToSegment;  // NERO_BPP_PROJ_FAST (nero_mu.hpp)
 using autoware::motion_utils::findNearestIndex;
-using autoware::motion_utils::findNearestSegmentIndex;
+using nero_mu::findNearestSegmentIndex;  // NERO_BPP_PROJ_FAST (nero_mu.hpp)
 using autoware_utils::calc_distance2d;
 
 void appendPointToPolygon(Polygon2d & polygon, const geometry_msgs::msg::Point & geom_point)
@@ -201,7 +202,7 @@ Polygon2d create_extended_polygon_along_path(
     debug.lat_offset = lat_offset;
   }
 
-  const auto lon_offset_pose = autoware::motion_utils::calcLongitudinalOffsetPose(
+  const auto lon_offset_pose = nero_mu::calcLongitudinalOffsetPose(
     planned_path.points, base_link_pose.position, lon_length);
   if (!lon_offset_pose.has_value()) {
     return createExtendedPolygon(
@@ -209,8 +210,8 @@ Polygon2d create_extended_polygon_along_path(
   }
 
   const size_t start_idx =
-    autoware::motion_utils::findNearestSegmentIndex(planned_path.points, base_link_pose.position);
-  const size_t end_idx = autoware::motion_utils::findNearestSegmentIndex(
+    nero_mu::findNearestSegmentIndex(planned_path.points, base_link_pose.position);
+  const size_t end_idx = nero_mu::findNearestSegmentIndex(
     planned_path.points, lon_offset_pose.value().position);
 
   Polygon2d polygon;

@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "autoware/behavior_path_planner_common/turn_signal_decider.hpp"
+#include "autoware/behavior_path_planner_common/utils/nero_mu.hpp"  // NERO_BPP_PROJ_FAST
 
 #include "autoware/behavior_path_planner_common/utils/utils.hpp"
 
@@ -37,16 +38,16 @@
 
 namespace autoware::behavior_path_planner
 {
-using autoware::motion_utils::calcSignedArcLength;
+using nero_mu::calcSignedArcLength;  // NERO_BPP_PROJ_FAST (nero_mu.hpp)
 
 double calc_distance(
   const PathWithLaneId & path, const Pose & current_pose, const size_t current_seg_idx,
   const Pose & input_point, const double nearest_dist_threshold, const double nearest_yaw_threshold)
 {
   const size_t nearest_seg_idx =
-    autoware::motion_utils::findFirstNearestSegmentIndexWithSoftConstraints(
+    nero_mu::findFirstNearestSegmentIndexWithSoftConstraints(
       path.points, input_point, nearest_dist_threshold, nearest_yaw_threshold);
-  return autoware::motion_utils::calcSignedArcLength(
+  return nero_mu::calcSignedArcLength(
     path.points, current_pose.position, current_seg_idx, input_point.position, nearest_seg_idx);
 }
 
@@ -88,7 +89,7 @@ TurnIndicatorsCommand TurnSignalDecider::getTurnSignal(
 
   // Closest ego segment
   const size_t ego_seg_idx =
-    autoware::motion_utils::findFirstNearestSegmentIndexWithSoftConstraints(
+    nero_mu::findFirstNearestSegmentIndexWithSoftConstraints(
       extended_path.points, current_pose, nearest_dist_threshold, nearest_yaw_threshold);
 
   // Get closest intersection turn signal if exists
@@ -250,20 +251,20 @@ std::optional<TurnSignalInfo> TurnSignalDecider::getIntersectionTurnSignalInfo(
     }
 
     const size_t front_nearest_seg_idx =
-      autoware::motion_utils::findFirstNearestSegmentIndexWithSoftConstraints(
+      nero_mu::findFirstNearestSegmentIndexWithSoftConstraints(
         path.points, lane_front_pose, nearest_dist_threshold, nearest_yaw_threshold);
     const size_t back_nearest_seg_idx =
-      autoware::motion_utils::findFirstNearestSegmentIndexWithSoftConstraints(
+      nero_mu::findFirstNearestSegmentIndexWithSoftConstraints(
         path.points, lane_back_pose, nearest_dist_threshold, nearest_yaw_threshold);
 
     // Distance from ego vehicle front pose to front point of the lane
-    const double dist_to_front_point = autoware::motion_utils::calcSignedArcLength(
+    const double dist_to_front_point = nero_mu::calcSignedArcLength(
                                          path.points, current_pose.position, current_seg_idx,
                                          lane_front_pose.position, front_nearest_seg_idx) -
                                        base_link2front_;
 
     // Distance from ego vehicle base link to the terminal point of the lane
-    const double dist_to_back_point = autoware::motion_utils::calcSignedArcLength(
+    const double dist_to_back_point = nero_mu::calcSignedArcLength(
       path.points, current_pose.position, current_seg_idx, lane_back_pose.position,
       back_nearest_seg_idx);
 
@@ -299,9 +300,9 @@ std::optional<TurnSignalInfo> TurnSignalDecider::getIntersectionTurnSignalInfo(
     const auto & turn_signal_info = signal_queue.front();
     const auto & required_end_point = turn_signal_info.required_end_point;
     const size_t nearest_seg_idx =
-      autoware::motion_utils::findFirstNearestSegmentIndexWithSoftConstraints(
+      nero_mu::findFirstNearestSegmentIndexWithSoftConstraints(
         path.points, required_end_point, nearest_dist_threshold, nearest_yaw_threshold);
-    const double dist_to_end_point = autoware::motion_utils::calcSignedArcLength(
+    const double dist_to_end_point = nero_mu::calcSignedArcLength(
       path.points, current_pose.position, current_seg_idx, required_end_point.position,
       nearest_seg_idx);
 
@@ -426,9 +427,9 @@ TurnSignalInfo TurnSignalDecider::overwrite_turn_signal(
 
   const auto get_distance = [&](const Pose & input_point) {
     const size_t nearest_seg_idx =
-      autoware::motion_utils::findFirstNearestSegmentIndexWithSoftConstraints(
+      nero_mu::findFirstNearestSegmentIndexWithSoftConstraints(
         path.points, input_point, nearest_dist_threshold, nearest_yaw_threshold);
-    return autoware::motion_utils::calcSignedArcLength(
+    return nero_mu::calcSignedArcLength(
              path.points, current_pose.position, current_seg_idx, input_point.position,
              nearest_seg_idx) -
            base_link2front_;
@@ -453,9 +454,9 @@ TurnSignalInfo TurnSignalDecider::use_prior_turn_signal(
 {
   const auto get_distance = [&](const Pose & input_point) {
     const size_t nearest_seg_idx =
-      autoware::motion_utils::findFirstNearestSegmentIndexWithSoftConstraints(
+      nero_mu::findFirstNearestSegmentIndexWithSoftConstraints(
         path.points, input_point, nearest_dist_threshold, nearest_yaw_threshold);
-    return autoware::motion_utils::calcSignedArcLength(
+    return nero_mu::calcSignedArcLength(
       path.points, current_pose.position, current_seg_idx, input_point.position, nearest_seg_idx);
   };
 
@@ -616,9 +617,9 @@ void TurnSignalDecider::set_intersection_info(
 {
   const auto get_distance = [&](const Pose & input_point) {
     const size_t nearest_seg_idx =
-      autoware::motion_utils::findFirstNearestSegmentIndexWithSoftConstraints(
+      nero_mu::findFirstNearestSegmentIndexWithSoftConstraints(
         path.points, input_point, nearest_dist_threshold, nearest_yaw_threshold);
-    return autoware::motion_utils::calcSignedArcLength(
+    return nero_mu::calcSignedArcLength(
       path.points, current_pose.position, current_seg_idx, input_point.position, nearest_seg_idx);
   };
 

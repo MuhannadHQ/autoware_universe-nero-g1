@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include <autoware/behavior_path_planner_common/utils/traffic_light_utils.hpp>
+#include "autoware/behavior_path_planner_common/utils/nero_mu.hpp"  // NERO_BPP_PROJ_FAST
 #include <autoware/motion_utils/trajectory/trajectory.hpp>
 #include <autoware/traffic_light_utils/traffic_light_utils.hpp>
 
@@ -21,7 +22,7 @@
 
 namespace autoware::behavior_path_planner::utils::traffic_light
 {
-using autoware::motion_utils::calcSignedArcLength;
+using nero_mu::calcSignedArcLength;  // NERO_BPP_PROJ_FAST (nero_mu.hpp)
 
 double getDistanceToNextTrafficLight(
   const Pose & current_pose, const lanelet::ConstLanelets & lanelets)

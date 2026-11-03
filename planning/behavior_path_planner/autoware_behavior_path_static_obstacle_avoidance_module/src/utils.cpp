@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "autoware/behavior_path_planner_common/utils/utils.hpp"
+#include "autoware/behavior_path_planner_common/utils/nero_mu.hpp"  // NERO_BPP_PROJ_FAST
 
 #include "autoware/behavior_path_planner_common/utils/drivable_area_expansion/static_drivable_area.hpp"
 #include "autoware/behavior_path_planner_common/utils/path_safety_checker/objects_filtering.hpp"
@@ -321,10 +322,10 @@ bool isQueued(
       continue;
     }
     const auto & op = o.kinematics.initial_pose_with_covariance.pose.position;
-    const double ds = autoware::motion_utils::calcSignedArcLength(path, me, op);
+    const double ds = nero_mu::calcSignedArcLength(path, me, op);
     const double gap = ds - 0.5 * my_len - 0.5 * o.shape.dimensions.x;
     if (ds <= 0.0 || gap > queue_m) continue;
-    if (std::abs(autoware::motion_utils::calcLateralOffset(path, op)) > 1.5) continue;
+    if (std::abs(nero_mu::calcLateralOffset(path, op)) > 1.5) continue;
     return true;
   }
   return false;
@@ -1470,7 +1471,7 @@ double getRoadShoulderDistance(
   const auto object_closest_pose = data.reference_path.points.at(object_closest_index).point.pose;
 
   const auto rh = planner_data->route_handler;
-  if (!rh->getClosestLaneletWithinRoute(object_closest_pose, &object.overhang_lanelet)) {
+  if (!nero_mu::getClosestLaneletWithinRoute(*rh, object_closest_pose, &object.overhang_lanelet)) {  // NERO_BPP_PROJ_FAST: memo
     return 0.0;
   }
 
@@ -1714,7 +1715,7 @@ void fillLongitudinalAndLengthByClosestEnvelopeFootprint(
     const auto point = autoware_utils::create_point(p.x(), p.y(), 0.0);
     // TODO(someone): search around first position where the ego should avoid the object.
     const double arc_length =
-      autoware::motion_utils::calcSignedArcLength(path.points, ego_pos, point);
+      nero_mu::calcSignedArcLength(path.points, ego_pos, point);
     min_distance = std::min(min_distance, arc_length);
     max_distance = std::max(max_distance, arc_length);
   }
@@ -1907,7 +1908,7 @@ void insertDecelPoint(
   PoseWithDetailOpt & p_out)
 {
   const auto decel_point =
-    autoware::motion_utils::calcLongitudinalOffsetPoint(path.points, p_src, offset);
+    nero_mu::calcLongitudinalOffsetPoint(path.points, p_src, offset);
 
   if (!decel_point) {
     // TODO(Satoshi OTA)  Think later the process in the case of no decel point found.
@@ -1915,7 +1916,7 @@ void insertDecelPoint(
   }
 
   const auto seg_idx =
-    autoware::motion_utils::findNearestSegmentIndex(path.points, decel_point.value());
+    nero_mu::findNearestSegmentIndex(path.points, decel_point.value());
   const auto insert_idx =
     autoware::motion_utils::insertTargetPoint(seg_idx, decel_point.value(), path.points);
 
@@ -2432,7 +2433,7 @@ void filterTargetObjects(
   const auto ego_idx = planner_data->findEgoIndex(data.reference_path_rough.points);
   const auto to_goal_distance =
     rh->isInGoalRouteSection(data.current_lanelets.back())
-      ? autoware::motion_utils::calcSignedArcLength(
+      ? nero_mu::calcSignedArcLength(
           data.reference_path_rough.points, ego_idx, data.reference_path_rough.points.size() - 1)
       : std::numeric_limits<double>::max();
 
@@ -3140,7 +3141,7 @@ double calcDistanceToReturnDeadLine(
     if (planner_data->route_handler->isInGoalRouteSection(lanelets.back())) {
       const auto & ego_pos = planner_data->self_odometry->pose.pose.position;
       const auto to_goal_distance =
-        autoware::motion_utils::calcSignedArcLength(path.points, ego_pos, path.points.size() - 1);
+        nero_mu::calcSignedArcLength(path.points, ego_pos, path.points.size() - 1);
       distance_to_return_dead_line = std::min(
         distance_to_return_dead_line, to_goal_distance - parameters->dead_line_buffer_for_goal);
     }

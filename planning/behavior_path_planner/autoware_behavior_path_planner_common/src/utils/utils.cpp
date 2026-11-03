@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "autoware/behavior_path_planner_common/utils/utils.hpp"
+#include "autoware/behavior_path_planner_common/utils/nero_mu.hpp"  // NERO_BPP_PROJ_FAST
 
 #include "autoware/motion_utils/trajectory/path_with_lane_id.hpp"
 
@@ -45,11 +46,11 @@ double calcInterpolatedZ(
   const autoware_internal_planning_msgs::msg::PathWithLaneId & input,
   const geometry_msgs::msg::Point target_pos, const size_t seg_idx)
 {
-  const double closest_to_target_dist = autoware::motion_utils::calcSignedArcLength(
+  const double closest_to_target_dist = nero_mu::calcSignedArcLength(
     input.points, input.points.at(seg_idx).point.pose.position,
     target_pos);  // TODO(murooka) implement calcSignedArcLength(points, idx, point)
   const double seg_dist =
-    autoware::motion_utils::calcSignedArcLength(input.points, seg_idx, seg_idx + 1);
+    nero_mu::calcSignedArcLength(input.points, seg_idx, seg_idx + 1);
 
   const double closest_z = input.points.at(seg_idx).point.pose.position.z;
   const double next_z = input.points.at(seg_idx + 1).point.pose.position.z;
@@ -64,7 +65,7 @@ double calcInterpolatedVelocity(
   const autoware_internal_planning_msgs::msg::PathWithLaneId & input, const size_t seg_idx)
 {
   const double seg_dist =
-    autoware::motion_utils::calcSignedArcLength(input.points, seg_idx, seg_idx + 1);
+    nero_mu::calcSignedArcLength(input.points, seg_idx, seg_idx + 1);
 
   const double closest_vel = input.points.at(seg_idx).point.longitudinal_velocity_mps;
   const double next_vel = input.points.at(seg_idx + 1).point.longitudinal_velocity_mps;

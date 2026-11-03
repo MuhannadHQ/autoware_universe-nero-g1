@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "autoware/behavior_path_lane_change_module/utils/utils.hpp"
+#include "autoware/behavior_path_planner_common/utils/nero_mu.hpp"  // NERO_BPP_PROJ_FAST
 
 #include "autoware/behavior_path_lane_change_module/structs/data.hpp"
 #include "autoware/behavior_path_lane_change_module/structs/path.hpp"
@@ -306,9 +307,9 @@ CandidateOutput assignToCandidate(
   CandidateOutput candidate_output;
   candidate_output.path_candidate = lane_change_path.path;
   candidate_output.lateral_shift = utils::lane_change::getLateralShift(lane_change_path);
-  candidate_output.start_distance_to_path_change = autoware::motion_utils::calcSignedArcLength(
+  candidate_output.start_distance_to_path_change = nero_mu::calcSignedArcLength(
     lane_change_path.path.points, ego_position, lane_change_path.info.shift_line.start.position);
-  candidate_output.finish_distance_to_path_change = autoware::motion_utils::calcSignedArcLength(
+  candidate_output.finish_distance_to_path_change = nero_mu::calcSignedArcLength(
     lane_change_path.path.points, ego_position, lane_change_path.info.shift_line.end.position);
 
   return candidate_output;
@@ -338,7 +339,7 @@ std::vector<PoseWithVelocityStamped> convert_to_predicted_path(
   const auto & vehicle_pose = common_data_ptr->get_ego_pose();
   const auto & bpp_param_ptr = common_data_ptr->bpp_param_ptr;
   const auto nearest_seg_idx =
-    autoware::motion_utils::findFirstNearestSegmentIndexWithSoftConstraints(
+    nero_mu::findFirstNearestSegmentIndexWithSoftConstraints(
       path.points, vehicle_pose, bpp_param_ptr->ego_nearest_dist_threshold,
       bpp_param_ptr->ego_nearest_yaw_threshold);
 
@@ -413,12 +414,12 @@ bool isParkedObject(
   const auto object_closest_pose = path.points.at(object_closest_index).point.pose;
 
   lanelet::ConstLanelet closest_lanelet;
-  if (!route_handler.getClosestLaneletWithinRoute(object_closest_pose, &closest_lanelet)) {
+  if (!nero_mu::getClosestLaneletWithinRoute(route_handler, object_closest_pose, &closest_lanelet)) {  // NERO_BPP_PROJ_FAST: memo
     return false;
   }
 
   const double lat_dist =
-    autoware::motion_utils::calcLateralOffset(path.points, object_pose.position);
+    nero_mu::calcLateralOffset(path.points, object_pose.position);
   const auto most_side_lanelet =
     lat_dist > 0.0 ? route_handler.getMostLeftLanelet(closest_lanelet, false, true)
                    : route_handler.getMostRightLanelet(closest_lanelet, false, true);
@@ -739,7 +740,7 @@ bool is_ahead_of_ego(
   auto ego_min_dist_to_end = std::numeric_limits<double>::max();
   for (const auto & ego_edge_point : current_footprint) {
     const auto ego_edge = autoware_utils::create_point(ego_edge_point.x(), ego_edge_point.y(), 0.0);
-    const auto dist_to_end = autoware::motion_utils::calcSignedArcLength(
+    const auto dist_to_end = nero_mu::calcSignedArcLength(
       path.points, ego_edge, path.points.back().point.pose.position);
     ego_min_dist_to_end = std::min(dist_to_end, ego_min_dist_to_end);
   }
@@ -747,7 +748,7 @@ bool is_ahead_of_ego(
   auto current_min_dist_to_end = std::numeric_limits<double>::max();
   for (const auto & polygon_p : object.initial_polygon.outer()) {
     const auto obj_p = autoware_utils::create_point(polygon_p.x(), polygon_p.y(), 0.0);
-    const auto dist_ego_to_obj = autoware::motion_utils::calcSignedArcLength(
+    const auto dist_ego_to_obj = nero_mu::calcSignedArcLength(
       path.points, obj_p, path.points.back().point.pose.position);
     current_min_dist_to_end = std::min(dist_ego_to_obj, current_min_dist_to_end);
   }
@@ -767,7 +768,7 @@ bool is_before_terminal(
 
   const auto & obj_position = object.initial_pose.position;
   const auto dist_to_base_link =
-    autoware::motion_utils::calcSignedArcLength(path.points, obj_position, terminal_position);
+    nero_mu::calcSignedArcLength(path.points, obj_position, terminal_position);
   // we don't always have to check the distance accurately.
   if (std::abs(dist_to_base_link) > object.shape.dimensions.x) {
     return dist_to_base_link >= 0.0;
@@ -776,7 +777,7 @@ bool is_before_terminal(
   for (const auto & polygon_p : object.initial_polygon.outer()) {
     const auto obj_p = autoware_utils::create_point(polygon_p.x(), polygon_p.y(), 0.0);
     const auto dist_obj_to_terminal =
-      autoware::motion_utils::calcSignedArcLength(path.points, obj_p, terminal_position);
+      nero_mu::calcSignedArcLength(path.points, obj_p, terminal_position);
     current_max_dist = std::max(dist_obj_to_terminal, current_max_dist);
   }
   return current_max_dist >= 0.0;
@@ -1160,7 +1161,7 @@ std::vector<PoseWithVelocityStamped> convert_to_predicted_path(
   const auto & vehicle_pose = common_data_ptr->get_ego_pose();
   const auto & bpp_param_ptr = common_data_ptr->bpp_param_ptr;
   const auto nearest_seg_idx =
-    autoware::motion_utils::findFirstNearestSegmentIndexWithSoftConstraints(
+    nero_mu::findFirstNearestSegmentIndexWithSoftConstraints(
       path, vehicle_pose, bpp_param_ptr->ego_nearest_dist_threshold,
       bpp_param_ptr->ego_nearest_yaw_threshold);
 

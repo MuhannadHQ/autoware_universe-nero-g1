@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "autoware/behavior_path_static_obstacle_avoidance_module/shift_line_generator.hpp"
+#include "autoware/behavior_path_planner_common/utils/nero_mu.hpp"  // NERO_BPP_PROJ_FAST
 
 #include "autoware/behavior_path_planner_common/utils/utils.hpp"
 #include "autoware/behavior_path_static_obstacle_avoidance_module/utils.hpp"
@@ -240,13 +241,13 @@ std::optional<std::pair<double, double>> nero_return_window(
         p.x = a.x() + (b.x() - a.x()) * k / n_step;
         p.y = a.y() + (b.y() - a.y()) * k / n_step;
         const size_t seg =
-          proj ? proj->nearestSegment(p) : autoware::motion_utils::findNearestSegmentIndex(points, p);
+          proj ? proj->nearestSegment(p) : nero_mu::findNearestSegmentIndex(points, p);
         const double s = data.arclength_from_ego.at(seg) +
                          (proj ? proj->lonToSegment(seg, p)
-                               : autoware::motion_utils::calcLongitudinalOffsetToSegment(points, seg, p));
+                               : nero_mu::calcLongitudinalOffsetToSegment(points, seg, p));
         if (s < -rear - LON_MARGIN || s > limit + front) continue;
         pts.push_back(
-          {s, proj ? proj->lateral(p, seg) : autoware::motion_utils::calcLateralOffset(points, p, seg),
+          {s, proj ? proj->lateral(p, seg) : nero_mu::calcLateralOffset(points, p, seg),
            half_w + op.lateral_hard_margin + LAT_EXTRA, half_w + (vehicle ? 0.1 : 0.3), id, n_obj});
       }
     }
@@ -734,7 +735,7 @@ AvoidOutlines ShiftLineGenerator::generateAvoidOutline(
         return false;
       }
       const auto goal_pose = data_->route_handler->getGoalPose();
-      const double goal_longitudinal_distance = autoware::motion_utils::calcSignedArcLength(
+      const double goal_longitudinal_distance = nero_mu::calcSignedArcLength(
         data.reference_path.points, 0, goal_pose.position);
       const bool is_return_shift_to_goal =
         std::abs(al_return.end_longitudinal - goal_longitudinal_distance) <

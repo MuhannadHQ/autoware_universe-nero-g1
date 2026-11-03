@@ -13,6 +13,7 @@
 // limitations under the License.
 #include "autoware/behavior_path_planner_common/utils/drivable_area_expansion/static_drivable_area.hpp"
 
+#include "autoware/behavior_path_planner_common/utils/nero_mu.hpp"  // NERO_BPP_PROJ_FAST
 #include "autoware/behavior_path_planner_common/utils/drivable_area_expansion/drivable_area_expansion.hpp"
 #include "autoware/motion_utils/trajectory/trajectory.hpp"
 
@@ -98,7 +99,7 @@ size_t findNearestSegmentIndexFromLateralDistance(
   double min_lateral_dist = std::numeric_limits<double>::max();
   for (size_t seg_idx = 0; seg_idx < points.size() - 1; ++seg_idx) {
     const double lon_dist =
-      autoware::motion_utils::calcLongitudinalOffsetToSegment(points, seg_idx, target_point);
+      nero_mu::calcLongitudinalOffsetToSegment(points, seg_idx, target_point);
     const double segment_length = calc_distance2d(points.at(seg_idx), points.at(seg_idx + 1));
     const double lat_dist = [&]() {
       if (lon_dist < 0.0) {
@@ -107,7 +108,7 @@ size_t findNearestSegmentIndexFromLateralDistance(
       if (segment_length < lon_dist) {
         return calc_distance2d(points.at(seg_idx + 1), target_point);
       }
-      return std::abs(autoware::motion_utils::calcLateralOffset(points, target_point, seg_idx));
+      return std::abs(nero_mu::calcLateralOffset(points, target_point, seg_idx));
     }();
     if (lat_dist < min_lateral_dist) {
       closest_idx = seg_idx;
@@ -119,7 +120,7 @@ size_t findNearestSegmentIndexFromLateralDistance(
     return *closest_idx;
   }
 
-  return autoware::motion_utils::findNearestSegmentIndex(points, target_point);
+  return nero_mu::findNearestSegmentIndex(points, target_point);
 }
 
 template <class T>
@@ -140,7 +141,7 @@ size_t findNearestSegmentIndexFromLateralDistance(
     if (yaw_threshold < std::abs(yaw)) {
       continue;
     }
-    const double lon_dist = autoware::motion_utils::calcLongitudinalOffsetToSegment(
+    const double lon_dist = nero_mu::calcLongitudinalOffsetToSegment(
       points, seg_idx, target_point.position);
     const double segment_length = calc_distance2d(points.at(seg_idx), points.at(seg_idx + 1));
     const double lat_dist = [&]() {
@@ -151,7 +152,7 @@ size_t findNearestSegmentIndexFromLateralDistance(
         return calc_distance2d(points.at(seg_idx + 1), target_point.position);
       }
       return std::abs(
-        autoware::motion_utils::calcLateralOffset(points, target_point.position, seg_idx));
+        nero_mu::calcLateralOffset(points, target_point.position, seg_idx));
     }();
     if (lat_dist < min_lateral_dist) {
       closest_idx = seg_idx;
@@ -163,7 +164,7 @@ size_t findNearestSegmentIndexFromLateralDistance(
     return *closest_idx;
   }
 
-  return autoware::motion_utils::findNearestSegmentIndex(points, target_point.position);
+  return nero_mu::findNearestSegmentIndex(points, target_point.position);
 }
 
 bool checkHasSameLane(
@@ -185,9 +186,9 @@ geometry_msgs::msg::Point calcLongitudinalOffsetStartPoint(
   const std::vector<geometry_msgs::msg::Point> & points, const geometry_msgs::msg::Pose & pose,
   const size_t nearest_segment_idx, const double offset)
 {
-  const double offset_length = autoware::motion_utils::calcLongitudinalOffsetToSegment(
+  const double offset_length = nero_mu::calcLongitudinalOffsetToSegment(
     points, nearest_segment_idx, pose.position);
-  const auto offset_point = autoware::motion_utils::calcLongitudinalOffsetPoint(
+  const auto offset_point = nero_mu::calcLongitudinalOffsetPoint(
     points, nearest_segment_idx, offset_length + offset);
 
   return offset_point ? offset_point.value() : points.at(nearest_segment_idx);
@@ -197,9 +198,9 @@ geometry_msgs::msg::Point calcLongitudinalOffsetGoalPoint(
   const std::vector<geometry_msgs::msg::Point> & points, const geometry_msgs::msg::Pose & pose,
   const size_t nearest_segment_idx, const double offset)
 {
-  const double offset_length = autoware::motion_utils::calcLongitudinalOffsetToSegment(
+  const double offset_length = nero_mu::calcLongitudinalOffsetToSegment(
     points, nearest_segment_idx, pose.position);
-  const auto offset_point = autoware::motion_utils::calcLongitudinalOffsetPoint(
+  const auto offset_point = nero_mu::calcLongitudinalOffsetPoint(
     points, nearest_segment_idx, offset_length + offset);
 
   return offset_point ? offset_point.value() : points.at(nearest_segment_idx + 1);
@@ -301,10 +302,10 @@ PolygonPoint transformBoundFrenetCoordinate(
   const size_t min_dist_seg_idx = std::distance(
     dist_to_bound_segment_vec.begin(),
     std::min_element(dist_to_bound_segment_vec.begin(), dist_to_bound_segment_vec.end()));
-  const double lon_dist_to_segment = autoware::motion_utils::calcLongitudinalOffsetToSegment(
+  const double lon_dist_to_segment = nero_mu::calcLongitudinalOffsetToSegment(
     bound_points, min_dist_seg_idx, target_point);
   const double lat_dist_to_segment =
-    autoware::motion_utils::calcLateralOffset(bound_points, target_point, min_dist_seg_idx);
+    nero_mu::calcLateralOffset(bound_points, target_point, min_dist_seg_idx);
   return PolygonPoint{target_point, min_dist_seg_idx, lon_dist_to_segment, lat_dist_to_segment};
 }
 
@@ -350,7 +351,7 @@ std::vector<PolygonPoint> generatePolygonInsideBounds(
     if (!intersection) {
       continue;
     }
-    const double lon_dist = autoware::motion_utils::calcLongitudinalOffsetToSegment(
+    const double lon_dist = nero_mu::calcLongitudinalOffsetToSegment(
       bound, intersection->first, intersection->second);
     const auto intersect_point =
       PolygonPoint{intersection->second, intersection->first, lon_dist, 0.0};
@@ -575,7 +576,7 @@ std::vector<PolygonPoint> getPolygonPointsInsideBounds(
   // add start and end points projected to bound if necessary
   if (inside_polygon.at(start_idx).lat_dist_to_bound != 0.0) {  // not on bound
     auto start_point = inside_polygon.at(start_idx);
-    const auto start_point_on_bound = autoware::motion_utils::calcLongitudinalOffsetPoint(
+    const auto start_point_on_bound = nero_mu::calcLongitudinalOffsetPoint(
       bound, start_point.bound_seg_idx, start_point.lon_dist_to_segment);
     if (start_point_on_bound) {
       start_point.point = start_point_on_bound.value();
@@ -584,7 +585,7 @@ std::vector<PolygonPoint> getPolygonPointsInsideBounds(
   }
   if (inside_polygon.at(end_idx).lat_dist_to_bound != 0.0) {  // not on bound
     auto end_point = inside_polygon.at(end_idx);
-    const auto end_point_on_bound = autoware::motion_utils::calcLongitudinalOffsetPoint(
+    const auto end_point_on_bound = nero_mu::calcLongitudinalOffsetPoint(
       bound, end_point.bound_seg_idx, end_point.lon_dist_to_segment);
     if (end_point_on_bound) {
       end_point.point = end_point_on_bound.value();
@@ -612,7 +613,7 @@ std::vector<Point> updateBoundary(
     const auto & start_poly = polygon.front();
     const auto & end_poly = polygon.back();
 
-    const double front_offset = autoware::motion_utils::calcLongitudinalOffsetToSegment(
+    const double front_offset = nero_mu::calcLongitudinalOffsetToSegment(
       updated_bound, start_poly.bound_seg_idx, start_poly.point);
 
     const size_t removed_start_idx =
@@ -853,7 +854,7 @@ void generateDrivableArea(
       const auto & prev_point = resampled_path.points.back().point.pose.position;
       const auto & curr_point = path.points.at(i).point.pose.position;
       const double signed_arc_length =
-        autoware::motion_utils::calcSignedArcLength(path.points, prev_point, curr_point);
+        nero_mu::calcSignedArcLength(path.points, prev_point, curr_point);
       if (signed_arc_length > resample_interval) {
         resampled_path.points.push_back(path.points.at(i));
       }
