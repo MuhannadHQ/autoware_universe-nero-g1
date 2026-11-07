@@ -614,6 +614,23 @@ private:
   };
   std::map<std::string, UnknownSpeedHistory> unknown_speed_history_;
 
+  //! NERO_IX_ADJACENT_OWN (2026-11-07, IXOVT): where each vehicle seen by this module came from, uuidKey() ->
+  //! {first seen, last seen, last time on an attention lanelet off ego's own lanelets, last time on ego's own lanelets
+  //! off the attention lanelets} (objects stamps [s]); set by updateObjectInfoManagerArea
+  struct NeroAdjOrigin
+  {
+    double first{0.0};
+    double last{0.0};
+    double att_only{-1e9};
+    double ego_only{-1e9};
+    double both_first{-1e9};  //!< first time on ego's own lanelet AND an attention lanelet
+  };
+  std::map<std::string, NeroAdjOrigin> nero_adj_origin_;
+  //! NERO_IX_ADJACENT_OWN: objects on ego's own lanelet AND an attention lanelet that came along ego's own lane, this
+  //! cycle (uuidKey()): their predicted paths that stay in ego's lane and leave it through ego's exit are not crossing
+  //! conflicts (read by the collision check)
+  std::set<std::string> nero_adj_own_;
+
   //! Nero c3 (wrong_way_watch): uuidKey() of attention objects that drive against ego's exit lane
   //! (or, once flagged, against the assigned lanelet). Rebuilt every cycle.
   std::set<std::string> wrong_way_ego_lane_object_uuids_;

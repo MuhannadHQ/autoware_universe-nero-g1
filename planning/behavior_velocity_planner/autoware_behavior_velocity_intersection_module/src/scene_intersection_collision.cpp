@@ -41,6 +41,7 @@
 #include <boost/geometry/algorithms/convex_hull.hpp>  // NERO_IX_PRIORITY_NO_EXIT
 
 #include <fmt/format.h>
+#include <lanelet2_core/geometry/Lanelet.h>  // NERO_IX_ADJACENT_OWN: inside(lanelet, point)
 #include <lanelet2_core/geometry/Polygon.h>
 #include <tf2/utils.h>
 #include <lanelet2_routing/RoutingGraph.h>  // Nero c3: following() of the assigned lanelet
@@ -377,6 +378,41 @@ bool nero_adjacent_fix()
   static const bool on = [] {
     const char * v = std::getenv("NERO_IX_ADJACENT_FIX");
     return v != nullptr && std::string(v) == "1";
+  }();
+  return on;
+}
+
+// NERO_IX_ADJACENT_OWN=<young s>[,<debug 0|1>] (2026-11-07, IXOVT; with NERO_IX_ADJACENT_FIX=1). The adjacent fix keeps
+// an object on ego's own lanelet whenever it also lies on an attention lanelet (with a matching heading, margin
+// attention_area_margin). Where an attention lanelet merges into ego's exit (11-03 #101: the minor road's right turn
+// 64108 into 43690 at the end of 63929) that also keeps a car driving along ego's own lane ahead of ego (a car that
+// overtook ego and cut in), and its paths straight on along ego's lane read as a collision with ego's own lane
+// (UNSAFE 0.0-1.0 s -> CollisionStop at -3.4 m/s2 from 13 km/h for a car already going away). With this switch such
+// an object is flagged "came along ego's lane" when this module saw it on ego's own lanelet without an attention
+// lanelet more recently than on an attention lanelet without ego's own lanelet, or never on an attention lanelet
+// without ego's lanelet although it had seen it for >= <young s> before it reached the overlap. For a flagged object, a
+// predicted path that stays in ego's lane along it (every point inside ego's lane polygon heading within
+// attention_area_angle_threshold of the lane) and leaves it into a lanelet that follows ego's assigned lanelet (heading
+// along it) or ends inside it is not a crossing conflict (upstream never checks such an object: adjacent). Every other
+// path of it (a turn across ego's lane) is checked exactly as before, and a car that came from the attention lanelet (a
+// real merger) or that is too new to tell is checked exactly as before. Log `[NERO_IX] adjacent own:` once per object
+// and cycle in which it leaves paths out (no such line = the car's decision). Unset / 0 = the car.
+double nero_adjacent_own()
+{
+  static const double v = [] {
+    const char * e = std::getenv("NERO_IX_ADJACENT_OWN");
+    return e != nullptr ? std::max(0.0, std::atof(e)) : 0.0;
+  }();
+  return v;
+}
+bool nero_adjacent_own_debug()
+{
+  static const bool on = [] {
+    const char * e = std::getenv("NERO_IX_ADJACENT_OWN");
+    if (e == nullptr) return false;
+    const std::string s(e);
+    const auto c = s.find(',');
+    return c != std::string::npos && std::atoi(s.substr(c + 1).c_str()) == 1;
   }();
   return on;
 }
@@ -2055,6 +2091,14 @@ void IntersectionModule::updateObjectInfoManagerArea()
   }
   const double nero_half_width = planner_data_->vehicle_info_.vehicle_width_m / 2.0;
 
+  // NERO_IX_ADJACENT_OWN: per-cycle flags; forget objects not seen for 2 s
+  const bool nero_adj_own_on = nero_adjacent_own() > 0.0 && nero_adjacent_fix();
+  const double nero_adj_t = rclcpp::Time(planner_data_->predicted_objects->header.stamp).seconds();
+  nero_adj_own_.clear();
+  for (auto it = nero_adj_origin_.begin(); it != nero_adj_origin_.end();) {
+    it = (it->second.last < nero_adj_t - 2.0) ? nero_adj_origin_.erase(it) : std::next(it);
+  }
+
   for (const auto & predicted_object : planner_data_->predicted_objects->objects) {
     if (!isTargetCollisionVehicleType(predicted_object)) {
       continue;
@@ -2101,6 +2145,39 @@ void IntersectionModule::updateObjectInfoManagerArea()
       checkAngleForTargetLanelets(object_direction, attention_lanelets, is_parked_vehicle);
     const auto belong_adjacent_lanelet_id =
       checkAngleForTargetLanelets(object_direction, adjacent_lanelets, false);
+    if (nero_adj_own_on) {  // NERO_IX_ADJACENT_OWN: where it came from
+      const auto key = uuidKey(predicted_object.object_id);
+      auto & org = nero_adj_origin_[key];
+      if (org.first <= 0.0) org.first = nero_adj_t;
+      org.last = nero_adj_t;
+      const bool on_att = belong_attention_lanelet_id.has_value();
+      const bool on_adj = belong_adjacent_lanelet_id.has_value();
+      if (on_att && !on_adj) org.att_only = nero_adj_t;
+      if (on_adj && !on_att) org.ego_only = nero_adj_t;
+      if (on_att && on_adj && !is_wrong_way_on_ego_lane) {
+        if (org.both_first < -1e8) org.both_first = nero_adj_t;
+        // came along ego's lane: on ego's own lanelet alone more recently than on an attention lanelet alone, or seen for
+        // >= <young s> BEFORE it reached the overlap and never on an attention lanelet alone (a car first seen inside the
+        // overlap, e.g. a merger published late, stays checked as the car)
+        const bool from_ego_lane = org.ego_only > org.att_only;
+        const bool never_on_att = org.att_only < -1e8 && org.both_first - org.first >= nero_adjacent_own();
+        if (from_ego_lane || never_on_att) nero_adj_own_.insert(key);
+        if (nero_adjacent_own_debug()) {
+          const auto & p = predicted_object.kinematics.initial_pose_with_covariance.pose.position;
+          RCLCPP_INFO(
+            logger_,
+            "[NERO_IX] adjacent own dbg: lane %ld obj %02x%02x at (%.1f, %.1f) on attention %ld + own %ld: own lane "
+            "alone %s, attention alone %s, seen %.1f s -> %s",
+            lane_id_, predicted_object.object_id.uuid[0], predicted_object.object_id.uuid[1], p.x, p.y,
+            attention_lanelets.at(belong_attention_lanelet_id.value()).id(),
+            adjacent_lanelets.at(belong_adjacent_lanelet_id.value()).id(),
+            org.ego_only > -1e8 ? fmt::format("{:.1f} s ago", nero_adj_t - org.ego_only).c_str() : "never",
+            org.att_only > -1e8 ? fmt::format("{:.1f} s ago", nero_adj_t - org.att_only).c_str() : "never",
+            nero_adj_t - org.first,
+            (from_ego_lane || never_on_att) ? "came along ego's lane" : "checked as the car");
+        }
+      }
+    }
     if (
       belong_adjacent_lanelet_id && !is_wrong_way_on_ego_lane &&
       !(nero_adjacent_fix() && belong_attention_lanelet_id)) {
@@ -2521,6 +2598,16 @@ void IntersectionModule::updateObjectInfoManagerCollision(
     }
   }
 
+  // NERO_IX_ADJACENT_OWN: the map lanelets that follow ego's assigned lanelet (where a car along ego's lane leaves it)
+  lanelet::ConstLanelets nero_ego_nexts{};
+  if (!nero_adj_own_.empty()) {
+    const auto lanelet_map_ptr = planner_data_->route_handler_->getLaneletMapPtr();
+    for (const auto & ll : planner_data_->route_handler_->getRoutingGraphPtr()->following(
+           lanelet_map_ptr->laneletLayer.get(lane_id_))) {
+      nero_ego_nexts.push_back(ll);
+    }
+  }
+
   for (auto & object_info : object_info_manager_.attentionObjects()) {
     const auto & predicted_object = object_info->predicted_object();
     // Nero c3 (wrong_way_watch)
@@ -2679,6 +2766,49 @@ void IntersectionModule::updateObjectInfoManagerCollision(
     std::optional<CollisionInterval> unsafe_interval{std::nullopt};
     std::optional<CollisionInterval> safe_interval{std::nullopt};
     std::optional<std::vector<double>> object_debug_info{std::nullopt};
+    // NERO_IX_ADJACENT_OWN: flagged in updateObjectInfoManagerArea (on ego's own lanelet + an attention lanelet, came
+    // along ego's own lane); a path is "along ego's lane" if inside ego's lane polygon it heads along the lane and it
+    // leaves the polygon into ego's next lanelet (or ends inside it)
+    const bool nero_adj_own =
+      !is_wrong_way_on_ego_lane && nero_adj_own_.count(uuidKey(predicted_object.object_id)) > 0;
+    int nero_adj_skipped = 0;
+    double nero_adj_skip_conf = 0.0;
+    std::pair<double, double> nero_adj_skip_in{0.0, 0.0};
+    const auto nero_along_ego_lane = [&](const CollisionInterval & iv) {
+      const double thr = planner_param_.common.attention_area_angle_threshold;
+      const auto [b, e] = iv.interval_position;
+      double dmax = 0.0;
+      bool along = true;
+      for (size_t i = b; i <= e && i < iv.path.size(); ++i) {
+        const auto & q = iv.path.at(i);
+        const double lane_yaw = lanelet::utils::getLaneletAngle(ego_lane, q.position);
+        dmax = std::max(dmax, std::fabs(autoware_utils::normalize_radian(tf2::getYaw(q.orientation) - lane_yaw)));
+        if (dmax >= thr) along = false;
+      }
+      bool out_ok = along && e + 1 >= iv.path.size();  // the path ends inside ego's lane
+      lanelet::Id out_ll = -1;
+      if (along && !out_ok) {
+        // it leaves ego's path strip into a MAP lanelet that follows ego's assigned lanelet, heading along it
+        // (path_lanelets.next is a strip of ego's own width along ego's path, not the lane)
+        const auto & q = iv.path.at(e + 1);
+        for (const auto & ll : nero_ego_nexts) {
+          if (!lanelet::geometry::inside(ll, lanelet::BasicPoint2d(q.position.x, q.position.y))) continue;
+          const double ll_yaw = lanelet::utils::getLaneletAngle(ll, q.position);
+          if (std::fabs(autoware_utils::normalize_radian(tf2::getYaw(q.orientation) - ll_yaw)) < thr) {
+            out_ok = true;
+            out_ll = ll.id();
+            break;
+          }
+        }
+      }
+      if (nero_adjacent_own_debug()) {
+        const auto & q = iv.path.at(std::min(e + 1, iv.path.size() - 1)).position;
+        RCLCPP_INFO(
+          logger_, "[NERO_IX] adjacent own path dbg: lane %ld in ego lane %zu-%zu of %zu, max dyaw %.1f deg, out (%.1f, %.1f) into %ld -> %s",
+          lane_id_, b, e, iv.path.size(), dmax * 180.0 / M_PI, q.x, q.y, out_ll, out_ok ? "along" : "not along");
+      }
+      return out_ok;
+    };
 
     for (const auto & predicted_path_ptr : sorted_predicted_paths) {
       auto predicted_path = *predicted_path_ptr;
@@ -2749,6 +2879,19 @@ void IntersectionModule::updateObjectInfoManagerCollision(
       const auto object_enter_exit_time = object_passage_interval.interval_time;
       const auto object_enter_time = std::get<0>(object_enter_exit_time);
       const auto object_exit_time = std::get<1>(object_enter_exit_time);
+      if (
+        nero_adj_own && predicted_path_ptr >= predicted_object.kinematics.predicted_paths.data() &&
+        predicted_path_ptr <
+          predicted_object.kinematics.predicted_paths.data() + predicted_object.kinematics.predicted_paths.size() &&
+        nero_along_ego_lane(object_passage_interval)) {
+        // NERO_IX_ADJACENT_OWN: a car that came along ego's own lane and stays in it through ego's exit: not a
+        // crossing conflict (upstream never checks a car on ego's own lanelet); logged once per object below
+        if (nero_adj_skipped++ == 0) {
+          nero_adj_skip_conf = predicted_path.confidence;
+          nero_adj_skip_in = {object_enter_time, object_exit_time};
+        }
+        continue;
+      }
       bool nero_force_unsafe = false;
       if (nero_merge.on && object_enter_time > passing_time) {
         // reaches ego's turn lanelet only after ego has left it
@@ -2872,6 +3015,28 @@ void IntersectionModule::updateObjectInfoManagerCollision(
         safe_interval = object_passage_interval;
         object_debug_info = get_object_info();
       }
+    }
+    if (nero_adj_skipped > 0) {  // NERO_IX_ADJACENT_OWN: one line per object and cycle that had paths left out
+      const auto & pos = predicted_object.kinematics.initial_pose_with_covariance.pose.position;
+      const auto org_it = nero_adj_origin_.find(uuidKey(predicted_object.object_id));
+      const double t_obj = rclcpp::Time(planner_data_->predicted_objects->header.stamp).seconds();
+      RCLCPP_INFO(
+        logger_,
+        "[NERO_IX] adjacent own: lane %ld obj %02x%02x at (%.1f, %.1f) v %.2f came along ego's lane (own lane alone %s, "
+        "attention alone %s): %d path(s) staying in ego's lane through its exit (conf %.2f, in it %.1f-%.1f s) are no "
+        "crossing conflict -> %s",
+        lane_id_, predicted_object.object_id.uuid[0], predicted_object.object_id.uuid[1], pos.x, pos.y,
+        std::hypot(
+          predicted_object.kinematics.initial_twist_with_covariance.twist.linear.x,
+          predicted_object.kinematics.initial_twist_with_covariance.twist.linear.y),
+        (org_it != nero_adj_origin_.end() && org_it->second.ego_only > -1e8)
+          ? fmt::format("{:.1f} s ago", t_obj - org_it->second.ego_only).c_str()
+          : "never",
+        (org_it != nero_adj_origin_.end() && org_it->second.att_only > -1e8)
+          ? fmt::format("{:.1f} s ago", t_obj - org_it->second.att_only).c_str()
+          : "never",
+        nero_adj_skipped, nero_adj_skip_conf, nero_adj_skip_in.first, nero_adj_skip_in.second,
+        unsafe_interval ? "another path UNSAFE" : "safe");
     }
     object_info->update_safety(unsafe_interval, safe_interval, safe_under_traffic_control);
     if (nero_pullaway_t >= 0.0) {
