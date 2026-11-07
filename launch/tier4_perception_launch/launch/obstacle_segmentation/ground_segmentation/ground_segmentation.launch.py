@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import os
+import struct
 
 import launch
 from launch.actions import DeclareLaunchArgument
@@ -26,6 +27,32 @@ from launch_ros.descriptions import ComposableNode
 from launch_ros.parameter_descriptions import ParameterFile
 from launch_ros.substitutions import FindPackageShare
 import yaml
+
+
+def nero_ground_level_valid(v):
+    """[nero 2026-11-05 jolt] the same test as the ground filter node (nero_ground_level.hpp GroundLevel::parse): "1" or
+    "<ceiling 0.1..5 m>[,<max tilt 0.5..20 deg>]", numbers as plain decimals (digits and at most one '.'); anything else = off in
+    both places (autoware_ground_segmentation test/data/nero_ground_level_switch.txt holds the cases both sides are tested on)."""
+    if v is None:
+        return False
+    if v == "1":
+        return True
+
+    def plain(t):
+        return all(c in "0123456789." for c in t) and t.count(".") <= 1 and any(c.isdigit() for c in t)
+
+    def f32(x):  # the node compares in float (strtof)
+        return struct.unpack("f", struct.pack("f", float(x)))[0]
+
+    parts = v.split(",", 1)
+    if not all(plain(t) for t in parts):
+        return False
+    try:
+        c = f32(parts[0])
+        t = f32(parts[1]) if len(parts) == 2 else f32(8.0)
+    except OverflowError:  # beyond float range: strtof gives inf there, out of bounds
+        return False
+    return f32(0.1) < c < f32(5.0) and f32(0.5) < t < f32(20.0)
 
 
 class GroundSegmentationPipeline:
@@ -243,6 +270,15 @@ class GroundSegmentationPipeline:
             self.vehicle_info["min_height_offset"]
             + self.ground_segmentation_param["common_crop_box_filter"]["parameters"]["margin_min_z"]
         )
+        # [nero 2026-11-05 jolt] NERO_GROUND_LEVEL (QUEUE PTH): the ground filter cuts the band's ceiling in each cloud's road frame,
+        # so the crop box before it must pass points up to the ceiling over a tilted road: max(max_z, ceiling) + 1.5 m (the node cuts
+        # the rest).
+        # Unset / invalid: the crop as is (the node prints its own on / off line).
+        sw = os.environ.get("NERO_GROUND_LEVEL")
+        if nero_ground_level_valid(sw):
+            ceiling = max_z if sw == "1" else float(sw.split(",")[0])
+            max_z = max(max_z, ceiling) + 1.5
+            print("[NERO_GROUND_LEVEL] common crop box max_z %.2f (the road-frame ceiling %.2f + 1.5)" % (max_z, ceiling))
         # Get the plugin name from the full plugin path
         ground_segmentation_plugin_name = self.ground_segmentation_param["common_ground_filter"][
             "plugin"

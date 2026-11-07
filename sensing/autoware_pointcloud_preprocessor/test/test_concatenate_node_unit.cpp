@@ -26,6 +26,8 @@
 #include <sensor_msgs/point_cloud2_iterator.hpp>
 
 #include <gtest/gtest.h>
+
+#include <sensor_msgs/msg/imu.hpp>
 #include <tf2_ros/static_transform_broadcaster.h>
 
 #include <algorithm>
@@ -531,6 +533,182 @@ TEST_F(ConcatenateCloudTest, TestProcessMultipleCloud)
   EXPECT_EQ(
     concatenate_node_->get_cloud_collectors().front()->get_status(),
     autoware::pointcloud_preprocessor::CollectorStatus::Idle);
+}
+
+//////////////////////////////// [nero 2026-11-05 jolt] NERO_LIDAR_MOTION_3D ////////////////////////////////
+namespace
+{
+// twist (speed v, yaw rate wz) and IMU (base_link rates) samples every 10 ms over [t0, t1]
+void nero_feed(
+  autoware::pointcloud_preprocessor::CombineCloudHandler & h, double t0, double t1, double v, double wx,
+  double wy, double wz)
+{
+  for (double t = t0; t <= t1 + 1e-9; t += 0.01) {
+    const rclcpp::Time stamp(static_cast<int64_t>(std::llround(t * 1e9)), RCL_ROS_TIME);
+    auto tw = std::make_shared<geometry_msgs::msg::TwistWithCovarianceStamped>();
+    tw->header.stamp = stamp;
+    tw->twist.twist.linear.x = v;
+    tw->twist.twist.angular.z = wz;
+    h.process_twist(tw);
+    auto imu = std::make_shared<sensor_msgs::msg::Imu>();
+    imu->header.stamp = stamp;
+    imu->header.frame_id = "base_link";
+    imu->angular_velocity.x = wx;
+    imu->angular_velocity.y = wy;
+    imu->angular_velocity.z = wz;
+    h.nero_process_imu(imu);
+  }
+}
+
+std::vector<Eigen::Vector3f> points_of(const sensor_msgs::msg::PointCloud2 & c)
+{
+  std::vector<Eigen::Vector3f> out;
+  sensor_msgs::PointCloud2ConstIterator<float> x(c, "x"), y(c, "y"), z(c, "z");
+  for (; x != x.end(); ++x, ++y, ++z) out.emplace_back(*x, *y, *z);
+  return out;
+}
+
+// every expected point has a concatenated point within tol
+bool contains_all(
+  const std::vector<Eigen::Vector3f> & got, const std::vector<Eigen::Vector3f> & expected, float tol)
+{
+  for (const auto & e : expected) {
+    bool found = false;
+    for (const auto & g : got) found = found || (g - e).norm() < tol;
+    if (!found) return false;
+  }
+  return true;
+}
+
+// the three test points of a cloud whose body frame is pitched by angle a (about y) relative to the oldest stamp
+std::vector<Eigen::Vector3f> pitched(double a)
+{
+  const Eigen::Matrix3f r = Eigen::AngleAxisf(static_cast<float>(a), Eigen::Vector3f::UnitY()).toRotationMatrix();
+  return {r * Eigen::Vector3f(10, 0, 0), r * Eigen::Vector3f(0, 10, 0), r * Eigen::Vector3f(0, 0, 10)};
+}
+}  // namespace
+
+TEST_F(ConcatenateCloudTest, TestNeroImu3dPitchBetweenScans)
+{
+  // the body pitches at 1 rad/s, standing: the scan 40 ms (80 ms) after the oldest is rotated by 0.04 (0.08) rad about y
+  combine_cloud_handler_->nero_enable_imu_3d();
+  nero_feed(*combine_cloud_handler_, 10.0, 10.4, 0.0, 0.0, 1.0, 0.0);
+  std::unordered_map<std::string, sensor_msgs::msg::PointCloud2::SharedPtr> clouds;
+  clouds["lidar_top"] = std::make_shared<sensor_msgs::msg::PointCloud2>(generate_pointcloud_msg(
+    true, false, "lidar_top", rclcpp::Time(timestamp_seconds, timestamp_nanoseconds, RCL_ROS_TIME)));
+  clouds["lidar_left"] = std::make_shared<sensor_msgs::msg::PointCloud2>(generate_pointcloud_msg(
+    true, false, "lidar_left",
+    rclcpp::Time(timestamp_seconds, timestamp_nanoseconds + 40'000'000, RCL_ROS_TIME)));
+  clouds["lidar_right"] = std::make_shared<sensor_msgs::msg::PointCloud2>(generate_pointcloud_msg(
+    true, false, "lidar_right",
+    rclcpp::Time(timestamp_seconds, timestamp_nanoseconds + 80'000'000, RCL_ROS_TIME)));
+  const auto res = combine_cloud_handler_->combine_pointclouds(clouds);
+  const auto got = points_of(*res.concatenate_cloud_ptr);
+  ASSERT_EQ(got.size(), 9u);
+  EXPECT_TRUE(contains_all(got, pitched(0.0), 1e-3));
+  EXPECT_TRUE(contains_all(got, pitched(0.04), 2e-3));
+  EXPECT_TRUE(contains_all(got, pitched(0.08), 2e-3));
+}
+
+TEST_F(ConcatenateCloudTest, TestNeroImu3dReferenceIsTheFirstPoint)
+{
+  // the distortion corrector expresses a scan at its FIRST point's time: a first point 27 ms after the stamp adds 27 ms
+  combine_cloud_handler_->nero_enable_imu_3d();
+  nero_feed(*combine_cloud_handler_, 10.0, 10.4, 0.0, 0.0, 1.0, 0.0);
+  auto top = generate_pointcloud_msg(
+    true, false, "lidar_top", rclcpp::Time(timestamp_seconds, timestamp_nanoseconds, RCL_ROS_TIME));
+  auto left = generate_pointcloud_msg(
+    true, false, "lidar_left",
+    rclcpp::Time(timestamp_seconds, timestamp_nanoseconds + 40'000'000, RCL_ROS_TIME));
+  sensor_msgs::PointCloud2Iterator<std::uint32_t> t(left, "time_stamp");
+  *t = 27'000'000;
+  std::unordered_map<std::string, sensor_msgs::msg::PointCloud2::SharedPtr> clouds;
+  clouds["lidar_top"] = std::make_shared<sensor_msgs::msg::PointCloud2>(top);
+  clouds["lidar_left"] = std::make_shared<sensor_msgs::msg::PointCloud2>(left);
+  const auto got = points_of(*combine_cloud_handler_->combine_pointclouds(clouds).concatenate_cloud_ptr);
+  EXPECT_TRUE(contains_all(got, pitched(0.067), 2e-3));
+  EXPECT_FALSE(contains_all(got, pitched(0.04), 2e-3));
+}
+
+TEST_F(ConcatenateCloudTest, TestNeroImu3dHeaderReferenceTopic)
+{
+  // [jolt-6] an input listed in nero_imu_3d_header_reference_topics is taken at its header stamp even if its first point's
+  // time_stamp is later (the front E1R: 13.3 ms); the other inputs keep stamp + first point
+  combine_cloud_handler_->nero_enable_imu_3d();
+  combine_cloud_handler_->nero_set_header_reference_topics({"lidar_left"});
+  nero_feed(*combine_cloud_handler_, 10.0, 10.4, 0.0, 0.0, 1.0, 0.0);
+  auto top = generate_pointcloud_msg(
+    true, false, "lidar_top", rclcpp::Time(timestamp_seconds, timestamp_nanoseconds, RCL_ROS_TIME));
+  auto left = generate_pointcloud_msg(
+    true, false, "lidar_left",
+    rclcpp::Time(timestamp_seconds, timestamp_nanoseconds + 40'000'000, RCL_ROS_TIME));
+  auto right = generate_pointcloud_msg(
+    true, false, "lidar_right",
+    rclcpp::Time(timestamp_seconds, timestamp_nanoseconds + 40'000'000, RCL_ROS_TIME));
+  sensor_msgs::PointCloud2Iterator<std::uint32_t> tl(left, "time_stamp");
+  *tl = 13'300'000;
+  sensor_msgs::PointCloud2Iterator<std::uint32_t> tr(right, "time_stamp");
+  *tr = 27'000'000;
+  std::unordered_map<std::string, sensor_msgs::msg::PointCloud2::SharedPtr> clouds;
+  clouds["lidar_top"] = std::make_shared<sensor_msgs::msg::PointCloud2>(top);
+  clouds["lidar_left"] = std::make_shared<sensor_msgs::msg::PointCloud2>(left);
+  clouds["lidar_right"] = std::make_shared<sensor_msgs::msg::PointCloud2>(right);
+  const auto got = points_of(*combine_cloud_handler_->combine_pointclouds(clouds).concatenate_cloud_ptr);
+  ASSERT_EQ(got.size(), 9u);
+  EXPECT_TRUE(contains_all(got, pitched(0.04), 2e-3));    // left at its stamp (40 ms), not 53.3 ms
+  EXPECT_FALSE(contains_all(got, pitched(0.0533), 2e-3));
+  EXPECT_TRUE(contains_all(got, pitched(0.067), 2e-3));   // right at stamp + first point (67 ms)
+}
+
+TEST_F(ConcatenateCloudTest, TestNeroImu3dSpeedAlongThePitchedBody)
+{
+  // 5 m/s along the body's own x while pitching 1 rad/s: after 40 ms the body moved ~0.2 m, along its rotating x axis
+  combine_cloud_handler_->nero_enable_imu_3d();
+  nero_feed(*combine_cloud_handler_, 10.0, 10.4, 5.0, 0.0, 1.0, 0.0);
+  std::unordered_map<std::string, sensor_msgs::msg::PointCloud2::SharedPtr> clouds;
+  clouds["lidar_top"] = std::make_shared<sensor_msgs::msg::PointCloud2>(generate_pointcloud_msg(
+    true, false, "lidar_top", rclcpp::Time(timestamp_seconds, timestamp_nanoseconds, RCL_ROS_TIME)));
+  clouds["lidar_left"] = std::make_shared<sensor_msgs::msg::PointCloud2>(generate_pointcloud_msg(
+    true, false, "lidar_left",
+    rclcpp::Time(timestamp_seconds, timestamp_nanoseconds + 40'000'000, RCL_ROS_TIME)));
+  const auto got = points_of(*combine_cloud_handler_->combine_pointclouds(clouds).concatenate_cloud_ptr);
+  // integral of 5 * (cos(t), 0, -sin(t)) dt over 0.04 s
+  const Eigen::Vector3f shift(5.0f * std::sin(0.04f), 0.0f, -5.0f * (1.0f - std::cos(0.04f)));
+  auto expected = pitched(0.04);
+  for (auto & e : expected) e += shift;
+  EXPECT_TRUE(contains_all(got, expected, 3e-3));
+}
+
+TEST_F(ConcatenateCloudTest, TestNeroImu3dNoImuFallsBackTo2D)
+{
+  // switch on but no IMU sample: the upstream 2D compensation (here nothing moves: no twist either)
+  combine_cloud_handler_->nero_enable_imu_3d();
+  std::unordered_map<std::string, sensor_msgs::msg::PointCloud2::SharedPtr> clouds;
+  clouds["lidar_top"] = std::make_shared<sensor_msgs::msg::PointCloud2>(generate_pointcloud_msg(
+    true, false, "lidar_top", rclcpp::Time(timestamp_seconds, timestamp_nanoseconds, RCL_ROS_TIME)));
+  clouds["lidar_left"] = std::make_shared<sensor_msgs::msg::PointCloud2>(generate_pointcloud_msg(
+    true, false, "lidar_left",
+    rclcpp::Time(timestamp_seconds, timestamp_nanoseconds + 40'000'000, RCL_ROS_TIME)));
+  const auto got = points_of(*combine_cloud_handler_->combine_pointclouds(clouds).concatenate_cloud_ptr);
+  ASSERT_EQ(got.size(), 6u);
+  for (const auto & g : got) {
+    EXPECT_TRUE(contains_all({g}, pitched(0.0), 1e-4) || contains_all(pitched(0.0), {g}, 1e-4));
+  }
+}
+
+TEST_F(ConcatenateCloudTest, TestNeroImu3dOffIgnoresTheImu)
+{
+  // switch off (upstream): IMU samples are ignored even if fed; the pitch is not compensated
+  nero_feed(*combine_cloud_handler_, 10.0, 10.4, 0.0, 0.0, 1.0, 0.0);
+  std::unordered_map<std::string, sensor_msgs::msg::PointCloud2::SharedPtr> clouds;
+  clouds["lidar_top"] = std::make_shared<sensor_msgs::msg::PointCloud2>(generate_pointcloud_msg(
+    true, false, "lidar_top", rclcpp::Time(timestamp_seconds, timestamp_nanoseconds, RCL_ROS_TIME)));
+  clouds["lidar_left"] = std::make_shared<sensor_msgs::msg::PointCloud2>(generate_pointcloud_msg(
+    true, false, "lidar_left",
+    rclcpp::Time(timestamp_seconds, timestamp_nanoseconds + 40'000'000, RCL_ROS_TIME)));
+  const auto got = points_of(*combine_cloud_handler_->combine_pointclouds(clouds).concatenate_cloud_ptr);
+  EXPECT_FALSE(contains_all(got, pitched(0.04), 2e-3));
+  EXPECT_TRUE(contains_all(got, pitched(0.0), 1e-4));
 }
 
 int main(int argc, char ** argv)

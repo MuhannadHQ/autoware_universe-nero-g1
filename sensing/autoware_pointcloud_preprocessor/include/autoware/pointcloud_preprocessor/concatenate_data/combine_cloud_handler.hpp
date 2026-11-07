@@ -19,6 +19,7 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 // ROS includes
@@ -30,6 +31,8 @@
 
 #include <diagnostic_msgs/msg/diagnostic_status.hpp>
 #include <geometry_msgs/msg/twist_stamped.hpp>
+#include <geometry_msgs/msg/vector3_stamped.hpp>
+#include <sensor_msgs/msg/imu.hpp>
 #include <geometry_msgs/msg/twist_with_covariance_stamped.hpp>
 #include <nav_msgs/msg/odometry.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
@@ -67,6 +70,21 @@ private:
 
   std::deque<geometry_msgs::msg::TwistStamped> twist_queue_;
 
+  // [nero 2026-11-05 jolt] NERO_LIDAR_MOTION_3D: bring each cloud from its own reference time (header stamp + its first
+  // point's time_stamp: the distortion corrector's reference) to the oldest stamp in 3D, with the IMU's angular velocity
+  // (roll / pitch / yaw rate) and the twist's speed, instead of speed + yaw rate between header stamps. Off = upstream.
+  bool nero_imu_3d_{false};
+  std::deque<geometry_msgs::msg::Vector3Stamped> nero_imu_queue_;  // angular velocity in the output frame
+  bool nero_imu_rotation_exists_{false};
+  Eigen::Matrix3d nero_imu_rotation_{Eigen::Matrix3d::Identity()};
+  bool nero_compute_transform_3d(
+    const rclcpp::Time & old_stamp, const rclcpp::Time & new_stamp, Eigen::Matrix4f & transform);
+  static rclcpp::Time nero_reference_time(const sensor_msgs::msg::PointCloud2 & cloud);
+  // [nero 2026-11-05 jolt-6] inputs whose cloud lies at its HEADER stamp although its first point's time_stamp is later: the
+  // front E1R's time_stamp starts 13.3 ms after its stamp in every frame since 11-03, while its corrected cloud lines up with
+  // the top lidar at the stamp (0..+5 ms; the Airys at stamp + first point). Empty = every input at stamp + first point.
+  std::unordered_set<std::string> nero_header_reference_topics_;
+
   /// @brief RclcppTimeHash structure defines a custom hash function for the rclcpp::Time type by
   /// using its nanoseconds representation as the hash value.
   struct RclcppTimeHash
@@ -94,6 +112,12 @@ public:
   void process_twist(
     const geometry_msgs::msg::TwistWithCovarianceStamped::ConstSharedPtr & twist_msg);
   void process_odometry(const nav_msgs::msg::Odometry::ConstSharedPtr & odometry_msg);
+  void nero_enable_imu_3d() { nero_imu_3d_ = true; }
+  void nero_set_header_reference_topics(const std::vector<std::string> & topics)
+  {
+    nero_header_reference_topics_ = std::unordered_set<std::string>(topics.begin(), topics.end());
+  }
+  void nero_process_imu(const sensor_msgs::msg::Imu::ConstSharedPtr & imu_msg);
 
   ConcatenatedCloudResult combine_pointclouds(
     std::unordered_map<std::string, sensor_msgs::msg::PointCloud2::SharedPtr> & topic_to_cloud_map);

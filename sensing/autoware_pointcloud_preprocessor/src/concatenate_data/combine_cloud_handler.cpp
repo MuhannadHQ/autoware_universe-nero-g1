@@ -18,7 +18,11 @@
 
 #include <pcl_conversions/pcl_conversions.h>
 
+#include <Eigen/Geometry>
+
 #include <algorithm>
+#include <cmath>
+#include <cstring>
 #include <deque>
 #include <functional>
 #include <memory>
@@ -94,6 +98,112 @@ void CombineCloudHandler::process_odometry(
   }
 
   twist_queue_.push_back(msg);
+}
+
+void CombineCloudHandler::nero_process_imu(const sensor_msgs::msg::Imu::ConstSharedPtr & imu_msg)
+{
+  // [nero 2026-11-05 jolt] the IMU's angular velocity, rotated into the output frame once the tf is known
+  if (!nero_imu_rotation_exists_) {
+    const auto tf_opt = managed_tf_buffer_->getTransform<Eigen::Matrix4f>(
+      output_frame_, imu_msg->header.frame_id, node_.now(), rclcpp::Duration::from_seconds(1.0),
+      node_.get_logger());
+    if (!tf_opt.has_value()) {
+      return;
+    }
+    nero_imu_rotation_ = tf_opt->block<3, 3>(0, 0).cast<double>();
+    nero_imu_rotation_exists_ = true;
+  }
+  const Eigen::Vector3d w = nero_imu_rotation_ * Eigen::Vector3d(
+                                                   imu_msg->angular_velocity.x,
+                                                   imu_msg->angular_velocity.y,
+                                                   imu_msg->angular_velocity.z);
+  geometry_msgs::msg::Vector3Stamped msg;
+  msg.header = imu_msg->header;
+  msg.vector.x = w.x();
+  msg.vector.y = w.y();
+  msg.vector.z = w.z();
+
+  // If time jumps backwards (e.g. when a rosbag restarts), clear buffer
+  if (
+    !nero_imu_queue_.empty() &&
+    rclcpp::Time(nero_imu_queue_.front().header.stamp) > rclcpp::Time(msg.header.stamp)) {
+    nero_imu_queue_.clear();
+  }
+  // IMU data older than the current one by 1 second is cleared (as the twist queue)
+  const auto cutoff_time = rclcpp::Time(msg.header.stamp) - rclcpp::Duration::from_seconds(1.0);
+  while (!nero_imu_queue_.empty() &&
+         rclcpp::Time(nero_imu_queue_.front().header.stamp) <= cutoff_time) {
+    nero_imu_queue_.pop_front();
+  }
+  nero_imu_queue_.push_back(msg);
+}
+
+rclcpp::Time CombineCloudHandler::nero_reference_time(const sensor_msgs::msg::PointCloud2 & cloud)
+{
+  // [nero 2026-11-05 jolt] the distortion corrector expresses a cloud in the body frame at its FIRST point's time
+  // (header stamp + that point's time_stamp offset), not at the header stamp: 13 ms (front) / 27 ms (left) on this car.
+  const rclcpp::Time stamp(cloud.header.stamp);
+  if (cloud.width * cloud.height == 0 || cloud.data.size() < cloud.point_step) {
+    return stamp;
+  }
+  for (const auto & field : cloud.fields) {
+    if (field.name == "time_stamp" && field.datatype == sensor_msgs::msg::PointField::UINT32) {
+      std::uint32_t offset_ns = 0;
+      std::memcpy(&offset_ns, cloud.data.data() + field.offset, sizeof(offset_ns));
+      return stamp + rclcpp::Duration(0, offset_ns);
+    }
+  }
+  return stamp;
+}
+
+bool CombineCloudHandler::nero_compute_transform_3d(
+  const rclcpp::Time & old_stamp, const rclcpp::Time & new_stamp, Eigen::Matrix4f & transform)
+{
+  // [nero 2026-11-05 jolt] pose of the body at new_stamp in the body frame at old_stamp: the body's rotation from the
+  // IMU's angular velocity (all three axes) and its travel along its own x axis at the twist's speed, integrated in
+  // steps of at most 1 ms. Each step takes the first sample at or after its middle time (as the distortion
+  // corrector). Returns false (the caller keeps the 2D result) when a queue is empty or does not cover the span.
+  if (twist_queue_.empty() || nero_imu_queue_.empty()) {
+    return false;
+  }
+  const double t0 = old_stamp.seconds();
+  const double t1 = new_stamp.seconds();
+  const double span = t1 - t0;
+  if (span < 0.0 || span > 0.2) {
+    return false;
+  }
+  const int steps = std::max(1, static_cast<int>(std::ceil(span / 0.001)));
+  const double h = span / steps;
+  auto it_twist = std::begin(twist_queue_);
+  auto it_imu = std::begin(nero_imu_queue_);
+  double twist_stamp = rclcpp::Time(it_twist->header.stamp).seconds();
+  double imu_stamp = rclcpp::Time(it_imu->header.stamp).seconds();
+  Eigen::Matrix3d rotation = Eigen::Matrix3d::Identity();
+  Eigen::Vector3d position = Eigen::Vector3d::Zero();
+  for (int k = 0; k < steps; ++k) {
+    const double tm = t0 + (k + 0.5) * h;
+    while (it_twist != std::end(twist_queue_) - 1 && tm > twist_stamp) {
+      ++it_twist;
+      twist_stamp = rclcpp::Time(it_twist->header.stamp).seconds();
+    }
+    while (it_imu != std::end(nero_imu_queue_) - 1 && tm > imu_stamp) {
+      ++it_imu;
+      imu_stamp = rclcpp::Time(it_imu->header.stamp).seconds();
+    }
+    if (std::fabs(tm - twist_stamp) > 0.1 || std::fabs(tm - imu_stamp) > 0.1) {
+      return false;
+    }
+    position += rotation * Eigen::Vector3d(it_twist->twist.linear.x * h, 0.0, 0.0);
+    const Eigen::Vector3d w(it_imu->vector.x, it_imu->vector.y, it_imu->vector.z);
+    const double angle = w.norm() * h;
+    if (angle > 1e-12) {
+      rotation = rotation * Eigen::AngleAxisd(angle, w.normalized()).toRotationMatrix();
+    }
+  }
+  transform = Eigen::Matrix4f::Identity();
+  transform.block<3, 3>(0, 0) = rotation.cast<float>();
+  transform.block<3, 1>(0, 3) = position.cast<float>();
+  return true;
 }
 
 std::deque<geometry_msgs::msg::TwistStamped> CombineCloudHandler::get_twist_queue()
@@ -226,7 +336,25 @@ ConcatenatedCloudResult CombineCloudHandler::combine_pointclouds(
 
     // compensate pointcloud
     std::shared_ptr<sensor_msgs::msg::PointCloud2> transformed_delay_compensated_cloud_ptr;
-    if (is_motion_compensated_) {
+    Eigen::Matrix4f nero_transform;
+    if (
+      is_motion_compensated_ && nero_imu_3d_ &&
+      nero_compute_transform_3d(
+        oldest_stamp,
+        nero_header_reference_topics_.count(topic) ? rclcpp::Time(cloud->header.stamp)
+                                                   : nero_reference_time(*cloud),
+        nero_transform)) {
+      // [nero 2026-11-05 jolt] NERO_LIDAR_MOTION_3D: this cloud straight from its own reference time to the oldest stamp,
+      // in 3D (IMU roll / pitch / yaw rate + speed)
+      transformed_delay_compensated_cloud_ptr = std::make_shared<sensor_msgs::msg::PointCloud2>();
+      pcl_ros::transformPointCloud(
+        nero_transform, *transformed_cloud_ptr, *transformed_delay_compensated_cloud_ptr);
+    } else if (is_motion_compensated_) {
+      if (nero_imu_3d_) {
+        RCLCPP_WARN_STREAM_THROTTLE(
+          node_.get_logger(), *node_.get_clock(), std::chrono::milliseconds(10000).count(),
+          "[NERO_LIDAR_MOTION_3D] no IMU / twist over the clouds' times: 2D compensation for this cloud");
+      }
       transformed_delay_compensated_cloud_ptr = std::make_shared<sensor_msgs::msg::PointCloud2>();
       correct_pointcloud_motion(
         transformed_cloud_ptr, pc_stamps, transform_memo, transformed_delay_compensated_cloud_ptr);

@@ -101,6 +101,14 @@ if(BUILD_TESTING)
     ${PROJECT_NAME}
     ${YAML_CPP_LIBRARIES}
   )
+  # [nero 2026-11-05 jolt] NERO_GROUND_LEVEL (QUEUE PTH)
+  ament_add_ros_isolated_gtest(test_nero_ground_level
+    test/test_nero_ground_level.cpp
+  )
+  target_link_libraries(test_nero_ground_level
+    ${PROJECT_NAME}
+    ${YAML_CPP_LIBRARIES}
+  )
   ament_add_ros_isolated_gtest(test_ransac_ground_filter
     test/test_ransac_ground_filter.cpp
   )

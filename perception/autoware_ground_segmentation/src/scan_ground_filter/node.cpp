@@ -16,6 +16,7 @@
 
 #include "grid_ground_filter.hpp"
 #include "nero_band_road.hpp"
+#include "nero_ground_level.hpp"
 
 #include <autoware_utils/geometry/geometry.hpp>
 #include <autoware_utils/math/normalization.hpp>
@@ -56,7 +57,70 @@ NeroBandRoadState * neroBandRoad(const void * node)
   return it == g_nero_band_road.end() ? nullptr : it->second.get();
 }
 
-// take out of the obstacle indices the points the band's road-referenced ceiling leaves out (nero_band_road.hpp)
+// NERO_GROUND_LEVEL (jolt, QUEUE PTH): per node instance, kept out of the class layout (nero_ground_level.hpp).
+struct NeroGroundLevelState
+{
+  nero::GroundLevel level;
+  float ceiling = 0.52f;
+  float x_front = 1.25f;  // the vehicle's front (vehicle_info max_longitudinal_offset)
+  size_t frames = 0, levelled = 0, cut = 0;
+  float max_pitch = 0.0f, max_roll = 0.0f;
+  double ms_fit = 0.0, ms_lev = 0.0, ms_cls = 0.0;
+  std::shared_ptr<sensor_msgs::msg::PointCloud2> buf;  // reused every cloud (no per-cloud allocation)
+  std::vector<size_t> src;
+  std::vector<float> bxyz;  // base_link x, y, z of the kept points (for NERO_GROUND_BAND_ROAD: the car's frame)
+  std::chrono::steady_clock::time_point last_log{};
+};
+std::mutex g_nero_ground_level_mutex;
+std::unordered_map<const void *, std::unique_ptr<NeroGroundLevelState>> g_nero_ground_level;
+
+NeroGroundLevelState * neroGroundLevel(const void * node)
+{
+  std::lock_guard<std::mutex> lock(g_nero_ground_level_mutex);
+  const auto it = g_nero_ground_level.find(node);
+  return it == g_nero_ground_level.end() ? nullptr : it->second.get();
+}
+
+// take out of the obstacle indices the points the band's road-referenced ceiling leaves out (nero_band_road.hpp):
+// n points (x, y, z at `stride` floats); the indices are byte offsets of `step`-byte points of the filtered cloud
+void neroBandRoadOn(
+  NeroBandRoadState & nb, const float * xyz, size_t stride, size_t n, size_t step, const builtin_interfaces::msg::Time & stamp,
+  pcl::PointIndices & no_ground_indices, const rclcpp::Logger & logger)
+{
+  nb.ng.assign(n, 0);
+  for (const auto i : no_ground_indices.indices) nb.ng[static_cast<size_t>(i) / step] = 1;
+  const auto st = nb.band_road.apply(xyz, stride, n, nb.ng);
+  if (st.removed) {
+    size_t k = 0;
+    for (const auto i : no_ground_indices.indices)
+      if (nb.ng[static_cast<size_t>(i) / step]) no_ground_indices.indices[k++] = i;
+    no_ground_indices.indices.resize(k);
+    if (nb.debug) {
+      RCLCPP_INFO(
+        logger,
+        "[NERO_GROUND_BAND_ROAD] frame %d.%09u: %zu obstacle points above road + %.2f m out (range %.1f-%.1f m, "
+        "lowest %.2f m over the road; road 20 m ahead at base z %+.2f m)",
+        stamp.sec, stamp.nanosec, st.removed, nb.band_road.band, st.r_min, st.r_max,
+        st.h_min, st.drop20);
+    }
+    if (!nb.frames || st.r_min < nb.r_min) nb.r_min = st.r_min;
+    if (!nb.frames || st.r_max > nb.r_max) nb.r_max = st.r_max;
+    if (!nb.frames || st.drop20 < nb.drop20) nb.drop20 = st.drop20;
+    ++nb.frames;
+    nb.points += st.removed;
+  }
+  const auto now = std::chrono::steady_clock::now();
+  if (nb.frames && now - nb.last_log >= std::chrono::seconds(1)) {
+    RCLCPP_INFO(
+      logger,
+      "[NERO_GROUND_BAND_ROAD] %zu frames / %zu obstacle points above road + %.2f m left out since the last line "
+      "(range %.1f-%.1f m; lowest road 20 m ahead at base z %+.2f m)",
+      nb.frames, nb.points, nb.band_road.band, nb.r_min, nb.r_max, nb.drop20);
+    nb.frames = nb.points = 0;
+    nb.last_log = now;
+  }
+}
+
 void neroApplyBandRoad(
   NeroBandRoadState & nb, const sensor_msgs::msg::PointCloud2::ConstSharedPtr & input,
   pcl::PointIndices & no_ground_indices, const rclcpp::Logger & logger)
@@ -87,38 +151,7 @@ void neroApplyBandRoad(
     }
     xyz = nb.xyz.data();
   }
-  nb.ng.assign(n, 0);
-  for (const auto i : no_ground_indices.indices) nb.ng[static_cast<size_t>(i) / step] = 1;
-  const auto st = nb.band_road.apply(xyz, stride, n, nb.ng);
-  if (st.removed) {
-    size_t k = 0;
-    for (const auto i : no_ground_indices.indices)
-      if (nb.ng[static_cast<size_t>(i) / step]) no_ground_indices.indices[k++] = i;
-    no_ground_indices.indices.resize(k);
-    if (nb.debug) {
-      RCLCPP_INFO(
-        logger,
-        "[NERO_GROUND_BAND_ROAD] frame %d.%09u: %zu obstacle points above road + %.2f m out (range %.1f-%.1f m, "
-        "lowest %.2f m over the road; road 20 m ahead at base z %+.2f m)",
-        input->header.stamp.sec, input->header.stamp.nanosec, st.removed, nb.band_road.band, st.r_min, st.r_max,
-        st.h_min, st.drop20);
-    }
-    if (!nb.frames || st.r_min < nb.r_min) nb.r_min = st.r_min;
-    if (!nb.frames || st.r_max > nb.r_max) nb.r_max = st.r_max;
-    if (!nb.frames || st.drop20 < nb.drop20) nb.drop20 = st.drop20;
-    ++nb.frames;
-    nb.points += st.removed;
-  }
-  const auto now = std::chrono::steady_clock::now();
-  if (nb.frames && now - nb.last_log >= std::chrono::seconds(1)) {
-    RCLCPP_INFO(
-      logger,
-      "[NERO_GROUND_BAND_ROAD] %zu frames / %zu obstacle points above road + %.2f m left out since the last line "
-      "(range %.1f-%.1f m; lowest road 20 m ahead at base z %+.2f m)",
-      nb.frames, nb.points, nb.band_road.band, nb.r_min, nb.r_max, nb.drop20);
-    nb.frames = nb.points = 0;
-    nb.last_log = now;
-  }
+  neroBandRoadOn(nb, xyz, stride, n, step, input->header.stamp, no_ground_indices, logger);
 }
 }  // namespace
 
@@ -222,6 +255,29 @@ ScanGroundFilterComponent::ScanGroundFilterComponent(const rclcpp::NodeOptions &
 
       // set time keeper to grid
       grid_ground_filter_ptr_->setTimeKeeper(time_keeper_);
+    }
+  }
+
+  // NERO_GROUND_LEVEL (jolt, QUEUE PTH): classify and cut the band's ceiling in each cloud's road frame (unset = the car)
+  {
+    // a node created where an earlier one lived must not inherit its state (unit tests create several)
+    std::lock_guard<std::mutex> lock(g_nero_ground_level_mutex);
+    g_nero_ground_level.erase(this);
+  }
+  if (const char * sw = std::getenv("NERO_GROUND_LEVEL")) {
+    auto gl = std::make_unique<NeroGroundLevelState>();
+    if (elevation_grid_mode_ && gl->level.parse(sw)) {
+      gl->ceiling = gl->level.ceiling > 0.0f ? gl->level.ceiling : static_cast<float>(vehicle_info_.vehicle_height_m);
+      gl->x_front = static_cast<float>(vehicle_info_.max_longitudinal_offset_m);
+      RCLCPP_INFO(
+        get_logger(),
+        "[NERO_GROUND_LEVEL] on: ground + band ceiling %.2f m over the road (road line from %.0f-%.0f m ahead, |y| < %.1f, "
+        "tilt <= %.1f deg; the robot's own plane up to its front %.2f m; behind it not levelled), output in base_link",
+        gl->ceiling, gl->level.x0, gl->level.x1, gl->level.yh, gl->level.max_tilt_deg, gl->x_front);
+      std::lock_guard<std::mutex> lock(g_nero_ground_level_mutex);
+      g_nero_ground_level[this] = std::move(gl);
+    } else {
+      RCLCPP_ERROR(get_logger(), "[NERO_GROUND_LEVEL] '%s' invalid or not elevation_grid_mode: switch off", sw);
     }
   }
 
@@ -464,8 +520,102 @@ void ScanGroundFilterComponent::faster_filter(
   pcl::PointIndices no_ground_indices;
 
   if (elevation_grid_mode_) {
-    grid_ground_filter_ptr_->process(input, no_ground_indices);
-    if (auto * nb = neroBandRoad(this)) neroApplyBandRoad(*nb, input, no_ground_indices, get_logger());
+    auto * gl = neroGroundLevel(this);
+    const auto & fl = input->fields;
+    if (
+      gl && input->point_step % 4 == 0 && fl.size() >= 3 && fl[0].name == "x" && fl[0].offset == 0 && fl[1].name == "y" &&
+      fl[1].offset == 4 && fl[2].name == "z" && fl[2].offset == 8) {
+      // NERO_GROUND_LEVEL: the points under the ceiling, rotated into this cloud's road frame (in base_link up to 3 m ahead, blended
+      // to the road frame by 6 m: jg9), are classified (on a level body = the car's input exactly); the kept points are taken from the
+      // input (base_link)
+      const size_t n = input->width * input->height, ps = input->point_step, stride = ps / 4;
+      const auto c0 = std::chrono::steady_clock::now();
+      gl->level.fit(reinterpret_cast<const float *>(input->data.data()), n, stride);
+      const auto c1 = std::chrono::steady_clock::now();
+      if (!gl->buf) gl->buf = std::make_shared<PointCloud2>();
+      auto & lev = *gl->buf;
+      lev.header = input->header; lev.fields = input->fields; lev.is_bigendian = input->is_bigendian;
+      lev.point_step = input->point_step; lev.is_dense = input->is_dense; lev.height = 1;
+      if (lev.data.size() < input->data.size()) lev.data.resize(input->data.size());
+      auto & src = gl->src; src.clear(); src.reserve(n);
+      size_t m = 0, over = 0;
+      const auto * in = input->data.data();
+      auto * out = lev.data.data();
+      const auto & L = gl->level;
+      const float ceil_z = gl->ceiling;
+      // NERO_GROUND_BAND_ROAD (rampground, on the car) runs on the kept points in base_link, as on the car (jolt-5): its gate
+      // ("the road ahead lies below the body's plane") and its road profile are base_link rules; in the road frame its gate never
+      // opens, and the car's ceiling kept under jolt-4's rule let the foliage it removes on the car back in (w31 20:48:03.9)
+      auto * nbr = neroBandRoad(this);
+      auto & bx = gl->bxyz;
+      if (nbr && bx.size() < 3 * n) bx.resize(3 * n);  // never shrinks: no per-cloud allocation / zeroing
+      float * bp = nbr ? bx.data() : nullptr;
+      if (L.ok) {
+        const float x_front = gl->x_front;
+        for (size_t k = 0; k < n; ++k) {
+          float q[3], z1 = 0.0f;
+          std::memcpy(q, in + k * ps, 12);
+          if (!(q[0] > 0.0f)) {  // behind the robot: not levelled, the car's band (jolt-3: a road rising ahead lifted it)
+            if (!(q[2] < ceil_z)) { ++over; continue; }
+            std::memcpy(out + m * ps, in + k * ps, ps);
+            src.push_back(k * ps); ++m;
+            if (bp) std::memcpy(bp + 3 * (m - 1), q, 12);
+            continue;
+          }
+          const float z = L.road_z(q, z1);
+          // over the road the point stands on (jolt-3) AND over the car's own base_link ceiling (jolt-4): the levelled band only ever
+          // adds to the car's. Where the road falls away (a crown toward a wall, a dip, the body nose-up) the ceiling over the local
+          // road sits lower in base_link and cut wall / car parts the car keeps (lidarinsert s1_087 recess: a low object's track lost)
+          if (!(z - L.ref_z(q, x_front) < ceil_z) && !(q[2] < ceil_z)) { ++over; continue; }
+          if (bp) std::memcpy(bp + 3 * m, q, 12);  // base_link, before the rotation
+          // jolt-8 (jg9): classified in base_link near the robot, in the road frame from xn1 ahead (nero_ground_level.hpp)
+          float c[3];
+          L.classify_xyz(q, z, z1, c);
+          std::memcpy(out + m * ps, in + k * ps, ps);
+          std::memcpy(out + m * ps, c, 12);
+          src.push_back(k * ps); ++m;
+        }
+      } else {
+        // no trusted road plane: the base_link band exactly as the car's crop box (z < vehicle height)
+        for (size_t k = 0; k < n; ++k) {
+          float z;
+          std::memcpy(&z, in + k * ps + 8, 4);
+          if (!(z < ceil_z)) { ++over; continue; }
+          std::memcpy(out + m * ps, in + k * ps, ps);
+          src.push_back(k * ps); ++m;
+          if (bp) std::memcpy(bp + 3 * (m - 1), in + k * ps, 12);
+        }
+      }
+      lev.width = static_cast<uint32_t>(m); lev.row_step = static_cast<uint32_t>(m * ps);
+      // the grid filter walks data.size(): give it exactly m points (shrinking keeps the capacity)
+      lev.data.resize(m * ps);
+      const auto c2 = std::chrono::steady_clock::now();
+      PointCloud2ConstPtr lev_c = gl->buf;
+      grid_ground_filter_ptr_->process(lev_c, no_ground_indices);
+      if (nbr) neroBandRoadOn(*nbr, bx.data(), 3, m, ps, input->header.stamp, no_ground_indices, get_logger());
+      for (auto & ix : no_ground_indices.indices) ix = static_cast<int>(src[static_cast<size_t>(ix) / ps]);
+      const auto c3 = std::chrono::steady_clock::now();
+      gl->ms_fit += std::chrono::duration<double, std::milli>(c1 - c0).count();
+      gl->ms_lev += std::chrono::duration<double, std::milli>(c2 - c1).count();
+      gl->ms_cls += std::chrono::duration<double, std::milli>(c3 - c2).count();
+      gl->frames++; gl->levelled += gl->level.ok ? 1 : 0; gl->cut += over;
+      if (gl->level.ok) {  // trusted fits only (an untrusted one keeps its too-steep angles for nothing)
+        gl->max_pitch = std::max(gl->max_pitch, std::abs(gl->level.pitch)); gl->max_roll = std::max(gl->max_roll, std::abs(gl->level.roll));
+      }
+      const auto now = std::chrono::steady_clock::now();
+      if (now - gl->last_log > std::chrono::seconds(30)) {
+        RCLCPP_INFO(
+          get_logger(), "[NERO_GROUND_LEVEL] %zu clouds (%zu levelled, max |pitch| %.1f |roll| %.1f deg), %zu points over the ceiling; "
+          "mean ms fit %.2f level %.2f classify %.2f",
+          gl->frames, gl->levelled, gl->max_pitch * 57.2958f, gl->max_roll * 57.2958f, gl->cut, gl->ms_fit / std::max<size_t>(1, gl->frames),
+          gl->ms_lev / std::max<size_t>(1, gl->frames), gl->ms_cls / std::max<size_t>(1, gl->frames));
+        gl->frames = gl->levelled = gl->cut = 0; gl->max_pitch = gl->max_roll = 0.0f; gl->ms_fit = gl->ms_lev = gl->ms_cls = 0.0;
+        gl->last_log = now;
+      }
+    } else {
+      grid_ground_filter_ptr_->process(input, no_ground_indices);
+      if (auto * nb = neroBandRoad(this)) neroApplyBandRoad(*nb, input, no_ground_indices, get_logger());
+    }
   } else {
     std::vector<PointCloudVector> radial_ordered_points;
     convertPointcloud(input, radial_ordered_points);

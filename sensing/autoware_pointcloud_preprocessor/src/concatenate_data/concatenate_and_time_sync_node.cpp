@@ -141,6 +141,24 @@ PointCloudConcatenateDataSynchronizerComponent::PointCloudConcatenateDataSynchro
     *this, params_.output_frame, params_.is_motion_compensated,
     params_.publish_synchronized_pointcloud, params_.keep_input_frame_in_synchronized_pointcloud);
 
+  // [nero 2026-11-05 jolt] NERO_LIDAR_MOTION_3D: 3D motion compensation between the clouds' stamps with the IMU
+  // (default false = upstream: speed + yaw rate from the twist only)
+  if (params_.is_motion_compensated && declare_parameter<bool>("nero_imu_3d", false)) {
+    combine_cloud_handler_->nero_enable_imu_3d();
+    // [nero 2026-11-05 jolt-6] inputs taken at their header stamp (the front E1R: see combine_cloud_handler.hpp)
+    const auto nero_header_topics = declare_parameter<std::vector<std::string>>(
+      "nero_imu_3d_header_reference_topics", std::vector<std::string>{});
+    combine_cloud_handler_->nero_set_header_reference_topics(nero_header_topics);
+    for (const auto & t : nero_header_topics) {
+      RCLCPP_INFO(get_logger(), "[NERO_LIDAR_MOTION_3D] %s at its header stamp", t.c_str());
+    }
+    nero_imu_sub_ = this->create_subscription<sensor_msgs::msg::Imu>(
+      "~/input/imu", rclcpp::QoS{100}, [this](const sensor_msgs::msg::Imu::ConstSharedPtr msg) {
+        combine_cloud_handler_->nero_process_imu(msg);
+      });
+    RCLCPP_INFO(get_logger(), "[NERO_LIDAR_MOTION_3D] 3D motion compensation with the IMU");
+  }
+
   // Diagnostic Updater
   std::ostringstream hardware_id_stream;
   hardware_id_stream << this->get_fully_qualified_name() << "_checker";
