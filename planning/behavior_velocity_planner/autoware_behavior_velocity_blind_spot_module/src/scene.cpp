@@ -132,15 +132,32 @@ BlindSpotDecision BlindSpotModule::modifyPathVelocityDetail(PathWithLaneId * pat
   const auto collision_obstacle = isCollisionDetected(
     blind_spot_lanelets, path->points.at(critical_stopline_idx).point.pose, detection_area,
     ego_time_to_reach_stop_line);
+  // NERO ixlpass: log-only (NERO_BS_DEBUG=1) and the vehicle check (NERO_BS_DETECT_NON_VRU, LEFT
+  // turns; nero_passer.cpp)
+  neroDebugOldArea(
+    blind_spot_lanelets, path->points.at(critical_stopline_idx).point.pose, detection_area,
+    ego_time_to_reach_stop_line, collision_obstacle.has_value());
+  const auto nero_veh = neroVehicleCheck(interpolated_path_info, path);
+  const bool nero_veh_stop = nero_veh.hold && nero_veh.stop_line_idx.has_value();
+  const size_t vru_stop_line_idx =
+    (nero_veh.inserted && nero_veh.stop_line_idx && nero_veh.stop_line_idx.value() <= stop_line_idx)
+      ? stop_line_idx + 1
+      : stop_line_idx;
   state_machine_.setStateWithMarginTime(
-    collision_obstacle.has_value() ? StateMachine::State::STOP : StateMachine::State::GO,
+    (collision_obstacle.has_value() || nero_veh_stop) ? StateMachine::State::STOP
+                                                      : StateMachine::State::GO,
     logger_.get_child("state_machine"), *clock_);
 
   if (state_machine_.getState() == StateMachine::State::STOP) {
-    return Unsafe{stop_line_idx, collision_obstacle};
+    if (
+      nero_veh_stop &&
+      (!collision_obstacle.has_value() || nero_veh.stop_line_idx.value() < vru_stop_line_idx)) {
+      return Unsafe{nero_veh.stop_line_idx.value(), nero_veh.object};
+    }
+    return Unsafe{vru_stop_line_idx, collision_obstacle};
   }
 
-  return Safe{stop_line_idx};
+  return Safe{vru_stop_line_idx};
 }
 
 // template-specification based visitor pattern

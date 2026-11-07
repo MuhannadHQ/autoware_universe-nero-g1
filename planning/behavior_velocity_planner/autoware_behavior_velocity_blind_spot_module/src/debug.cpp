@@ -106,6 +106,44 @@ visualization_msgs::msg::MarkerArray BlindSpotModule::createDebugMarkerArray()
       debug_data_.conflicting_targets, "conflicting_targets", module_id_, now, 0.99, 0.4, 0.0),
     &debug_marker_array, now);
 
+  // NERO ixlpass (NERO_BS_DETECT_NON_VRU): the vehicle check's attention area (orange) and ego's
+  // turn path polygon (cyan)
+  auto nero_poly = [&](
+                     const lanelet::BasicPolygon2d & poly, const std::string & ns, const double r,
+                     const double g, const double b) {
+    visualization_msgs::msg::Marker marker{};
+    marker.header.frame_id = "map";
+    marker.header.stamp = now;
+    marker.ns = ns;
+    marker.id = planning_utils::bitShift(module_id_);
+    marker.lifetime = rclcpp::Duration::from_seconds(0.3);
+    marker.type = visualization_msgs::msg::Marker::LINE_STRIP;
+    marker.action = visualization_msgs::msg::Marker::ADD;
+    marker.pose.orientation = create_marker_orientation(0, 0, 0, 1.0);
+    marker.scale = create_marker_scale(0.1, 0.0, 0.0);
+    marker.color = create_marker_color(r, g, b, 0.999);
+    const double z = planner_data_->current_odometry->pose.position.z;
+    for (const auto & p : poly) {
+      geometry_msgs::msg::Point point;
+      point.x = p.x();
+      point.y = p.y();
+      point.z = z;
+      marker.points.push_back(point);
+    }
+    if (!marker.points.empty()) {
+      marker.points.push_back(marker.points.front());
+    }
+    debug_marker_array.markers.push_back(marker);
+  };
+  if (debug_data_.nero_veh_attention_area) {
+    nero_poly(
+      debug_data_.nero_veh_attention_area.value(), "nero_vehicle_attention_area", 1.0, 0.5, 0.0);
+  }
+  if (debug_data_.nero_veh_conflict_area) {
+    nero_poly(
+      debug_data_.nero_veh_conflict_area.value(), "nero_vehicle_conflict_area", 0.0, 0.8, 0.9);
+  }
+
   return debug_marker_array;
 }
 }  // namespace autoware::behavior_velocity_planner

@@ -25,6 +25,8 @@
 
 #include <lanelet2_routing/RoutingGraph.h>
 
+#include <deque>
+#include <map>
 #include <memory>
 #include <string>
 #include <utility>
@@ -68,6 +70,9 @@ public:
     std::optional<geometry_msgs::msg::Pose> virtual_wall_pose{std::nullopt};
     std::optional<lanelet::CompoundPolygon3d> detection_area;
     autoware_perception_msgs::msg::PredictedObjects conflicting_targets;
+    // NERO ixlpass (NERO_BS_DETECT_NON_VRU): the vehicle check's attention area and conflict area
+    std::optional<lanelet::BasicPolygon2d> nero_veh_attention_area;
+    std::optional<lanelet::BasicPolygon2d> nero_veh_conflict_area;
   };
 
 public:
@@ -170,6 +175,55 @@ private:
     const double time_thr) const;
 
   StateMachine state_machine_;  //! for state
+
+  // NERO ixlpass (NERO_BS_DETECT_NON_VRU, LEFT turns only; src/nero_passer.cpp): vehicles (car /
+  // truck / bus / trailer) passing on the turning side, judged as upstream's re-designed blind_spot
+  // (#11079) judges them: an attention area from ego's turning-side edge to the blind side's far
+  // edge (here the OPPOSITE lane's far edge: the car's #5635 strip, which the redesign dropped),
+  // carried straight on past the junction entry, and the time intervals in which ego and each
+  // object pass ego's turn path (#11265's lateral clearance filter; the overlap test with both
+  // margins)
+  struct NeroVehGeometry
+  {
+    lanelet::LineString3d
+      far_before;                     //!< far edge of the blind side before turning (ego direction)
+    lanelet::LineString3d far_after;  //!< its straight extension past the junction entry (clipped)
+    lanelet::LineString3d road_centerline;  //!< the approach lanes' centreline (ego direction)
+    lanelet::ConstLanelets road_lanelets;
+    std::string kind;
+  };
+  struct NeroVehDecision
+  {
+    bool active{false};      //!< the check ran
+    bool unsafe_now{false};  //!< an object conflicts this cycle
+    bool hold{false};        //!< unsafe now or within the debounce time of the last unsafe cycle
+    std::optional<size_t> stop_line_idx{std::nullopt};  //!< where to hold (inserted into the path)
+    bool inserted{false};  //!< a new point went into the path at stop_line_idx
+    std::optional<autoware_perception_msgs::msg::PredictedObject> object{std::nullopt};
+    std::string note;
+  };
+  std::optional<NeroVehGeometry> nero_veh_geometry_{std::nullopt};
+  bool nero_veh_geometry_failed_{false};
+  std::optional<rclcpp::Time> nero_veh_last_unsafe_{std::nullopt};
+  std::optional<autoware_perception_msgs::msg::PredictedObject> nero_veh_last_object_{std::nullopt};
+  bool nero_veh_over_pass_judge_{false};
+  std::optional<geometry_msgs::msg::Pose> nero_veh_stop_pose_{};  //!< the hold's latched stop point
+  std::optional<lanelet::BasicPoint2d>
+    nero_veh_entry_pt_{};  //!< ego's path on the turn lanelet's entry line
+  //! yield memory per track id: (seen moving >= 1 m/s, stood after that and not faster than
+  //! resume_v since)
+  std::map<std::string, std::pair<bool, bool>> nero_veh_stood_;
+  std::map<std::string, std::deque<std::pair<double, double>>>
+    nero_veh_vhist_;  //!< (t, v) per track, 1.5 s
+  std::optional<NeroVehGeometry> neroVehBuildGeometry(
+    const std::vector<lanelet::Id> & lane_ids_upto_intersection) const;
+  NeroVehDecision neroVehicleCheck(
+    const InterpolatedPathInfo & interpolated_path_info,
+    autoware_internal_planning_msgs::msg::PathWithLaneId * path);
+  void neroDebugOldArea(
+    const lanelet::ConstLanelets & blind_spot_lanelets,
+    const geometry_msgs::msg::Pose & stop_line_pose, const lanelet::CompoundPolygon3d & area,
+    const double ego_time_to_reach_stop_line, const bool vru_collision) const;
 
   // Debug
   mutable DebugData debug_data_;

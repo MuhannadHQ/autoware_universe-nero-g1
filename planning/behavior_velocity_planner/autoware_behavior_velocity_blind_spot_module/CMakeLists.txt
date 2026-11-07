@@ -14,6 +14,7 @@ ament_auto_add_library(${PROJECT_NAME} SHARED
   src/decisions.cpp
   src/util.cpp
   src/parameter.cpp
+  src/nero_passer.cpp
 )
 
 if(BUILD_TESTING)
