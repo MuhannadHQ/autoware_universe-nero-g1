@@ -50,6 +50,11 @@ public:
   bool measureWithPose(const types::DynamicObject & object);
   bool measureWithShape(const types::DynamicObject & object);
   bool getTrackedObject(const rclcpp::Time & time, types::DynamicObject & object) const override;
+
+  // NERO_MOT_SIGN_BELIEF (signbelief, upstream #13050): the heading and the 180 deg turn, for the pedestrian / bicycle
+  // track's sign consensus (the pedestrian layer follows the bicycle layer)
+  double neroYawState() const { return motion_model_.getStateElement(IDX::YAW); }
+  void neroFlipOrientation() { motion_model_.flipOrientation(); }
 };
 
 }  // namespace autoware::multi_object_tracker

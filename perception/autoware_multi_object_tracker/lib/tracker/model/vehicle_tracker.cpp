@@ -91,6 +91,19 @@ bool VehicleTracker::neroFlipDeferEnabled()
   return neroFlipDefer().enabled;
 }
 
+namespace
+{
+// NERO_MOT_SIGN_BELIEF + NERO_MOT_FLIP_DEFER = one mechanism: only the sign belief turns a vehicle track. limitStates no
+// longer turns, so the judged copy keeps the held heading with the reverse speed, and "moving the turned way" is moving
+// BACKWARD along it (-1); deciding "moving" takes that copy as it is (the measured reverse / forward motion with its own
+// consistent covariance, heading kept) and the belief turns the track only if the motion and the boxes say so. Without
+// the belief the copy is the stock turned state (+1).
+double neroTurnedWay()
+{
+  return neroSignBeliefParams().enabled ? -1.0 : 1.0;
+}
+}  // namespace
+
 VehicleTracker::Options VehicleTracker::options{};
 VehicleTracker::VehicleTracker(
   const object_model::ObjectModel & object_model, const rclcpp::Time & time,
@@ -186,6 +199,11 @@ VehicleTracker::VehicleTracker(
 
     // initialize motion model
     motion_model_.initialize(time, x, y, yaw, pose_cov, vel, vel_cov, slip, slip_cov, length);
+  }
+
+  // NERO_MOT_SIGN_BELIEF: the seeding box counts as one agreeing vote (by its orientation availability)
+  if (neroSignBeliefParams().enabled) {
+    nero_sign_.init(static_cast<int>(object.kinematics.orientation_availability), time);
   }
 }
 
@@ -330,7 +348,23 @@ bool VehicleTracker::measureWithPose(
         std::max(motion_model_.getVelocityVariance(), defer.sigma_stand * defer.sigma_stand);
       motion_model_.holdStanding(nero_hold_pvv_);
     }
+    const double nero_yaw_pre = motion_model_.getStateElement(IDX::YAW);
+    const double nero_vel_pre = motion_model_.getStateElement(IDX::VEL);
     motion_model_.limitStates();
+    if (neroSignBeliefParams().debug > 0) {
+      // NERO_MOT_SIGN_DEBUG (research): the car's own reverse-speed turn (limitStates, covariance not turned)
+      const double d = autoware_utils::normalize_radian(motion_model_.getStateElement(IDX::YAW) - nero_yaw_pre);
+      if (std::fabs(d) > M_PI_2) {
+        RCLCPP_INFO(
+          logger_,
+          "[NERO_MOT_SIGN] %02x%02x%02x%02x %s stock turn (limitStates, reverse speed): t %.2f at (%.2f, %.2f) yaw %.0f -> "
+          "%.0f v %.2f -> %.2f (sigma %.2f)",
+          nero_log_uuid_[0], nero_log_uuid_[1], nero_log_uuid_[2], nero_log_uuid_[3], nero_log_model_,
+          nero_now_.seconds(), motion_model_.getStateElement(IDX::X), motion_model_.getStateElement(IDX::Y),
+          nero_yaw_pre * 180.0 / M_PI, motion_model_.getStateElement(IDX::YAW) * 180.0 / M_PI, nero_vel_pre,
+          motion_model_.getStateElement(IDX::VEL), std::sqrt(motion_model_.getVelocityVariance()));
+      }
+    }
   }
 
   // position z
@@ -418,10 +452,14 @@ bool VehicleTracker::measure(
   types::DynamicObject updating_object = in_object;
   shapes::calcAnchorPointOffset(object_, tracking_offset_, updating_object);
   nero_now_ = time;
+  // NERO_MOT_SIGN_BELIEF: the box's raw yaw votes before the update folds it within +-90 deg of the track
+  if (neroSignBeliefParams().enabled) neroSignVote(in_object, time, channel_info);
   measureWithPose(updating_object, channel_info);
   if (channel_info.trust_extension) {
     measureWithShape(updating_object);
   }
+  // NERO_MOT_SIGN_BELIEF: the accumulated votes and the track's speed decide a 180 deg turn of the whole state
+  if (neroSignBeliefParams().enabled) neroSignEvaluate(time);
   if (nero_turned_) {
     // NERO_MOT_FLIP_DEFER: the measured positions since the sudden reverse speed decide
     neroAddTurnedPosition(updating_object, time);
@@ -437,6 +475,68 @@ bool VehicleTracker::measure(
   }
 
   return true;
+}
+
+void VehicleTracker::neroSignVote(
+  const types::DynamicObject & object, const rclcpp::Time & time, const types::InputChannel & channel_info)
+{
+  // upstream #13050: only boxes with an orientation, from channels that trust it (on this car: CenterPoint's SIGN_UNKNOWN
+  // vehicle boxes through detected_objects; detection_by_tracker's boxes take the track's own yaw and never vote)
+  if (
+    object.kinematics.orientation_availability == types::OrientationAvailability::UNAVAILABLE ||
+    !channel_info.trust_orientation) {
+    return;
+  }
+  const double tracker_yaw = motion_model_.getStateElement(IDX::YAW);
+  const double raw_yaw_diff =
+    autoware_utils::normalize_radian(tf2::getYaw(object.pose.orientation) - tracker_yaw);
+  const int z = nero_sign_.vote(
+    time, raw_yaw_diff, object.kinematics.orientation_availability == types::OrientationAvailability::AVAILABLE,
+    object.nero_range, object.existence_probability);
+  if (neroSignBeliefParams().debug > 1) {
+    RCLCPP_INFO(
+      logger_,
+      "[NERO_MOT_SIGN] %02x%02x%02x%02x %s vote %+d: t %.2f at (%.2f, %.2f) box yaw %.0f track yaw %.0f agreement %.3f "
+      "(var %.3f) votes %d",
+      nero_log_uuid_[0], nero_log_uuid_[1], nero_log_uuid_[2], nero_log_uuid_[3], nero_log_model_, z, time.seconds(),
+      object.pose.position.x, object.pose.position.y, tf2::getYaw(object.pose.orientation) * 180.0 / M_PI,
+      tracker_yaw * 180.0 / M_PI, nero_sign_.agreement(), nero_sign_.variance(), nero_sign_.votes());
+  }
+}
+
+void VehicleTracker::neroSignEvaluate(const rclcpp::Time & time)
+{
+  const double vel_long = motion_model_.getStateElement(IDX::VEL);
+  const double vel_var = motion_model_.getVelocityVariance();
+  if (nero_sign_.shouldFlip(time, vel_long, vel_var)) {
+    // a track moving forward is not made a reverser by its boxes' votes (a slowly moving car with consistently mirrored boxes)
+    const double lock = neroSignBeliefParams().fwd_lock;
+    if (lock > 0.0 && vel_long >= lock) return;
+    neroFlipOrientationSign("belief");
+  }
+}
+
+void VehicleTracker::neroFlipOrientationSign(const char * why)
+{
+  const double yaw_pre = motion_model_.getStateElement(IDX::YAW);
+  const double vel_pre = motion_model_.getStateElement(IDX::VEL);
+  const double agreement_pre = nero_sign_.agreement();
+  const double fused_pre = nero_sign_.fusedAgreement();
+  motion_model_.flipOrientation();
+  // the anchor offset is kept in the object's coordinates: the same offset in the map is the negated vector
+  tracking_offset_ = -tracking_offset_;
+  nero_sign_.onFlipped();
+  if (neroSignBeliefParams().debug > 0) {
+    RCLCPP_INFO(
+      logger_,
+      "[NERO_MOT_SIGN] %02x%02x%02x%02x %s turn (%s): t %.2f at (%.2f, %.2f) yaw %.0f -> %.0f v %.2f -> %.2f (sigma "
+      "%.2f) agreement %.3f (var %.3f, %d votes) fused %.3f (var %.3f)",
+      nero_log_uuid_[0], nero_log_uuid_[1], nero_log_uuid_[2], nero_log_uuid_[3], nero_log_model_, why,
+      nero_now_.seconds(), motion_model_.getStateElement(IDX::X), motion_model_.getStateElement(IDX::Y),
+      yaw_pre * 180.0 / M_PI, motion_model_.getStateElement(IDX::YAW) * 180.0 / M_PI, vel_pre,
+      motion_model_.getStateElement(IDX::VEL), std::sqrt(motion_model_.getVelocityVariance()), agreement_pre,
+      nero_sign_.variance(), nero_sign_.votes(), fused_pre, nero_sign_.fusedVariance());
+  }
 }
 
 void VehicleTracker::neroOnPublished(
@@ -459,7 +559,8 @@ void VehicleTracker::neroOnPublished(
     return;
   }
   const double yaw_turned = nero_turned_->getStateElement(IDX::YAW);
-  const double v_partner = partner_vx * std::cos(yaw_turned) + partner_vy * std::sin(yaw_turned);
+  const double v_partner =
+    neroTurnedWay() * (partner_vx * std::cos(yaw_turned) + partner_vy * std::sin(yaw_turned));
   if (v_partner < neroFlipDefer().v_move) {
     nero_show_turned_ = false;
     nero_first_pub_ = " (first published while judged: the vehicle track at its place does not move the turned way)";
@@ -477,6 +578,13 @@ void VehicleTracker::neroOnPublished(
   motion_model_.takeStateOf(*nero_turned_);
   nero_turned_.reset();
   nero_show_turned_ = false;
+  if (neroSignBeliefParams().enabled) {
+    // NERO_MOT_SIGN_BELIEF: the vehicle track at its place moves backward along this track's heading at >= v_move: its
+    // speed is the belief's velocity evidence (certain), as the measured positions are in neroDecideTurned
+    if (nero_sign_.shouldFlipMeasured(nero_now_, -v_partner, neroSignBeliefParams().measured_v_cap)) {
+      neroFlipOrientationSign("belief: partner's motion");
+    }
+  }
 }
 
 void VehicleTracker::neroAddTurnedPosition(
@@ -523,8 +631,8 @@ void VehicleTracker::neroDecideTurned()
     }
     return stt < 1e-6 ? 0.0 : sta / stt;
   };
-  const double v_turned = slope(0);
-  const double v_after = slope(1);
+  const double v_turned = neroTurnedWay() * slope(0);
+  const double v_after = neroTurnedWay() * slope(1);
   // it moves the turned way (the turn was right), or after the jump it moves the way it was heading (the reverse
   // speed was wrong, not the motion) and the stock state has turned back to that heading with that motion (a box
   // that jumped back and returns, jitter, leaves the stock state turned or slow): either way the stock state is the
@@ -547,6 +655,25 @@ void VehicleTracker::neroDecideTurned()
     nero_turned_->getStateElement(IDX::YAW) * 180.0 / M_PI, nero_turned_->getStateElement(IDX::VEL));
   if (moving) {
     motion_model_.takeStateOf(*nero_turned_);
+    if (neroSignBeliefParams().enabled) {
+      // NERO_MOT_SIGN_BELIEF: the judged copy is a consistent filter recovering from the false first speed and can lag the
+      // motion the positions measured (the car's turned copy got there by its un-turned covariance): take the measured speed
+      // along the heading (the least-squares speed of every position since the jump, as the decision used: >= 3 positions
+      // over >= t_judge; the positions after the jump alone are too few for far boxes) when it is larger and of the same sign
+      {
+        const double v_fit = slope(0);
+        const double v_now = motion_model_.getStateElement(IDX::VEL);
+        if (v_fit * v_now > 0.0 && std::fabs(v_fit) > std::fabs(v_now)) motion_model_.neroSetSpeed(v_fit);
+      }
+      // NERO_MOT_SIGN_BELIEF: 0.2 s of measured positions are the belief's velocity evidence, certain (variance 0): a young
+      // track whose heading is mirrored against its measured motion turns now (as the car's judged turn did), a track
+      // whose boxes have long agreed with its heading keeps it (a car really reversing out of a spot is not held: its speed
+      // builds up gradually)
+      const double v_meas = slope(0);   // along the held heading (the judged copy is not turned under the belief)
+      if (nero_sign_.shouldFlipMeasured(nero_now_, v_meas, neroSignBeliefParams().measured_v_cap)) {
+        neroFlipOrientationSign("belief: measured motion");
+      }
+    }
   } else {
     motion_model_.holdStanding(defer.sigma_stand * defer.sigma_stand);
   }

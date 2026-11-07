@@ -21,6 +21,7 @@
 
 #include "autoware/multi_object_tracker/object_model/object_model.hpp"
 #include "autoware/multi_object_tracker/object_model/types.hpp"
+#include "autoware/multi_object_tracker/tracker/model/nero_sign_belief.hpp"
 #include "autoware/multi_object_tracker/tracker/model/tracker_base.hpp"
 #include "autoware/multi_object_tracker/tracker/motion_model/bicycle_motion_model.hpp"
 
@@ -47,6 +48,12 @@ private:
 
   BicycleMotionModel motion_model_;
   using IDX = BicycleMotionModel::IDX;
+
+  // NERO_MOT_SIGN_BELIEF (signbelief, upstream #13050): the heading-sign evidence of every box and the track's speed
+  NeroSignBelief nero_sign_;
+  void neroSignVote(
+    const types::DynamicObject & object, const rclcpp::Time & time, const types::InputChannel & channel_info);
+  void neroSignEvaluate(const rclcpp::Time & time);
 
   // NERO_MOT_FLIP_DEFER (flipspeed): after a sudden reverse speed the track is held as standing and the object turned
   // by 180 deg (as stock turns it) runs beside it on the same measurements until they show which one is right
@@ -117,6 +124,13 @@ public:
     std::copy(uuid.uuid.begin(), uuid.uuid.begin() + 4, nero_log_uuid_.begin());
     nero_log_model_ = model;
   }
+
+  // NERO_MOT_SIGN_BELIEF (signbelief): the heading, the belief's confidence (layer consensus) and the exact 180 deg turn
+  // of the whole state (motion model, anchor offset, belief)
+  double neroYawState() const { return motion_model_.getStateElement(IDX::YAW); }
+  double neroSpeedState() const { return motion_model_.getStateElement(IDX::VEL); }
+  double neroSignConfidence() const { return nero_sign_.confidence(); }
+  void neroFlipOrientationSign(const char * why);
 };
 
 }  // namespace autoware::multi_object_tracker

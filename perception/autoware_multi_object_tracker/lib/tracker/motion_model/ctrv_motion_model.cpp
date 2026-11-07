@@ -198,6 +198,20 @@ bool CTRVMotionModel::updateStatePoseHeadVel(
   return ekf_.update(Y, C, R);
 }
 
+bool CTRVMotionModel::flipOrientation()
+{
+  if (!checkInitialized()) return false;
+  Eigen::MatrixXd X_t(DIM, 1);
+  Eigen::MatrixXd P_t(DIM, DIM);
+  ekf_.getX(X_t);
+  ekf_.getP(P_t);
+  X_t(IDX::YAW) = autoware_utils::normalize_radian(X_t(IDX::YAW) + M_PI);
+  X_t(IDX::VEL) = -X_t(IDX::VEL);
+  P_t.row(IDX::VEL) *= -1.0;
+  P_t.col(IDX::VEL) *= -1.0;
+  return ekf_.init(X_t, P_t);
+}
+
 bool CTRVMotionModel::limitStates()
 {
   Eigen::MatrixXd X_t(DIM, 1);

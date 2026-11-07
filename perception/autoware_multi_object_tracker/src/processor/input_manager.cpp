@@ -14,6 +14,8 @@
 
 #include "input_manager.hpp"
 
+#include <cmath>
+
 #include "autoware/multi_object_tracker/object_model/shapes.hpp"
 #include "autoware/multi_object_tracker/object_model/types.hpp"
 #include "autoware/multi_object_tracker/uncertainty/uncertainty_processor.hpp"
@@ -101,6 +103,10 @@ void InputStream::onMessage(
       return;
     }
     shapes::getNearestCornerOrSurface(*self_transform, object);
+    // NERO_MOT_SIGN_BELIEF: the box's range from the robot (the belief's range-weighted votes)
+    object.nero_range = std::hypot(
+      object.pose.position.x - self_transform->translation.x,
+      object.pose.position.y - self_transform->translation.y);
 
     // if object extension is not reliable, enlarge covariance of position and extend shape
   }

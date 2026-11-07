@@ -117,6 +117,11 @@ public:
   double getVelocityVariance() const;
   bool holdStanding(const double vel_cov);
   bool takeStateOf(const BicycleMotionModel & other);
+  // NERO_MOT_SIGN_BELIEF (signbelief): the exact 180 deg turn of the state: yaw + pi, speed negated (the velocity
+  // vector, position and slip unchanged), covariance T P T^T with T = diag(1, 1, 1, -1, 1)
+  bool flipOrientation();
+  // NERO_MOT_SIGN_BELIEF + NERO_MOT_FLIP_DEFER (signbelief): the speed from measured positions (its cross-covariances kept)
+  bool neroSetSpeed(const double vel);
 
   bool updateExtendedState(const double & length);
 

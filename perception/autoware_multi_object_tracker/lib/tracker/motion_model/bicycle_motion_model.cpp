@@ -19,6 +19,7 @@
 
 #include "autoware/multi_object_tracker/tracker/motion_model/bicycle_motion_model.hpp"
 
+#include "autoware/multi_object_tracker/tracker/model/nero_sign_belief.hpp"
 #include "autoware/multi_object_tracker/tracker/motion_model/motion_model_base.hpp"
 
 #include <Eigen/Core>
@@ -259,8 +260,10 @@ bool BicycleMotionModel::limitStates()
   ekf_.getX(X_t);
   ekf_.getP(P_t);
 
-  // maximum reverse velocity
-  if (motion_params_.max_reverse_vel < 0 && X_t(IDX::VEL) < motion_params_.max_reverse_vel) {
+  // maximum reverse velocity (NERO_MOT_SIGN_BELIEF: a vehicle track turns only by its sign belief, upstream #13050)
+  if (
+    !neroSignBeliefParams().enabled && motion_params_.max_reverse_vel < 0 &&
+    X_t(IDX::VEL) < motion_params_.max_reverse_vel) {
     // rotate the object orientation by 180 degrees
     X_t(IDX::VEL) = -X_t(IDX::VEL);
     X_t(IDX::YAW) = X_t(IDX::YAW) + M_PI;
@@ -312,6 +315,33 @@ bool BicycleMotionModel::takeStateOf(const BicycleMotionModel & other)
   Eigen::MatrixXd P_t(DIM, DIM);
   other.getStateVector(X_t);
   other.ekf_.getP(P_t);
+  return ekf_.init(X_t, P_t);
+}
+
+bool BicycleMotionModel::flipOrientation()
+{
+  // NERO_MOT_SIGN_BELIEF (signbelief, port of upstream #13050's flipOrientation for this model's state)
+  if (!checkInitialized()) return false;
+  Eigen::MatrixXd X_t(DIM, 1);
+  Eigen::MatrixXd P_t(DIM, DIM);
+  ekf_.getX(X_t);
+  ekf_.getP(P_t);
+  X_t(IDX::YAW) = autoware_utils::normalize_radian(X_t(IDX::YAW) + M_PI);
+  X_t(IDX::VEL) = -X_t(IDX::VEL);
+  // covariance transform T*P*T^T: negate the speed's cross-covariances (its own variance unchanged)
+  P_t.row(IDX::VEL) *= -1.0;
+  P_t.col(IDX::VEL) *= -1.0;
+  return ekf_.init(X_t, P_t);
+}
+
+bool BicycleMotionModel::neroSetSpeed(const double vel)
+{
+  if (!checkInitialized()) return false;
+  Eigen::MatrixXd X_t(DIM, 1);
+  Eigen::MatrixXd P_t(DIM, DIM);
+  ekf_.getX(X_t);
+  ekf_.getP(P_t);
+  X_t(IDX::VEL) = vel;
   return ekf_.init(X_t, P_t);
 }
 

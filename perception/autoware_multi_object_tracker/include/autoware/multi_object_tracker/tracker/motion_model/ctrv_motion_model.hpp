@@ -86,6 +86,10 @@ public:
 
   bool limitStates();
 
+  // NERO_MOT_SIGN_BELIEF (signbelief, upstream #13050): the exact 180 deg turn: yaw + pi, speed negated, the speed's
+  // cross-covariances negated
+  bool flipOrientation();
+
   bool predictStateStep(const double dt, KalmanFilter & ekf) const override;
 
   bool getPredictedState(

@@ -20,6 +20,10 @@
 
 #include "autoware/multi_object_tracker/object_model/object_model.hpp"
 
+#include <autoware_utils/math/normalization.hpp>
+
+#include <cmath>
+
 namespace autoware::multi_object_tracker
 {
 MultipleVehicleTracker::MultipleVehicleTracker(
@@ -41,13 +45,27 @@ bool MultipleVehicleTracker::measure(
   const types::DynamicObject & object, const rclcpp::Time & time,
   const types::InputChannel & channel_info)
 {
-  if (VehicleTracker::neroFlipDeferEnabled()) {
+  if (VehicleTracker::neroFlipDeferEnabled() || neroSignBeliefParams().debug > 0) {
     // NERO_MOT_FLIP_DEFER: the object's uuid in the vehicle models' log lines
     big_vehicle_tracker_.neroSetLogName(object_.uuid, "big");
     normal_vehicle_tracker_.neroSetLogName(object_.uuid, "nrm");
   }
   big_vehicle_tracker_.measure(object, time, channel_info);
   normal_vehicle_tracker_.measure(object, time, channel_info);
+  if (neroSignBeliefParams().enabled) {
+    // NERO_MOT_SIGN_BELIEF (upstream #13050): the layers publish interchangeably and must agree on the heading sign;
+    // the stronger sign belief leads
+    const bool big_leads =
+      big_vehicle_tracker_.neroSignConfidence() >= normal_vehicle_tracker_.neroSignConfidence();
+    VehicleTracker & leader = big_leads ? big_vehicle_tracker_ : normal_vehicle_tracker_;
+    VehicleTracker & follower = big_leads ? normal_vehicle_tracker_ : big_vehicle_tracker_;
+    const double lock = neroSignBeliefParams().fwd_lock;
+    if (
+      std::fabs(autoware_utils::normalize_radian(leader.neroYawState() - follower.neroYawState())) > M_PI_2 &&
+      !(lock > 0.0 && follower.neroSpeedState() >= lock)) {
+      follower.neroFlipOrientationSign("layer consensus");
+    }
+  }
 
   return true;
 }

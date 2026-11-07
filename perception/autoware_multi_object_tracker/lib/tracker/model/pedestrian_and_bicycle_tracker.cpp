@@ -18,6 +18,11 @@
 
 #include "autoware/multi_object_tracker/tracker/model/pedestrian_and_bicycle_tracker.hpp"
 
+#include <autoware_utils/math/normalization.hpp>
+#include <rclcpp/logging.hpp>
+
+#include <cmath>
+
 namespace autoware::multi_object_tracker
 {
 PedestrianAndBicycleTracker::PedestrianAndBicycleTracker(
@@ -39,8 +44,25 @@ bool PedestrianAndBicycleTracker::measure(
   const types::DynamicObject & object, const rclcpp::Time & time,
   const types::InputChannel & channel_info)
 {
+  if (neroSignBeliefParams().debug > 0) bicycle_tracker_.neroSetLogName(object_.uuid, "bic");
   pedestrian_tracker_.measure(object, time, channel_info);
   bicycle_tracker_.measure(object, time, channel_info);
+  if (neroSignBeliefParams().enabled && neroSignBeliefParams().ped_follow) {
+    // NERO_MOT_SIGN_BELIEF (upstream #13050): only the bicycle layer accumulates heading-sign evidence; the pedestrian
+    // layer follows it
+    if (
+      std::fabs(autoware_utils::normalize_radian(
+        bicycle_tracker_.neroYawState() - pedestrian_tracker_.neroYawState())) > M_PI_2) {
+      pedestrian_tracker_.neroFlipOrientation();
+      if (neroSignBeliefParams().debug > 0) {
+        RCLCPP_INFO(
+          rclcpp::get_logger("PedestrianAndBicycleTracker"),
+          "[NERO_MOT_SIGN] %02x%02x%02x%02x ped turn (follows the bicycle layer): t %.2f yaw -> %.0f", object_.uuid.uuid[0],
+          object_.uuid.uuid[1], object_.uuid.uuid[2], object_.uuid.uuid[3], time.seconds(),
+          pedestrian_tracker_.neroYawState() * 180.0 / M_PI);
+      }
+    }
+  }
 
   return true;
 }

@@ -94,6 +94,10 @@ struct DynamicObject
   // object extension (size and shape)
   autoware_perception_msgs::msg::Shape shape;
   geometry_msgs::msg::Point anchor_point;
+
+  // NERO_MOT_SIGN_BELIEF (signbelief): the box centre's distance from the robot at its measurement time [m] (-1 = not set;
+  // set by the input manager for vehicle-like boxes; only the belief's range-weighted votes read it)
+  double nero_range{-1.0};
 };
 
 struct DynamicObjectList
