@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "obstacle_cruise_module.hpp"
+#include "nero_kerb.hpp"
 
 #include "autoware_utils/ros/uuid_helper.hpp"
 
@@ -257,6 +258,8 @@ VelocityPlanningResult ObstacleCruiseModule::plan(
   // NERO_CRUISE_CUTIN_YIELD / _STEEP (nero_cutin.hpp): ease off for a car squeezing in close, brake for a car turning in
   // from the side; unset = stock
   nero_cutin_yield(raw_trajectory_points, planner_data, result);
+  // NERO_CRUISE_KERB (nero_kerb.hpp): a vehicle that stood beside the robot's way and starts to move; unset = stock
+  nero_kerb(raw_trajectory_points, planner_data, common_param_.limit_min_jerk, common_param_.max_jerk, logger_, result);
 
   // clear velocity limit if necessary
   if (result.velocity_limit) {
