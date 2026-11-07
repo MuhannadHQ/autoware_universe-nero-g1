@@ -567,6 +567,55 @@ const NeroTurnParam & nero_priority_turn()
   return p;
 }
 
+// NERO_IX_PRIORITY_TURN_EARLY=<win_s>,<dev_deg>,<move_m>,<near_m>[,<n_cycles>[,<census_gate>]] (ixturnev, 2026-11-06; QUEUE IXTURNEV, on
+// top of NERO_IX_PRIORITY_TURN). Ahmed 11-05: "be dynamic if he starts going in our lane then start braking". TURN reads a car's
+// turn from the heading of its own positions over 1.0 s; over a shorter window the same positions show it sooner (the census of
+// our left turners, replayed through the car's tracker and the turn-onset tracker: 0.10-0.30 s sooner on every at-speed turner),
+// but a short window also reads a straight car's lane drift or a slow car's position jitter as a heading. So TURN also shows a
+// car's turn when its positions over the last <win_s> s moved at least <move_m> m (a car at speed) and head at least <dev_deg>
+// off its lane toward the side of a turn across ego (and at least TURN's <lat_m> sideways), on <n_cycles> consecutive objects
+// messages, while it is within <near_m> m of that turn's stop line or past it (a car turning across ego turns there; lane drifts
+// further back are not turns), and it is SETTLED by TURN's own gate. Its hold, side, reference direction and effect are TURN's.
+// <census_gate> (absent = 1): TURN's settled gate (its 1-s heading within <gate_tol_deg> over <gate_s>) counts the values it
+// can compute (>= 5), as the left-turner census measured it (0 of 33 straight passes), instead of failing on the first second
+// of a record (no 1-s heading yet): the car's gate needs ~3.5 s of a car's positions, the census's ~2.4 s, so a car first
+// published within ~40 m showed its turn up to ~0.7 s later than the census allows; applies to TURN's own 1-s reading too.
+// Census (47 straight passes, 7 oncoming, both tracker families): 0 straight passes more than TURN, largest straight-pass value
+// 4.8 deg against 6 (TURN's own 5.4). Logs `[NERO_IX] priority turn early: ...` on the cycle it makes a car's turn show while
+// TURN alone would not (no such line = the decisions of NERO_IX_PRIORITY_TURN alone). Needs NERO_IX_PRIORITY_TURN. Unset = off.
+struct NeroTurnEarlyParam
+{
+  bool on{false};
+  double win_s{0.7};
+  double dev_deg{6.0};
+  double move_m{2.0};
+  double near_m{15.0};
+  int n_cycles{2};
+  bool census_gate{true};  // TURN's settled gate counts the computable values (>= 5), as the census measured it
+};
+const NeroTurnEarlyParam & nero_priority_turn_early()
+{
+  static const NeroTurnEarlyParam p = [] {
+    NeroTurnEarlyParam q;
+    const char * v = std::getenv("NERO_IX_PRIORITY_TURN_EARLY");
+    if (v == nullptr || std::string(v).empty()) return q;
+    std::vector<double> f;
+    std::stringstream ss(v);
+    std::string item;
+    while (std::getline(ss, item, ',')) f.push_back(std::atof(item.c_str()));
+    if (f.size() < 4 || f.at(0) <= 0.0 || f.at(1) <= 0.0 || f.at(2) < 1.0 || f.at(3) < 0.0) return q;
+    q.on = true;
+    q.win_s = f.at(0);
+    q.dev_deg = f.at(1);
+    q.move_m = f.at(2);
+    q.near_m = f.at(3);
+    if (f.size() > 4 && f.at(4) >= 1.0) q.n_cycles = static_cast<int>(f.at(4) + 0.5);
+    if (f.size() > 5) q.census_gate = f.at(5) > 0.5;
+    return q;
+  }();
+  return p;
+}
+
 // NERO_IX_PRIORITY_READY=<evidence_s>,<react_s>,<a_stop>,<b_max>[,<horizon_s>[,<away_m>[,<acc_release>[,<gap_m>[,<v_floor>]]]]] (predleft, 2026-11-05; QUEUE PREDLEFT, on
 // top of NERO_IX_PRIORITY_EVIDENCE's no-anticipation). Ahmed 10-23: "in saudi you get the occasional crazy driver that
 // doesnt respect the right of way ... we are still ready for him". Without anticipation a car that keeps its speed and
@@ -1383,7 +1432,7 @@ int IntersectionModule::neroPriorityVerdict(
   const auto & tp = nero_priority_turn();
   const auto & rp = nero_priority_ready();
   // NERO_IX_PRIORITY_TURN: do its own positions over the last win_s s move toward the side of turn y (vs its lane)?
-  auto turn_shows = [&](const size_t y) {
+  auto turn_shows = [&](const size_t y, const double dist_to_line) {
     if (!tp.on || !ev.on) return false;
     const std::string tkey = uuidKey(object.object_id) + "#" + std::to_string(y);
     const double now = nero_steady_now();
@@ -1418,20 +1467,62 @@ int IntersectionModule::neroPriorityVerdict(
       dh.push_back({stamp, computed ? dev : std::numeric_limits<double>::quiet_NaN()});
     }
     while (!dh.empty() && dh.front()[0] < stamp - (tp.win_s + tp.gate_s + 0.5)) dh.pop_front();
-    if (fire && tp.gate_s > 0.0) {
-      int n = 0;
-      bool settled = true;
+    // NERO_IX_PRIORITY_TURN_EARLY: the same positions over a shorter window, a car at speed near its turn's line
+    const auto & te = nero_priority_turn_early();
+    bool efire = false;
+    double edev = 0.0, elat = 0.0;
+    if (
+      te.on && dist_to_line <= te.near_m && xy_it != nero_priority_xy_hist_.end() && xy_it->second.size() >= 2) {
+      const auto & h = xy_it->second;
+      const auto & last = h.back();
+      const std::array<double, 3> * ref = nullptr;
+      for (auto it = h.rbegin(); it != h.rend(); ++it) {
+        if (last[0] - (*it)[0] >= te.win_s - 0.05) {  // the newest position ~win_s old (10 Hz objects)
+          ref = &(*it);
+          break;
+        }
+      }
+      if (ref != nullptr) {
+        const double dx = last[1] - (*ref)[1], dy = last[2] - (*ref)[2];
+        const double lon = dx * std::cos(cur_lane_angle) + dy * std::sin(cur_lane_angle);
+        elat = lanes.at(y).turn_sign * (-dx * std::sin(cur_lane_angle) + dy * std::cos(cur_lane_angle));
+        if (std::hypot(dx, dy) >= te.move_m && lon > 0.0) {
+          edev = std::atan2(elat, lon) * 180.0 / M_PI;
+          efire = edev >= te.dev_deg && elat >= tp.lat_m;
+        }
+      }
+    }
+    bool tfire = fire;  // NERO_IX_PRIORITY_TURN_EARLY: TURN's own reading, judged by the switch's gate
+    if ((fire || efire) && tp.gate_s > 0.0) {
+      // TURN's gate as the car runs it: every value in the window computable and within tol (>= 5 of them); with
+      // NERO_IX_PRIORITY_TURN_EARLY's <census_gate> the values not yet computable (its first second of positions) are skipped
+      // and >= 5 computable ones must be within tol: the gate the left-turner census measured (0 false of 33)
+      int n = 0, n_fin = 0;
+      bool settled = true, settled_c = true;
       for (const auto & q : dh) {
         if (q[0] < stamp - tp.win_s - tp.gate_s - 1e-6 || q[0] > stamp - tp.win_s + 1e-6) continue;
-        if (!std::isfinite(q[1]) || std::fabs(q[1]) > tp.gate_tol_deg) {
-          settled = false;
-          break;
+        if (!std::isfinite(q[1]) || std::fabs(q[1]) > tp.gate_tol_deg) settled = false;
+        if (std::isfinite(q[1])) {
+          ++n_fin;
+          if (std::fabs(q[1]) > tp.gate_tol_deg) settled_c = false;
         }
         ++n;
       }
-      if (!settled || n < 5) {
-        if (dbg) nero_priority_dbg_ += fmt::format(" | turn {} pos dev {:.1f} not settled", lanes.at(y).lanelet.id(), dev);
+      settled = settled && n >= 5;
+      settled_c = settled_c && n_fin >= 5;
+      const bool settled_e = te.census_gate ? settled_c : settled;
+      if (!settled) {
+        if (dbg && fire) {
+          nero_priority_dbg_ += fmt::format(" | turn {} pos dev {:.1f} not settled", lanes.at(y).lanelet.id(), dev);
+        }
         fire = false;
+      }
+      if (!settled_e) {
+        if (dbg && efire) {
+          nero_priority_dbg_ += fmt::format(" | turn {} early dev {:.1f} not settled", lanes.at(y).lanelet.id(), edev);
+        }
+        efire = false;
+        tfire = false;
       }
     }
     // [0] consecutive objects messages that showed it, [1] steady time it last held, [2] the objects stamp counted last
@@ -1442,10 +1533,38 @@ int IntersectionModule::neroPriorityVerdict(
       st[0] = fire ? st[0] + 1.0 : 0.0;
       if (fire && st[0] >= tp.n_cycles - 1e-6) st[1] = now;
     }
-    const bool shows = st[1] > 0.0 && now - st[1] <= tp.hold_s;
-    if (dbg && (fire || shows)) {
+    const bool shows_turn = st[1] > 0.0 && now - st[1] <= tp.hold_s;
+    bool shows = shows_turn;
+    if (te.on) {
+      // NERO_IX_PRIORITY_TURN_EARLY: its own count of consecutive messages and its own last time it held (TURN's hold)
+      auto & es = nero_turn_early_[tkey];
+      const bool new_msg = stamp > es[2] + 1e-6;
+      if (new_msg) {
+        es[2] = stamp;
+        // TURN's own reading through the switch's gate, or the short window
+        const bool any = efire || (te.census_gate && tfire);
+        es[0] = any ? es[0] + 1.0 : 0.0;
+        if (any && es[0] >= (efire ? te.n_cycles : tp.n_cycles) - 1e-6) es[1] = now;
+      }
+      const bool eshows = es[1] > 0.0 && now - es[1] <= tp.hold_s;
+      if (eshows && !shows_turn && new_msg) {
+        const std::string turn_dev = computed ? fmt::format("{:.1f} deg", dev) : std::string("unknown");
+        RCLCPP_INFO(
+          logger_,
+          "[NERO_IX] priority turn early: lane %ld obj %s turn %ld d %.1f v %.2f: positions over %.1f s head %.1f deg "
+          "(lat %.2f m) toward the turn%s, TURN's %.1f s heading %s%s",
+          lane_id_, nero_hex_id(object).c_str(), lanes.at(y).lanelet.id(), dist_to_line, speed, te.win_s, edev, elat,
+          efire ? "" : " (held)", tp.win_s, turn_dev.c_str(), (tfire && !efire) ? " (census gate)" : "");
+      }
+      if (dbg && (efire || eshows)) {
+        nero_priority_dbg_ += fmt::format(" | turn {} early dev {:.1f} lat {:.2f}{}", lanes.at(y).lanelet.id(), edev,
+          elat, eshows ? " SHOWS" : "");
+      }
+      shows = shows_turn || eshows;
+    }
+    if (dbg && (fire || shows_turn)) {
       nero_priority_dbg_ += fmt::format(" | turn {} pos dev {:.1f} lat {:.2f}{}", lanes.at(y).lanelet.id(), dev, lat,
-        shows ? " SHOWS" : "");
+        shows_turn ? " SHOWS" : "");
     }
     return shows;
   };
@@ -1497,7 +1616,7 @@ int IntersectionModule::neroPriorityVerdict(
         }
         return;
       }
-      if (turn_shows(y)) {
+      if (turn_shows(y, dist_to_line)) {
         // NERO_IX_PRIORITY_TURN: its positions move toward its turn: its turn paths are checked, also after ego's 1st pass
         // judge line (as a swing)
         nero_priority_hard_ = true;
@@ -1853,6 +1972,7 @@ void IntersectionModule::updateObjectInfoManagerArea()
     for (auto it = nero_turn_shows_.begin(); it != nero_turn_shows_.end();) {
       if (stamp - it->second[2] > 5.0 && now - it->second[1] > 5.0) {
         nero_turn_dev_.erase(it->first);
+        nero_turn_early_.erase(it->first);  // NERO_IX_PRIORITY_TURN_EARLY
         it = nero_turn_shows_.erase(it);
       } else {
         ++it;

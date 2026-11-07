@@ -749,6 +749,9 @@ private:
   mutable std::map<std::string, std::array<double, 3>> nero_turn_shows_;
   //! NERO_IX_PRIORITY_TURN: the same key -> its heading toward that turn per objects message (stamp, deg; NaN unknown)
   mutable std::map<std::string, std::deque<std::array<double, 2>>> nero_turn_dev_;
+  //! NERO_IX_PRIORITY_TURN_EARLY (ixturnev, 2026-11-06): the same key -> (consecutive objects messages that showed the turn
+  //! over the short window, last steady time it held, last stamp counted)
+  mutable std::map<std::string, std::array<double, 3>> nero_turn_early_;
   //! NERO_IX_PRIORITY_READY (predleft, 2026-11-05): the cars judged straight on (no turn shown yet) that could still
   //! take a turn across ego without stopping, this cycle (set by the verdict, read by neroReadyCap)
   struct NeroReadyCand
