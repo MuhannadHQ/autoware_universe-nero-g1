@@ -29,6 +29,8 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <limits>
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
@@ -425,10 +427,157 @@ ObstaclePointCloudBasedValidator::ObstaclePointCloudBasedValidator(
         env);
     }
   }
+  // [nero 2026-11-04 REALIZE] NERO_VAL_MOVER (see the header)
+  if (const char * env = std::getenv("NERO_VAL_MOVER"); env && *env) {
+    std::vector<double> v;
+    std::stringstream ss(env);
+    std::string tok;
+    bool ok = true;
+    while (std::getline(ss, tok, ',')) {
+      try {
+        size_t used = 0;
+        v.push_back(std::stod(tok, &used));
+        if (used != tok.size()) ok = false;
+      } catch (...) {
+        ok = false;
+      }
+    }
+    if (
+      ok && (v.size() == 7 || v.size() == 8 || v.size() == 12 || v.size() == 14 || v.size() == 16 || v.size() == 17) && v[0] >= 2.0 && v[0] <= 20.0 &&
+      v[0] == std::floor(v[0]) && v[1] > 0.0 && v[1] <= 2.0 && v[2] > 0.0 && v[3] > 0.0 && v[4] > 0.0 &&
+      v[4] <= 90.0 && v[5] >= 0.0 && v[6] >= 0.0 && v[6] == std::floor(v[6]) && (v[6] == 0.0 || nero_body_.on) &&
+      (v.size() == 7 || v[7] >= 0.0) &&
+      (v.size() < 16 || (v[14] > 0.0 && v[14] <= 1.0 && v[15] >= 0.0 && v[15] <= 10.0 && v[12] > 0.0)) &&
+      (v.size() < 17 || (v[16] > 0.0 && v[16] <= 10.0)) &&
+      (v.size() < 14 || (v[12] >= 0.0 && v[12] == std::floor(v[12]) && v[13] >= 0.0 && v[13] <= 2.0 &&
+                         (v[12] == 0.0 || nero_body_.on))) &&
+      (v.size() < 12 || (v[8] >= 0.0 && v[8] == std::floor(v[8]) && v[9] >= 0.0 && v[10] >= 0.0 &&
+                         v[10] <= 1.0 && v[11] > 0.0 && ((v[8] == 0.0 && v[9] == 0.0) || nero_body_.on)))) {
+      nero_mv_.on = true;
+      nero_mv_.n = static_cast<int>(v[0]);
+      nero_mv_.win = v[1];
+      nero_mv_.rms = v[2];
+      nero_mv_.vmin = v[3];
+      nero_mv_.yaw = v[4];
+      nero_mv_.travel = v[5];
+      nero_mv_.min_slab = static_cast<int>(v[6]);
+      if (v.size() >= 8) nero_mv_.min_range = v[7];
+      if (v.size() >= 12) {
+        nero_mv_.min_body = static_cast<int>(v[8]);
+        nero_mv_.k_r2_body = v[9];
+        nero_mv_.min_score = v[10];
+        nero_mv_.v_first = v[11];
+      }
+      if (v.size() >= 14) {
+        nero_mv_.min_road_body = static_cast<int>(v[12]);
+        nero_mv_.road_h = v[13];
+      }
+      if (v.size() >= 16) {
+        nero_mv_.max_stay = v[14];
+        nero_mv_.twin_m = v[15];
+      }
+      if (v.size() == 17) nero_mv_.twin_lat = v[16];
+      if (const char * dbg = std::getenv("NERO_VAL_MOVER_DEBUG"); dbg && std::string(dbg) == "1") {
+        nero_mv_.debug = true;
+      }
+      RCLCPP_INFO(
+        get_logger(),
+        "[NERO_VAL_MOVER] on: a dropped vehicle box is validated when >= %d of its CenterPoint boxes within %.2f s "
+        "lie on a line (map frame, rms <= %.2f m) at >= %.1f m/s over >= %.1f m, its heading within %.0f deg of the "
+        "motion, >= %d lower-body slab points (0 = not required), from %.0f m; >= max(%d, %.0f/r^2) raw body points "
+        "(0 = not required), the boxes' mean existence >= %.2f, first step within 1.0 m + %.1f m/s x the gap; >= %d raw "
+        "points > %.2f m over the road (0 = not required); moving body: stay share < %.2f (1 = off), no kept vehicle box within "
+        "%.1f m (0 = off) and across it within %.1f m (0 = any)",
+        nero_mv_.n, nero_mv_.win, nero_mv_.rms, nero_mv_.vmin, nero_mv_.travel, nero_mv_.yaw, nero_mv_.min_slab,
+        nero_mv_.min_range, nero_mv_.min_body, nero_mv_.k_r2_body, nero_mv_.min_score, nero_mv_.v_first,
+        nero_mv_.min_road_body, nero_mv_.road_h, nero_mv_.max_stay, nero_mv_.twin_m, nero_mv_.twin_lat);
+    } else {
+      RCLCPP_ERROR(
+        get_logger(),
+        "[NERO_VAL_MOVER] '%s' is not <n>,<win_s>,<rms_m>,<vmin_mps>,<yaw_deg>,<min_travel_m>,<min_slab>[,<min_range_m>"
+        "[,<min_body>,<k_r2_body>,<min_score>,<v_first_mps>[,<min_road_body>,<road_h_m>[,<max_stay>,<twin_m>[,<twin_lat_m>]]]]] (raw point tests "
+        "need NERO_VAL_BODY): "
+        "no mover validation",
+        env);
+    }
+  }
+  // [nero 2026-11-04 REALIZE-7] NERO_VAL_PED (see the header)
+  if (const char * env = std::getenv("NERO_VAL_PED"); env && *env) {
+    std::vector<double> v;
+    std::stringstream ss(env);
+    std::string tok;
+    bool ok = true;
+    while (std::getline(ss, tok, ',')) {
+      try {
+        size_t used = 0;
+        v.push_back(std::stod(tok, &used));
+        if (used != tok.size() || !std::isfinite(v.back())) ok = false;
+      } catch (...) {
+        ok = false;
+      }
+    }
+    auto count_ok = [](const double x, const double hi) { return x >= 1.0 && x <= hi && x == std::floor(x); };
+    if (!nero_body_.on) {
+      RCLCPP_ERROR(
+        get_logger(), "[NERO_VAL_PED] '%s': needs NERO_VAL_BODY on (its raw cloud subscription): no people validation",
+        env);
+    } else if (
+      ok && v.size() == 16 && count_ok(v[0], 1e6) && v[1] >= 0.0 && v[2] >= 0.0 && count_ok(v[3], 100.0) && v[4] > 0.0 &&
+      v[4] <= 5.0 && v[5] >= 0.0 && v[6] > 0.0 && v[7] >= 0.0 && count_ok(v[8], 100.0) && v[9] > 0.0 && v[9] <= 5.0 &&
+      v[10] > 0.0 && v[11] >= 0.0 && v[12] > v[11] && v[12] <= 10.0 && v[13] >= 0.15 && v[13] <= 3.0 && v[14] >= 0.0 &&
+      v[15] >= 0.0) {
+      nero_ped_.on = true;
+      nero_ped_.min_body = static_cast<int>(v[0]);
+      nero_ped_.k_r2 = v[1];
+      nero_ped_.min_ext = v[2];
+      nero_ped_.n_move = static_cast<int>(v[3]);
+      nero_ped_.w_move = v[4];
+      nero_ped_.v_move = v[5];
+      nero_ped_.rms = v[6];
+      nero_ped_.min_travel = v[7];
+      nero_ped_.n_stand = static_cast<int>(v[8]);
+      nero_ped_.w_stand = v[9];
+      nero_ped_.d_stand = v[10];
+      nero_ped_.over_lo = v[11];
+      nero_ped_.over_hi = v[12];
+      nero_ped_.iso_pad = v[13];
+      nero_ped_.iso_abs = v[14];
+      nero_ped_.iso_rel = v[15];
+      if (const char * dbg = std::getenv("NERO_VAL_PED_DEBUG"); dbg && std::string(dbg) == "1") {
+        nero_ped_.debug = true;
+      }
+      RCLCPP_INFO(
+        get_logger(),
+        "[NERO_VAL_PED] on: a dropped PEDESTRIAN / BICYCLE box is validated when >= max(%d, %.0f/r^2) raw points in its "
+        "footprint + 0.15 m 0.3-1.9 m over its bottom span >= %.2f m in height, and its chain of people boxes (map frame) "
+        "moves (>= %d boxes within %.2f s on a line, rms <= %.2f m, >= %.2f m/s, travel >= %.2f m) or stands (>= %d boxes "
+        "within %.2f s pairwise <= %.2f m, no raw point %.2f-%.2f m over its bottom in the footprint + 0.15 m, footprint + "
+        "%.2f m adds <= max(%.1f, %.2f x body) body points)",
+        nero_ped_.min_body, nero_ped_.k_r2, nero_ped_.min_ext, nero_ped_.n_move, nero_ped_.w_move, nero_ped_.rms,
+        nero_ped_.v_move, nero_ped_.min_travel, nero_ped_.n_stand, nero_ped_.w_stand, nero_ped_.d_stand, nero_ped_.over_lo,
+        nero_ped_.over_hi, nero_ped_.iso_pad, nero_ped_.iso_abs, nero_ped_.iso_rel);
+    } else {
+      RCLCPP_ERROR(
+        get_logger(),
+        "[NERO_VAL_PED] '%s' is not <min_body>,<k_r2>,<min_ext_m>,<n_move>,<w_move_s>,<v_move_mps>,<rms_m>,<min_travel_m>,"
+        "<n_stand>,<w_stand_s>,<d_stand_m>,<over_lo_m>,<over_hi_m>,<iso_pad_m>,<iso_abs>,<iso_rel> (counts integers >= 1, "
+        "windows 0-5 s, over_lo < over_hi, iso_pad >= 0.15 m): no people validation",
+        env);
+    }
+  }
 }
 
 namespace
 {
+// [realize-6 research] NERO_VAL_MOVER_DUMP=<file>: one line per line-passing box (geometry, decision, raw points around it); debug only
+FILE * neroMvDump()
+{
+  static FILE * f = [] {
+    const char * p = std::getenv("NERO_VAL_MOVER_DUMP");
+    return (p && *p) ? std::fopen(p, "a") : static_cast<FILE *>(nullptr);
+  }();
+  return f;
+}
 // numpy-style linear percentile of a sorted vector
 double neroPercentile(const std::vector<float> & sorted, const double q)
 {
@@ -457,7 +606,7 @@ bool neroIsVehicle(const autoware_perception_msgs::msg::DetectedObject & object)
 void ObstaclePointCloudBasedValidator::neroBodyEvidence(
   const autoware_perception_msgs::msg::DetectedObjects & transformed_objects,
   const std::vector<size_t> & candidates, std::vector<char> & body,
-  const builtin_interfaces::msg::Time & stamp, const std::string & frame_id)
+  const builtin_interfaces::msg::Time & stamp, const std::string & frame_id, std::vector<int> * slab)
 {
   sensor_msgs::msg::PointCloud2::ConstSharedPtr raw;
   {
@@ -644,6 +793,7 @@ void ObstaclePointCloudBasedValidator::neroBodyEvidence(
     // v8: from far_range (the lower-body test on there) a smaller slab count
     const int min_pts = (nero_body_.far_min > 0 && cd.range >= nero_body_.far_range) ? nero_body_.far_min
                                                                                        : nero_body_.min_points;
+    if (slab) slab->at(cd.idx) = static_cast<int>(cd.u.size());  // NERO_VAL_MOVER's raw support (before any test)
     const double need =
       std::max(static_cast<double>(min_pts), nero_body_.k_r2 / std::max(1.0, cd.range * cd.range));
     if (static_cast<double>(cd.u.size()) < need) continue;
@@ -672,6 +822,808 @@ void ObstaclePointCloudBasedValidator::neroBodyEvidence(
     body.at(cd.idx) = 1;
   }
 }
+void ObstaclePointCloudBasedValidator::neroMoverPass(
+  const autoware_perception_msgs::msg::DetectedObjects & transformed_objects, std::vector<char> & keep,
+  const std::vector<int> & slab, const builtin_interfaces::msg::Time & stamp, const std::string & frame_id)
+{
+  // [nero 2026-11-04 REALIZE] NERO_VAL_MOVER (see the header): chain this frame's vehicle boxes (map frame) onto the
+  // chains of the previous frames, then validate a dropped vehicle box whose chain moves on a line
+  const rclcpp::Time t_obj(stamp);
+  const double t = t_obj.seconds();
+  tf2::Transform map_from_cloud;
+  try {
+    const auto tf = tf_buffer_.lookupTransform("map", frame_id, t_obj, rclcpp::Duration::from_seconds(0.0));
+    tf2::fromMsg(tf.transform, map_from_cloud);
+  } catch (const tf2::TransformException &) {
+    return;  // no map tf at this stamp: no mover validation this frame (the chains wait; a gap > 0.35 s ends them)
+  }
+  const double map_yaw = tf2::getYaw(map_from_cloud.getRotation());
+  struct Box
+  {
+    size_t idx;
+    double x, y, yaw, range, prob;
+  };
+  std::vector<Box> boxes;
+  for (size_t i = 0; i < transformed_objects.objects.size(); ++i) {
+    const auto & o = transformed_objects.objects.at(i);
+    if (!neroIsVehicle(o)) continue;
+    const auto & p = o.kinematics.pose_with_covariance.pose;
+    const tf2::Vector3 m = map_from_cloud * tf2::Vector3(p.position.x, p.position.y, p.position.z);
+    boxes.push_back(Box{
+      i, m.x(), m.y(), tf2::getYaw(p.orientation) + map_yaw, std::hypot(p.position.x, p.position.y),
+      static_cast<double>(o.existence_probability)});
+  }
+  // drop chains with a gap > 0.35 s
+  nero_mv_chains_.erase(
+    std::remove_if(
+      nero_mv_chains_.begin(), nero_mv_chains_.end(),
+      [&](const NeroMvChain & c) { return t - c.last_t > 0.35 || t - c.last_t <= 0.0; }),
+    nero_mv_chains_.end());
+  // greedy association by distance to each chain's predicted centre
+  struct Pair
+  {
+    double d;
+    size_t c, b;
+  };
+  std::vector<Pair> pairs;
+  for (size_t c = 0; c < nero_mv_chains_.size(); ++c) {
+    const auto & P = nero_mv_chains_[c].pts;
+    const auto & L = P.back();
+    double vx = 0.0, vy = 0.0;
+    if (P.size() >= 2) {
+      const auto & Q = P[P.size() - 2];
+      const double dt0 = L[0] - Q[0];
+      if (dt0 > 1e-3) {
+        vx = (L[1] - Q[1]) / dt0;
+        vy = (L[2] - Q[2]) / dt0;
+      }
+    }
+    const double dt = t - L[0];
+    const double px = L[1] + vx * dt, py = L[2] + vy * dt;
+    const double gate = 1.0 + (P.size() >= 2 ? 2.5 : nero_mv_.v_first) * dt;
+    for (size_t b = 0; b < boxes.size(); ++b) {
+      const double d = std::hypot(boxes[b].x - px, boxes[b].y - py);
+      if (d <= gate) pairs.push_back(Pair{d, c, b});
+    }
+  }
+  std::sort(pairs.begin(), pairs.end(), [](const Pair & a, const Pair & b) { return a.d < b.d; });
+  std::vector<int> chain_of(boxes.size(), -1);
+  std::vector<char> used(nero_mv_chains_.size(), 0);
+  for (const auto & pr : pairs) {
+    if (used[pr.c] || chain_of[pr.b] >= 0) continue;
+    used[pr.c] = 1;
+    chain_of[pr.b] = static_cast<int>(pr.c);
+  }
+  const size_t keep_pts = static_cast<size_t>(nero_mv_.n) + 4;
+  for (size_t b = 0; b < boxes.size(); ++b) {
+    if (chain_of[b] < 0) {
+      nero_mv_chains_.push_back(NeroMvChain{});
+      chain_of[b] = static_cast<int>(nero_mv_chains_.size() - 1);
+    }
+    auto & ch = nero_mv_chains_[static_cast<size_t>(chain_of[b])];
+    ch.pts.push_back({t, boxes[b].x, boxes[b].y, boxes[b].prob});
+    if (ch.pts.size() > keep_pts) ch.pts.erase(ch.pts.begin());
+    ch.last_t = t;
+  }
+  // the test for the dropped vehicle boxes
+  struct Pass
+  {
+    size_t idx{0};
+    double x{0.0}, y{0.0}, range{0.0}, v{0.0}, rms{0.0}, travel{0.0}, dyaw{0.0};
+    int slab{0};
+    double score{0.0};
+    int body{0};
+    // v3: road level (2nd lowest raw z around the footprint), the box bottom, points > road_h over the road, their top
+    double road{std::numeric_limits<double>::quiet_NaN()}, bottom{0.0}, ztop{-1e9};
+    double zlo1{1e9}, zlo2{1e9};
+    int nring{0}, body_road{0};
+    std::vector<float> zb;
+    std::vector<float> fx, fy, fz;  // v4: footprint points (cloud frame) for the stay test
+    double myaw{0.0};
+    double stay{-1.0};
+    std::vector<float> dp;  // research dump (NERO_VAL_MOVER_DUMP): x, y, z of every raw point in the footprint + 1.5 m
+    double cx{0.0}, cy{0.0}, yaw{0.0}, l{0.0}, w{0.0}, h{0.0};
+  };
+  std::vector<Pass> passing;
+  for (size_t b = 0; b < boxes.size(); ++b) {
+    const auto & bx = boxes[b];
+    if (keep[bx.idx] || bx.range < nero_mv_.min_range) continue;
+    const auto & P = nero_mv_chains_[static_cast<size_t>(chain_of[b])].pts;
+    if (static_cast<int>(P.size()) < nero_mv_.n) continue;
+    const size_t i0 = P.size() - static_cast<size_t>(nero_mv_.n);
+    const double t0 = P[i0][0];
+    if (t - t0 > nero_mv_.win + 1e-3) continue;
+    // least-squares line x(t), y(t) over the last n centres
+    double st = 0.0, sx = 0.0, sy = 0.0, stt = 0.0, stx = 0.0, sty = 0.0;
+    const double k = static_cast<double>(nero_mv_.n);
+    for (size_t i = i0; i < P.size(); ++i) {
+      const double u = P[i][0] - t0;
+      st += u;
+      sx += P[i][1];
+      sy += P[i][2];
+      stt += u * u;
+      stx += u * P[i][1];
+      sty += u * P[i][2];
+    }
+    const double den = k * stt - st * st;
+    if (den <= 1e-9) continue;
+    const double ax = (k * stx - st * sx) / den, bx0 = (sx - ax * st) / k;
+    const double ay = (k * sty - st * sy) / den, by0 = (sy - ay * st) / k;
+    double se = 0.0;
+    for (size_t i = i0; i < P.size(); ++i) {
+      const double u = P[i][0] - t0;
+      const double ex = bx0 + ax * u - P[i][1], ey = by0 + ay * u - P[i][2];
+      se += ex * ex + ey * ey;
+    }
+    const double rms = std::sqrt(se / k);
+    const double v = std::hypot(ax, ay);
+    const double travel = v * (t - t0);
+    if (rms > nero_mv_.rms || v < nero_mv_.vmin || travel < nero_mv_.travel) continue;
+    double dyaw = std::abs(std::remainder(bx.yaw - std::atan2(ay, ax), M_PI)) * 180.0 / M_PI;
+    if (dyaw > nero_mv_.yaw) continue;
+    const int s = slab.empty() ? 0 : slab.at(bx.idx);
+    if (s < nero_mv_.min_slab) continue;
+    double score = 0.0;
+    for (size_t i = i0; i < P.size(); ++i) score += P[i][3];
+    score /= k;
+    if (score < nero_mv_.min_score) continue;
+    Pass ps;
+    ps.idx = bx.idx;
+    ps.x = bx.x;
+    ps.y = bx.y;
+    ps.range = bx.range;
+    ps.v = v;
+    ps.rms = rms;
+    ps.travel = travel;
+    ps.dyaw = dyaw;
+    ps.slab = s;
+    ps.score = score;
+    ps.body = 0;
+    ps.myaw = bx.yaw;
+    passing.push_back(std::move(ps));
+  }
+  // v2: raw body support of the line-passing boxes (one pass over the raw cloud, a bounding-box reject first)
+  // the road features are logged with the debug switch only where the body test runs anyway (no decision changes)
+  const bool need_road =
+    nero_mv_.min_road_body > 0 || (nero_mv_.debug && (nero_mv_.min_body > 0 || nero_mv_.k_r2_body > 0.0)) ||
+    (nero_mv_.debug && neroMvDump() != nullptr && (nero_mv_.min_body > 0 || nero_mv_.k_r2_body > 0.0));
+  const bool need_body = nero_mv_.min_body > 0 || nero_mv_.k_r2_body > 0.0 || need_road;
+  constexpr double kRing = 1.5;
+  if (need_body && !passing.empty()) {
+    sensor_msgs::msg::PointCloud2::ConstSharedPtr raw;
+    {
+      std::lock_guard<std::mutex> lock(nero_raw_mutex_);
+      double best = 0.05;
+      for (const auto & c : nero_raw_) {
+        const double dtc = std::abs((rclcpp::Time(c->header.stamp) - t_obj).seconds());
+        if (dtc <= best) {
+          best = dtc;
+          raw = c;
+        }
+      }
+    }
+    int ox = -1, oy = -1, oz = -1;
+    if (raw && raw->header.frame_id == frame_id && !raw->is_bigendian) {
+      for (const auto & f : raw->fields) {
+        if (f.datatype != sensor_msgs::msg::PointField::FLOAT32 || f.count != 1) continue;
+        if (f.name == "x") ox = static_cast<int>(f.offset);
+        if (f.name == "y") oy = static_cast<int>(f.offset);
+        if (f.name == "z") oz = static_cast<int>(f.offset);
+      }
+    }
+    if (ox < 0 || oy < 0 || oz < 0) {
+      passing.clear();  // no raw cloud: no mover validation this frame
+    } else {
+      struct Foot
+      {
+        double cx, cy, c, s, hl, hw, z0, z1, r, zr0;
+      };
+      std::vector<Foot> F;
+      double bx0 = 1e9, by0 = 1e9, bx1 = -1e9, by1 = -1e9, bz0 = 1e9, bz1 = -1e9;
+      for (const auto & ps : passing) {
+        const auto & o = transformed_objects.objects.at(ps.idx);
+        const auto & p = o.kinematics.pose_with_covariance.pose;
+        const double yaw = tf2::getYaw(p.orientation);
+        const double bottom = p.position.z - 0.5 * o.shape.dimensions.z;
+        Foot f{p.position.x, p.position.y, std::cos(yaw), std::sin(yaw), 0.5 * std::max(0.5, o.shape.dimensions.x),
+               0.5 * std::max(0.5, o.shape.dimensions.y), bottom + 0.25, bottom + o.shape.dimensions.z + 0.5, 0.0,
+               bottom - 1.5};
+        f.r = std::hypot(f.hl, f.hw) + (need_road ? kRing : 0.0);
+        passing[F.size()].bottom = bottom;
+        passing[F.size()].cx = f.cx;
+        passing[F.size()].cy = f.cy;
+        passing[F.size()].yaw = yaw;
+        passing[F.size()].l = 2.0 * f.hl;
+        passing[F.size()].w = 2.0 * f.hw;
+        passing[F.size()].h = o.shape.dimensions.z;
+        bx0 = std::min(bx0, f.cx - f.r);
+        bx1 = std::max(bx1, f.cx + f.r);
+        by0 = std::min(by0, f.cy - f.r);
+        by1 = std::max(by1, f.cy + f.r);
+        bz0 = std::min(bz0, need_road ? f.zr0 : f.z0);
+        bz1 = std::max(bz1, f.z1);
+        F.push_back(f);
+      }
+      const uint8_t * data = raw->data.data();
+      for (uint32_t row = 0; row < raw->height; ++row) {
+        const uint8_t * q = data + static_cast<size_t>(row) * raw->row_step;
+        for (uint32_t col = 0; col < raw->width; ++col, q += raw->point_step) {
+          float x, y, z;
+          std::memcpy(&x, q + ox, sizeof(float));
+          if (x < bx0 || x > bx1) continue;
+          std::memcpy(&y, q + oy, sizeof(float));
+          if (y < by0 || y > by1) continue;
+          std::memcpy(&z, q + oz, sizeof(float));
+          if (z <= bz0 || z > bz1) continue;
+          for (size_t j = 0; j < F.size(); ++j) {
+            const auto & f = F[j];
+            if (z <= (need_road ? f.zr0 : f.z0) || z > f.z1) continue;
+            const double dx = x - f.cx, dy = y - f.cy;
+            if (std::abs(dx) > f.r || std::abs(dy) > f.r) continue;
+            const double u = std::abs(f.c * dx + f.s * dy), w = std::abs(-f.s * dx + f.c * dy);
+            const bool in_fp = u <= f.hl && w <= f.hw;
+            if (in_fp && z > f.z0) passing[j].body++;
+            if (!need_road) continue;
+            if (u <= f.hl + kRing && w <= f.hw + kRing) {
+              auto & ps = passing[j];
+              ps.nring++;
+              if (neroMvDump()) {
+                ps.dp.push_back(x);
+                ps.dp.push_back(y);
+                ps.dp.push_back(z);
+              }
+              if (z < ps.zlo1) {
+                ps.zlo2 = ps.zlo1;
+                ps.zlo1 = z;
+              } else if (z < ps.zlo2) {
+                ps.zlo2 = z;
+              }
+            }
+            if (in_fp) {
+              passing[j].zb.push_back(z);
+              if (nero_mv_.max_stay < 1.0) {
+                passing[j].fx.push_back(x);
+                passing[j].fy.push_back(y);
+                passing[j].fz.push_back(z);
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  if (need_road) {
+    for (auto & ps : passing) {
+      if (ps.nring >= 2) ps.road = ps.zlo2;
+      if (!std::isfinite(ps.road)) continue;
+      for (const float z : ps.zb) {
+        if (z > ps.road + nero_mv_.road_h) {
+          ps.body_road++;
+          ps.ztop = std::max(ps.ztop, static_cast<double>(z));
+        }
+      }
+    }
+  }
+  // v4 stay: the standing body points NOW vs the standing raw points ~0.3 s earlier (both in the map frame)
+  if (need_road && nero_mv_.max_stay < 1.0 && !passing.empty()) {
+    sensor_msgs::msg::PointCloud2::ConstSharedPtr old;
+    {
+      std::lock_guard<std::mutex> lock(nero_raw_mutex_);
+      double best = 1e9;
+      for (const auto & cc : nero_raw_) {
+        const double age = (t_obj - rclcpp::Time(cc->header.stamp)).seconds();
+        if (age >= 0.15 && age <= 0.5 && std::abs(age - 0.3) < best) {
+          best = std::abs(age - 0.3);
+          old = cc;
+        }
+      }
+    }
+    tf2::Transform map_from_old;
+    bool have_old = false;
+    if (old && old->header.frame_id == frame_id && !old->is_bigendian) {
+      try {
+        const auto tfo = tf_buffer_.lookupTransform("map", frame_id, old->header.stamp, rclcpp::Duration::from_seconds(0.0));
+        tf2::fromMsg(tfo.transform, map_from_old);
+        have_old = true;
+      } catch (const tf2::TransformException &) {
+      }
+    }
+    int qx = -1, qy = -1, qz = -1;
+    if (have_old) {
+      for (const auto & fl : old->fields) {
+        if (fl.datatype != sensor_msgs::msg::PointField::FLOAT32 || fl.count != 1) continue;
+        if (fl.name == "x") qx = static_cast<int>(fl.offset);
+        if (fl.name == "y") qy = static_cast<int>(fl.offset);
+        if (fl.name == "z") qz = static_cast<int>(fl.offset);
+      }
+    }
+    if (have_old && qx >= 0 && qy >= 0 && qz >= 0) {
+      // each box's region in the OLD cloud's frame: its centre (map) moved into the old frame, radius half-diagonal + 0.5 m
+      const tf2::Transform old_from_map = map_from_old.inverse();
+      struct Reg
+      {
+        double ox, oy, r;
+        std::vector<float> qx, qy;  // standing old points near the box, map frame
+      };
+      std::vector<Reg> R(passing.size());
+      for (size_t j = 0; j < passing.size(); ++j) {
+        // at the ego's own map height (the map z is the real altitude: z = 0 would shift the region by altitude x pitch)
+        const tf2::Vector3 oc = old_from_map * tf2::Vector3(passing[j].x, passing[j].y, map_from_old.getOrigin().z());
+        R[j].ox = oc.x();
+        R[j].oy = oc.y();
+        R[j].r = std::hypot(passing[j].l, passing[j].w) / 2.0 + 0.5;
+      }
+      const uint8_t * od = old->data.data();
+      for (uint32_t row = 0; row < old->height; ++row) {
+        const uint8_t * q = od + static_cast<size_t>(row) * old->row_step;
+        for (uint32_t col = 0; col < old->width; ++col, q += old->point_step) {
+          float x, y, z;
+          std::memcpy(&x, q + qx, sizeof(float));
+          std::memcpy(&y, q + qy, sizeof(float));
+          for (size_t j = 0; j < passing.size(); ++j) {
+            auto & rg = R[j];
+            if (std::abs(x - rg.ox) > rg.r || std::abs(y - rg.oy) > rg.r) continue;
+            const auto & ps = passing[j];
+            if (!std::isfinite(ps.road)) continue;
+            std::memcpy(&z, q + qz, sizeof(float));
+            if (z <= ps.road + nero_mv_.road_h) continue;
+            const tf2::Vector3 m = map_from_old * tf2::Vector3(x, y, z);
+            rg.qx.push_back(static_cast<float>(m.x()));
+            rg.qy.push_back(static_cast<float>(m.y()));
+          }
+        }
+      }
+      for (size_t j = 0; j < passing.size(); ++j) {
+        auto & ps = passing[j];
+        if (!std::isfinite(ps.road)) continue;
+        int nb = 0, nst = 0;
+        for (size_t i = 0; i < ps.fz.size(); ++i) {
+          if (ps.fz[i] <= ps.road + nero_mv_.road_h) continue;
+          ++nb;
+          const tf2::Vector3 m = map_from_cloud * tf2::Vector3(ps.fx[i], ps.fy[i], ps.fz[i]);
+          for (size_t k = 0; k < R[j].qx.size(); ++k) {
+            const double dx = m.x() - R[j].qx[k], dy = m.y() - R[j].qy[k];
+            if (dx * dx + dy * dy < 0.0625) {
+              ++nst;
+              break;
+            }
+          }
+        }
+        if (nb > 0) ps.stay = static_cast<double>(nst) / nb;
+      }
+    }
+  }
+  if (FILE * df = neroMvDump(); df && nero_mv_.debug) {
+    for (const auto & ps : passing) {
+      const double need = std::max(
+        static_cast<double>(nero_mv_.min_body), nero_mv_.k_r2_body / std::max(1.0, ps.range * ps.range));
+      const int dec = (need_body && static_cast<double>(ps.body) < need) ? 2
+                      : (nero_mv_.min_road_body > 0 && ps.body_road < nero_mv_.min_road_body) ? 3 : 1;
+      std::fprintf(
+        df, "P %.3f %.2f %.2f %.1f %.2f %.2f %d %d %.3f %.3f %.4f %.2f %.2f %.2f %.3f %.3f %d %zu", t, ps.x, ps.y, ps.range,
+        ps.v, ps.score, ps.body, dec, ps.cx, ps.cy, ps.yaw, ps.l, ps.w, ps.h, ps.bottom, ps.road, ps.body_road,
+        ps.dp.size() / 3);
+      for (const float v : ps.dp) std::fprintf(df, " %.3f", v);
+      std::fprintf(df, "\n");
+      // the raw cloud ~0.3 s earlier (nero_raw_ keeps 6), points within a generous disc around the box (base_link of THAT cloud;
+      // the reader moves both clouds to the map with the window's EKF pose): "the place it left is empty" offline
+      sensor_msgs::msg::PointCloud2::ConstSharedPtr old;
+      {
+        std::lock_guard<std::mutex> lock(nero_raw_mutex_);
+        double best = 1e9;
+        for (const auto & cc : nero_raw_) {
+          const double age = (t_obj - rclcpp::Time(cc->header.stamp)).seconds();
+          if (age >= 0.15 && std::abs(age - 0.3) < best) {
+            best = std::abs(age - 0.3);
+            old = cc;
+          }
+        }
+      }
+      if (old && old->header.frame_id == frame_id && !old->is_bigendian) {
+        int qx = -1, qy = -1, qz = -1;
+        for (const auto & fl : old->fields) {
+          if (fl.datatype != sensor_msgs::msg::PointField::FLOAT32 || fl.count != 1) continue;
+          if (fl.name == "x") qx = static_cast<int>(fl.offset);
+          if (fl.name == "y") qy = static_cast<int>(fl.offset);
+          if (fl.name == "z") qz = static_cast<int>(fl.offset);
+        }
+        if (qx >= 0 && qy >= 0 && qz >= 0) {
+          const double rad = std::hypot(ps.l, ps.w) / 2.0 + std::abs(ps.v) * 0.4 + 6.0;
+          std::vector<float> op;
+          const uint8_t * od = old->data.data();
+          for (uint32_t row = 0; row < old->height; ++row) {
+            const uint8_t * q = od + static_cast<size_t>(row) * old->row_step;
+            for (uint32_t col = 0; col < old->width; ++col, q += old->point_step) {
+              float x, y, z;
+              std::memcpy(&x, q + qx, sizeof(float));
+              std::memcpy(&y, q + qy, sizeof(float));
+              if (std::abs(x - ps.cx) > rad || std::abs(y - ps.cy) > rad) continue;
+              std::memcpy(&z, q + qz, sizeof(float));
+              if (z < ps.bottom - 1.5 || z > ps.bottom + ps.h + 0.5) continue;
+              op.push_back(x);
+              op.push_back(y);
+              op.push_back(z);
+            }
+          }
+          std::fprintf(df, "O %.3f %zu", rclcpp::Time(old->header.stamp).seconds(), op.size() / 3);
+          for (const float v : op) std::fprintf(df, " %.3f", v);
+          std::fprintf(df, "\n");
+        }
+      }
+    }
+    std::fflush(df);
+  }
+  for (const auto & ps : passing) {
+    if (need_body) {
+      const double need = std::max(
+        static_cast<double>(nero_mv_.min_body), nero_mv_.k_r2_body / std::max(1.0, ps.range * ps.range));
+      if (static_cast<double>(ps.body) < need) continue;
+    }
+    if (nero_mv_.min_road_body > 0 && ps.body_road < nero_mv_.min_road_body) {
+      if (nero_mv_.debug) {
+        RCLCPP_INFO(
+          get_logger(),
+          "[NERO_VAL_MOVER] reject_road t %.3f map (%.2f, %.2f) range %.1f v %.2f score %.2f body %d road %.2f bottom %.2f "
+          "nring %d body_road %d htop %.2f",
+          t, ps.x, ps.y, ps.range, ps.v, ps.score, ps.body, ps.road, ps.bottom, ps.nring, ps.body_road, ps.ztop - ps.road);
+      }
+      continue;
+    }
+    if (nero_mv_.max_stay < 1.0 && ps.stay >= nero_mv_.max_stay) {
+      if (nero_mv_.debug) {
+        RCLCPP_INFO(
+          get_logger(), "[NERO_VAL_MOVER] reject_stay t %.3f map (%.2f, %.2f) range %.1f v %.2f body_road %d stay %.2f", t, ps.x,
+          ps.y, ps.range, ps.v, ps.body_road, ps.stay);
+      }
+      continue;
+    }
+    if (nero_mv_.twin_m > 0.0) {
+      bool twin = false;
+      for (const auto & ob : boxes) {
+        if (ob.idx == ps.idx || !keep[ob.idx]) continue;
+        const double d = std::hypot(ob.x - ps.x, ob.y - ps.y);
+        double dy = std::fmod(std::abs(ob.yaw - ps.myaw), M_PI);
+        dy = std::min(dy, M_PI - dy);
+        // realize-8 field 17: a twin is a second box on the SAME vehicle (overlapping across the kept box's heading);
+        // boxes 2.5-4.5 m to its side were all cars in the next lane (cL: 72 of 72 twin rejects)
+        const double lat = std::abs(-(ps.x - ob.x) * std::sin(ob.yaw) + (ps.y - ob.y) * std::cos(ob.yaw));
+        if (
+          d > 0.5 && d < nero_mv_.twin_m && dy < 30.0 * M_PI / 180.0 &&
+          (nero_mv_.twin_lat <= 0.0 || lat < nero_mv_.twin_lat)) {
+          twin = true;
+          break;
+        }
+      }
+      if (twin) {
+        if (nero_mv_.debug) {
+          RCLCPP_INFO(
+            get_logger(), "[NERO_VAL_MOVER] reject_twin t %.3f map (%.2f, %.2f) range %.1f v %.2f", t, ps.x, ps.y, ps.range, ps.v);
+        }
+        continue;
+      }
+    }
+    keep[ps.idx] = 1;
+    nero_mv_count_[neroBand(ps.range)]++;
+    if (nero_mv_.debug) {
+      RCLCPP_INFO(
+        get_logger(),
+        "[NERO_VAL_MOVER] pass t %.3f map (%.2f, %.2f) range %.1f v %.2f rms %.3f travel %.2f dyaw %.1f slab %d "
+        "score %.2f body %d road %.2f bottom %.2f nring %d body_road %d htop %.2f stay %.2f",
+        t, ps.x, ps.y, ps.range, ps.v, ps.rms, ps.travel, ps.dyaw, ps.slab, ps.score, ps.body, ps.road, ps.bottom,
+        ps.nring, ps.body_road, ps.ztop - ps.road, ps.stay);
+    }
+  }
+}
+void ObstaclePointCloudBasedValidator::neroPedPass(
+  const autoware_perception_msgs::msg::DetectedObjects & transformed_objects, std::vector<char> & keep,
+  const builtin_interfaces::msg::Time & stamp, const std::string & frame_id)
+{
+  // [nero 2026-11-04 REALIZE-7] NERO_VAL_PED (see the header): chain this frame's people boxes (map frame) onto the chains
+  // of the previous frames (r5/valped common.py chains()), then rule R5 for each dropped people box
+  using Label = autoware_perception_msgs::msg::ObjectClassification;
+  const rclcpp::Time t_obj(stamp);
+  const double t = t_obj.seconds();
+  // chains whose last box is > 0.35 s old end (and every chain when the stamp went back)
+  nero_ped_chains_.erase(
+    std::remove_if(
+      nero_ped_chains_.begin(), nero_ped_chains_.end(),
+      [&](const NeroPedChain & c) { return t - c.last_t > 0.35 || t - c.last_t <= 0.0; }),
+    nero_ped_chains_.end());
+  std::vector<size_t> people;
+  for (size_t i = 0; i < transformed_objects.objects.size(); ++i) {
+    const auto & o = transformed_objects.objects.at(i);
+    if (o.classification.empty()) continue;
+    const auto label = o.classification.front().label;
+    if (label == Label::PEDESTRIAN || label == Label::BICYCLE) people.push_back(i);
+  }
+  if (people.empty()) return;
+  tf2::Transform map_from_cloud;
+  try {
+    const auto tf = tf_buffer_.lookupTransform("map", frame_id, t_obj, rclcpp::Duration::from_seconds(0.0));
+    tf2::fromMsg(tf.transform, map_from_cloud);
+  } catch (const tf2::TransformException &) {
+    RCLCPP_WARN_THROTTLE(
+      get_logger(), *get_clock(), 5000, "[NERO_VAL_PED] no map tf at the objects' stamp: no people validation this frame");
+    return;
+  }
+  struct Box
+  {
+    size_t idx;
+    double x, y;
+  };
+  std::vector<Box> boxes;
+  for (const auto i : people) {
+    const auto & p = transformed_objects.objects.at(i).kinematics.pose_with_covariance.pose;
+    const tf2::Vector3 m = map_from_cloud * tf2::Vector3(p.position.x, p.position.y, p.position.z);
+    boxes.push_back(Box{i, m.x(), m.y()});
+  }
+  // greedy association by distance to each chain's predicted centre (ties: chain, then box order, as common.py)
+  struct Pair
+  {
+    double d;
+    size_t c, b;
+  };
+  std::vector<Pair> pairs;
+  for (size_t c = 0; c < nero_ped_chains_.size(); ++c) {
+    const auto & P = nero_ped_chains_[c].pts;
+    const auto & L = P.back();
+    double vx = 0.0, vy = 0.0;
+    if (P.size() >= 2) {
+      const auto & Q = P[P.size() - 2];
+      const double dt0 = L[0] - Q[0];
+      if (dt0 > 1e-3) {
+        vx = (L[1] - Q[1]) / dt0;
+        vy = (L[2] - Q[2]) / dt0;
+      }
+    }
+    const double dt = t - L[0];
+    const double px = L[1] + vx * dt, py = L[2] + vy * dt;
+    const double gate = 1.0 + 2.5 * dt;
+    for (size_t b = 0; b < boxes.size(); ++b) {
+      const double d = std::hypot(boxes[b].x - px, boxes[b].y - py);
+      if (d <= gate) pairs.push_back(Pair{d, c, b});
+    }
+  }
+  std::sort(pairs.begin(), pairs.end(), [](const Pair & a, const Pair & b) {
+    return a.d < b.d || (a.d == b.d && (a.c < b.c || (a.c == b.c && a.b < b.b)));
+  });
+  std::vector<int> chain_of(boxes.size(), -1);
+  std::vector<char> used(nero_ped_chains_.size(), 0);
+  for (const auto & pr : pairs) {
+    if (used[pr.c] || chain_of[pr.b] >= 0) continue;
+    used[pr.c] = 1;
+    chain_of[pr.b] = static_cast<int>(pr.c);
+  }
+  // history: the longer test window + a margin, at least 2 s (the last two boxes always stay: the prediction)
+  const double hist = std::max(2.0, std::max(nero_ped_.w_move, nero_ped_.w_stand) + 0.1);
+  for (size_t b = 0; b < boxes.size(); ++b) {
+    if (chain_of[b] < 0) {
+      nero_ped_chains_.push_back(NeroPedChain{});
+      chain_of[b] = static_cast<int>(nero_ped_chains_.size() - 1);
+    }
+    auto & ch = nero_ped_chains_[static_cast<size_t>(chain_of[b])];
+    ch.pts.push_back({t, boxes[b].x, boxes[b].y});
+    ch.total++;
+    ch.last_t = t;
+    size_t old = 0;
+    while (old + 2 < ch.pts.size() && ch.pts[old][0] < t - hist) ++old;
+    if (old > 0) ch.pts.erase(ch.pts.begin(), ch.pts.begin() + static_cast<std::ptrdiff_t>(old));
+  }
+  // the dropped people boxes (the car's verdict after every other rule)
+  std::vector<size_t> cand;
+  for (size_t b = 0; b < boxes.size(); ++b) {
+    if (!keep[boxes[b].idx]) cand.push_back(b);
+  }
+  if (cand.empty()) return;
+  sensor_msgs::msg::PointCloud2::ConstSharedPtr raw;
+  {
+    std::lock_guard<std::mutex> lock(nero_raw_mutex_);
+    double best = 0.05;
+    for (const auto & c : nero_raw_) {
+      const double dtc = std::abs((rclcpp::Time(c->header.stamp) - t_obj).seconds());
+      if (dtc <= best) {
+        best = dtc;
+        raw = c;
+      }
+    }
+  }
+  int ox = -1, oy = -1, oz = -1;
+  if (raw && raw->header.frame_id == frame_id && !raw->is_bigendian && raw->width * raw->height > 0) {
+    for (const auto & f : raw->fields) {
+      if (f.datatype != sensor_msgs::msg::PointField::FLOAT32 || f.count != 1) continue;
+      if (f.name == "x") ox = static_cast<int>(f.offset);
+      if (f.name == "y") oy = static_cast<int>(f.offset);
+      if (f.name == "z") oz = static_cast<int>(f.offset);
+    }
+  }
+  if (ox < 0 || oy < 0 || oz < 0) {
+    RCLCPP_WARN_THROTTLE(
+      get_logger(), *get_clock(), 5000,
+      "[NERO_VAL_PED] no raw cloud (float32 x / y / z) for the objects' stamp in frame '%s' (%s): no people validation "
+      "this frame",
+      frame_id.c_str(), raw ? raw->header.frame_id.c_str() : "none");
+    return;
+  }
+  // raw body features per candidate (common.py body_feats): box frame u along its yaw, v across, z over its bottom
+  constexpr double kPad = 0.15, kLo = 0.3, kHi = 1.9;
+  struct Feat
+  {
+    size_t b;
+    double cx, cy, c, s, hl, hw, bottom, r, range;
+    int nb{0}, nb_w{0}, over{0};
+    double zmin{1e9}, zmax{-1e9};
+  };
+  std::vector<Feat> F;
+  const double pad_max = std::max(kPad, nero_ped_.iso_pad);
+  const double zr0 = std::min(kLo, nero_ped_.over_lo), zr1 = std::max(kHi, nero_ped_.over_hi);
+  double zmin = 1e9, zmax = -1e9;
+  for (const auto b : cand) {
+    const auto & o = transformed_objects.objects.at(boxes[b].idx);
+    const auto & p = o.kinematics.pose_with_covariance.pose;
+    const double yaw = tf2::getYaw(p.orientation);
+    Feat f;
+    f.b = b;
+    f.cx = p.position.x;
+    f.cy = p.position.y;
+    f.c = std::cos(yaw);
+    f.s = std::sin(yaw);
+    f.hl = 0.5 * o.shape.dimensions.x;
+    f.hw = 0.5 * o.shape.dimensions.y;
+    f.bottom = p.position.z - 0.5 * o.shape.dimensions.z;
+    f.r = std::hypot(f.hl + pad_max, f.hw + pad_max);
+    f.range = std::hypot(p.position.x, p.position.y);
+    zmin = std::min(zmin, f.bottom + zr0);
+    zmax = std::max(zmax, f.bottom + zr1);
+    F.push_back(f);
+  }
+  // a 2 m grid over the candidates' squares (as neroBodyEvidence): each candidate listed in every cell its square touches
+  // plus one around it
+  constexpr double kCell = 2.0;
+  double gx0 = 1e9, gy0 = 1e9, gx1 = -1e9, gy1 = -1e9;
+  for (const auto & f : F) {
+    gx0 = std::min(gx0, f.cx - f.r - kCell);
+    gy0 = std::min(gy0, f.cy - f.r - kCell);
+    gx1 = std::max(gx1, f.cx + f.r + kCell);
+    gy1 = std::max(gy1, f.cy + f.r + kCell);
+  }
+  const int nx = static_cast<int>(std::floor((gx1 - gx0) / kCell)) + 1;
+  const int ny = static_cast<int>(std::floor((gy1 - gy0) / kCell)) + 1;
+  std::vector<int> cell_start(static_cast<size_t>(nx) * ny + 1, 0);
+  auto cell_span = [&](const Feat & f, int & ix0, int & ix1, int & iy0, int & iy1) {
+    ix0 = std::max(0, static_cast<int>(std::floor((f.cx - f.r - gx0) / kCell)) - 1);
+    ix1 = std::min(nx - 1, static_cast<int>(std::floor((f.cx + f.r - gx0) / kCell)) + 1);
+    iy0 = std::max(0, static_cast<int>(std::floor((f.cy - f.r - gy0) / kCell)) - 1);
+    iy1 = std::min(ny - 1, static_cast<int>(std::floor((f.cy + f.r - gy0) / kCell)) + 1);
+  };
+  for (const auto & f : F) {
+    int ix0, ix1, iy0, iy1;
+    cell_span(f, ix0, ix1, iy0, iy1);
+    for (int j = iy0; j <= iy1; ++j)
+      for (int i = ix0; i <= ix1; ++i) cell_start[static_cast<size_t>(j) * nx + i + 1]++;
+  }
+  for (size_t k = 1; k < cell_start.size(); ++k) cell_start[k] += cell_start[k - 1];
+  std::vector<int> cell_items(static_cast<size_t>(cell_start.back()));
+  std::vector<int> cell_fill(cell_start.begin(), cell_start.end() - 1);
+  for (size_t k = 0; k < F.size(); ++k) {
+    int ix0, ix1, iy0, iy1;
+    cell_span(F[k], ix0, ix1, iy0, iy1);
+    for (int j = iy0; j <= iy1; ++j)
+      for (int i = ix0; i <= ix1; ++i) cell_items[cell_fill[static_cast<size_t>(j) * nx + i]++] = static_cast<int>(k);
+  }
+  const uint8_t * data = raw->data.data();
+  for (uint32_t row = 0; row < raw->height; ++row) {
+    const uint8_t * q = data + static_cast<size_t>(row) * raw->row_step;
+    for (uint32_t col = 0; col < raw->width; ++col, q += raw->point_step) {
+      float x, y, z;
+      std::memcpy(&z, q + oz, sizeof(float));
+      if (!(z > zmin && z <= zmax)) continue;
+      std::memcpy(&x, q + ox, sizeof(float));
+      std::memcpy(&y, q + oy, sizeof(float));
+      const double fx = std::floor((x - gx0) / kCell), fy = std::floor((y - gy0) / kCell);
+      if (!(fx >= 0.0 && fx < nx && fy >= 0.0 && fy < ny)) continue;
+      const size_t cell = static_cast<size_t>(fy) * nx + static_cast<size_t>(fx);
+      for (int e = cell_start[cell]; e < cell_start[cell + 1]; ++e) {
+        auto & f = F[static_cast<size_t>(cell_items[static_cast<size_t>(e)])];
+        const double zr = z - f.bottom;
+        const bool body_z = zr > kLo && zr <= kHi;
+        const bool over_z = zr > nero_ped_.over_lo && zr <= nero_ped_.over_hi;
+        if (!body_z && !over_z) continue;
+        const double dx = x - f.cx, dy = y - f.cy;
+        if (std::abs(dx) > f.r || std::abs(dy) > f.r) continue;
+        const double u = std::abs(f.c * dx + f.s * dy), w = std::abs(-f.s * dx + f.c * dy);
+        const bool in_fp = u <= f.hl + kPad && w <= f.hw + kPad;
+        if (body_z) {
+          if (in_fp) {
+            f.nb++;
+            f.zmin = std::min(f.zmin, zr);
+            f.zmax = std::max(f.zmax, zr);
+          }
+          if (u <= f.hl + nero_ped_.iso_pad && w <= f.hw + nero_ped_.iso_pad) f.nb_w++;
+        }
+        if (over_z && in_fp) f.over++;
+      }
+    }
+  }
+  // rule R5 per candidate (r5/valped evaluate.py): R1 AND (moving OR (standing AND over == 0 AND iso))
+  for (const auto & f : F) {
+    const auto & bx = boxes[f.b];
+    const auto & ch = nero_ped_chains_[static_cast<size_t>(chain_of[f.b])];
+    const auto & P = ch.pts;  // time-ascending, its last entry this frame's box
+    const double ext = f.nb > 0 ? f.zmax - f.zmin : 0.0;
+    const double need = std::max(static_cast<double>(nero_ped_.min_body), nero_ped_.k_r2 / std::max(1.0, f.range * f.range));
+    const bool r1 = static_cast<double>(f.nb) >= need && ext >= nero_ped_.min_ext;
+    const bool iso =
+      static_cast<double>(f.nb_w - f.nb) <= std::max(nero_ped_.iso_abs, nero_ped_.iso_rel * static_cast<double>(f.nb));
+    // moving (common.py line_test): least-squares lines x(t), y(t) over the chain's boxes within the last w_move s
+    size_t i0 = P.size();
+    while (i0 > 0 && t - P[i0 - 1][0] <= nero_ped_.w_move + 1e-3) --i0;
+    const size_t n_mv = P.size() - i0;
+    bool mov = false;
+    double v = 0.0, rms = 9.0;  // no line (< 2 boxes): common.py's sentinels
+    if (n_mv >= 2 && P.back()[0] - P[i0][0] > 1e-3) {
+      const double t0 = P[i0][0];
+      double st = 0.0, sx = 0.0, sy = 0.0, stt = 0.0, stx = 0.0, sty = 0.0;
+      const double k = static_cast<double>(n_mv);
+      for (size_t i = i0; i < P.size(); ++i) {
+        const double u = P[i][0] - t0;
+        st += u;
+        sx += P[i][1];
+        sy += P[i][2];
+        stt += u * u;
+        stx += u * P[i][1];
+        sty += u * P[i][2];
+      }
+      const double den = k * stt - st * st;
+      if (den > 1e-12) {
+        const double ax = (k * stx - st * sx) / den, bx0 = (sx - ax * st) / k;
+        const double ay = (k * sty - st * sy) / den, by0 = (sy - ay * st) / k;
+        double se = 0.0;
+        for (size_t i = i0; i < P.size(); ++i) {
+          const double u = P[i][0] - t0;
+          const double ex = bx0 + ax * u - P[i][1], ey = by0 + ay * u - P[i][2];
+          se += ex * ex + ey * ey;
+        }
+        rms = std::sqrt(se / k);
+        v = std::hypot(ax, ay);
+        const double travel = v * (P.back()[0] - t0);
+        mov = static_cast<int>(n_mv) >= nero_ped_.n_move && rms <= nero_ped_.rms && v >= nero_ped_.v_move &&
+              travel >= nero_ped_.min_travel;
+      }
+    }
+    // standing (common.py standing_test): >= n_stand boxes within the last w_stand s, pairwise within d_stand
+    size_t j0 = P.size();
+    while (j0 > 0 && t - P[j0 - 1][0] <= nero_ped_.w_stand + 1e-3) --j0;
+    bool stand = false;
+    if (static_cast<int>(P.size() - j0) >= nero_ped_.n_stand) {
+      const double d2 = nero_ped_.d_stand * nero_ped_.d_stand;
+      stand = true;
+      for (size_t a = j0; a < P.size() && stand; ++a) {
+        for (size_t c = a + 1; c < P.size(); ++c) {
+          const double dx = P[a][1] - P[c][1], dy = P[a][2] - P[c][2];
+          if (dx * dx + dy * dy > d2) {
+            stand = false;
+            break;
+          }
+        }
+      }
+    }
+    const bool pass = r1 && (mov || (stand && f.over == 0 && iso));
+    if (pass) {
+      keep[bx.idx] = 1;
+      nero_ped_count_[neroBand(f.range)]++;
+    }
+    if (nero_ped_.debug) {
+      RCLCPP_INFO(
+        get_logger(),
+        "[NERO_VAL_PED] %s t %.3f map (%.2f, %.2f) range %.1f lbl %d nb %d ext %.2f over %d nb_w %d chain %zu mov %d v %.2f "
+        "rms %.3f stand %d",
+        pass ? "keep" : "reject", t, bx.x, bx.y, f.range,
+        static_cast<int>(transformed_objects.objects.at(bx.idx).classification.front().label), f.nb, ext, f.over, f.nb_w,
+        ch.total, mov ? 1 : 0, v, rms, stand ? 1 : 0);
+    }
+  }
+}
+
 void ObstaclePointCloudBasedValidator::onObjectsAndObstaclePointCloud(
   const autoware_perception_msgs::msg::DetectedObjects::ConstSharedPtr & input_objects,
   const sensor_msgs::msg::PointCloud2::ConstSharedPtr & input_obstacle_pointcloud)
@@ -730,13 +1682,14 @@ void ObstaclePointCloudBasedValidator::onObjectsAndObstaclePointCloud(
       }
     }
   }
+  std::vector<int> nero_slab(nero_mv_.on ? transformed_objects.objects.size() : 0, 0);
   if (nero_body_.on) {
     const auto t_start = std::chrono::steady_clock::now();
     std::vector<char> body(transformed_objects.objects.size(), 0);
     if (!nero_candidates.empty()) {
       neroBodyEvidence(
         transformed_objects, nero_candidates, body, input_objects->header.stamp,
-        input_obstacle_pointcloud->header.frame_id);
+        input_obstacle_pointcloud->header.frame_id, nero_mv_.on ? &nero_slab : nullptr);
     }
     auto range_of = [&](const size_t i) {
       const auto & q = transformed_objects.objects.at(i).kinematics.pose_with_covariance.pose.position;
@@ -818,6 +1771,24 @@ void ObstaclePointCloudBasedValidator::onObjectsAndObstaclePointCloud(
           .count());
     }
   }
+  if (nero_mv_.on) {
+    const auto t_mv = std::chrono::steady_clock::now();
+    neroMoverPass(
+      transformed_objects, keep, nero_slab, input_objects->header.stamp,
+      input_obstacle_pointcloud->header.frame_id);
+    debug_publisher_->publish<autoware_internal_debug_msgs::msg::Float64Stamped>(
+      "debug/nero_mover_ms",
+      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_mv).count());
+  }
+  if (nero_ped_.on) {
+    // [nero 2026-11-04 REALIZE-7] NERO_VAL_PED: after every other rule (only the people boxes still dropped)
+    const auto t_ped = std::chrono::steady_clock::now();
+    neroPedPass(
+      transformed_objects, keep, input_objects->header.stamp, input_obstacle_pointcloud->header.frame_id);
+    debug_publisher_->publish<autoware_internal_debug_msgs::msg::Float64Stamped>(
+      "debug/nero_ped_ms",
+      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_ped).count());
+  }
   if (nero_body_.on && (this->get_clock()->now() - nero_last_log_).seconds() > 10.0) {
     nero_last_log_ = this->get_clock()->now();
     std::stringstream ss;
@@ -826,6 +1797,8 @@ void ObstaclePointCloudBasedValidator::onObjectsAndObstaclePointCloud(
       ss << " " << bands[b] << "m " << nero_count_[b][0] << "/" << nero_count_[b][1] << "/"
          << nero_count_[b][2] << "/" << nero_count_[b][3];
       if (nero_body_.persist_frames > 0) ss << "/" << nero_count_[b][4] << "/" << nero_count_[b][5];
+      if (nero_mv_.on) ss << " mover " << nero_mv_count_[b];
+      if (nero_ped_.on) ss << " ped " << nero_ped_count_[b];
     }
     RCLCPP_INFO(
       get_logger(),

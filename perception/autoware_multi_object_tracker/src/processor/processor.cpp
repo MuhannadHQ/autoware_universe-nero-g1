@@ -68,6 +68,27 @@ TrackerProcessor::TrackerProcessor(
       nero_rebirth_.min_count, nero_rebirth_.margin, nero_rebirth_.max_dist,
       nero_rebirth_.max_pred_speed);
   }
+  if (const char * env = std::getenv("NERO_MOT_FAST_BIRTH"); env != nullptr && env[0] != '\0') {
+    double v[8] = {2.0, 0.15, 0.0, 0.0, 180.0, -1.0, 1e9, 2.0};
+    std::sscanf(
+      env, "%lf,%lf,%lf,%lf,%lf,%lf,%lf,%lf", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5], &v[6], &v[7]);
+    nero_fast_birth_.iso_m = v[5];
+    nero_fast_birth_.far_m = v[6];
+    nero_fast_birth_.far_frames = std::max(1, static_cast<int>(v[7]));
+    nero_fast_birth_.vmin = v[3];
+    nero_fast_birth_.yaw_deg = v[4];
+    nero_fast_birth_.on = true;
+    nero_fast_birth_.frames = std::max(1, static_cast<int>(v[0]));
+    nero_fast_birth_.max_gap = v[1];
+    nero_fast_birth_.min_prob = v[2];
+    RCLCPP_INFO(
+      rclcpp::get_logger("multi_object_tracker"),
+      "[NERO_MOT_FAST_BIRTH] vehicle tracks published from %d distinct detection frames (last within %.2f s, "
+      "existence >= %.2f, measured boxes moving >= %.1f m/s within %.0f deg of their heading, no published vehicle "
+      "within half lengths + %.1f m, %d frames from %.0f m) before the stock count",
+      nero_fast_birth_.frames, nero_fast_birth_.max_gap, nero_fast_birth_.min_prob, nero_fast_birth_.vmin,
+      nero_fast_birth_.yaw_deg, nero_fast_birth_.iso_m, nero_fast_birth_.far_frames, nero_fast_birth_.far_m);
+  }
   if (const char * env = std::getenv("NERO_MOT_DUP_FRESH"); env != nullptr && env[0] != '\0') {
     nero_dup_fresh_ = std::atof(env);
     RCLCPP_INFO(
@@ -784,6 +805,54 @@ bool TrackerProcessor::isConfidentTracker(const std::shared_ptr<Tracker> & track
   return tracker->getTotalMeasurementCount() >= config_.confident_count_threshold.at(label);
 }
 
+// NERO_MOT_FAST_BIRTH: a not yet confident vehicle track measured at enough distinct detection frames, still measured
+bool TrackerProcessor::neroFastBirthPublish(
+  const std::shared_ptr<Tracker> & tracker, const rclcpp::Time & time) const
+{
+  const auto label = tracker->getHighestProbLabel();
+  if (
+    label != Label::CAR && label != Label::TRUCK && label != Label::BUS && label != Label::TRAILER) {
+    return false;
+  }
+  int need = nero_fast_birth_.frames;
+  if (
+    nero_ego_ok_ && std::hypot(tracker->nero_last_x - nero_ego_x_, tracker->nero_last_y - nero_ego_y_) >=
+                      nero_fast_birth_.far_m) {
+    need = std::max(need, nero_fast_birth_.far_frames);
+  }
+  if (tracker->nero_distinct_stamps < need) return false;
+  if (tracker->nero_min_meas_prob < nero_fast_birth_.min_prob) return false;
+  if (nero_fast_birth_.vmin > 0.0) {
+    const double dt = (tracker->nero_last_t - tracker->nero_first_t).seconds();
+    if (dt < 0.05) return false;
+    const double dx = tracker->nero_last_x - tracker->nero_first_x;
+    const double dy = tracker->nero_last_y - tracker->nero_first_y;
+    if (std::hypot(dx, dy) < nero_fast_birth_.vmin * dt) return false;
+    double da = std::fabs(std::remainder(std::atan2(dy, dx) - tracker->nero_last_yaw, M_PI));
+    if (da * 180.0 / M_PI > nero_fast_birth_.yaw_deg) return false;
+  }
+  if (tracker->getElapsedTimeFromLastUpdate(time) > nero_fast_birth_.max_gap + 0.2) return false;  // + latency
+  if (nero_fast_birth_.iso_m >= 0.0) {
+    // isolation: a second box of a vehicle the tracker already publishes is not a new vehicle
+    types::DynamicObject self;
+    if (!tracker->getTrackedObject(time, self)) return false;
+    for (const auto & other : list_tracker_) {
+      if (other == tracker || !isConfidentTracker(other)) continue;
+      const auto ol = other->getHighestProbLabel();
+      if (ol != Label::CAR && ol != Label::TRUCK && ol != Label::BUS && ol != Label::TRAILER) continue;
+      types::DynamicObject o;
+      if (!other->getTrackedObject(time, o)) continue;
+      const double gap = 0.5 * (self.shape.dimensions.x + o.shape.dimensions.x) + nero_fast_birth_.iso_m;
+      if (
+        std::hypot(
+          self.pose.position.x - o.pose.position.x, self.pose.position.y - o.pose.position.y) < gap) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
 void TrackerProcessor::getTrackedObjects(
   const rclcpp::Time & time, autoware_perception_msgs::msg::TrackedObjects & tracked_objects) const
 {
@@ -794,7 +863,7 @@ void TrackerProcessor::getTrackedObjects(
   types::DynamicObject tracked_object;
   for (const auto & tracker : list_tracker_) {
     // Skip if the tracker is not confident
-    if (!isConfidentTracker(tracker)) continue;
+    if (!isConfidentTracker(tracker) && !(nero_fast_birth_.on && neroFastBirthPublish(tracker, time))) continue;
     // NERO_MOT_REBIRTH: the UNKNOWN track whose object its vehicle successor publishes
     if (nero_rebirth_.enabled && neroHidden(tracker, time)) continue;
     // Get the tracked object, extrapolated to the given time

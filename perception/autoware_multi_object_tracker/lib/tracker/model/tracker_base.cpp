@@ -16,6 +16,8 @@
 
 #include "autoware/multi_object_tracker/tracker/model/tracker_base.hpp"
 
+#include <tf2/utils.h>
+
 #include <algorithm>
 #include <random>
 #include <vector>
@@ -57,6 +59,12 @@ Tracker::Tracker(const rclcpp::Time & time, const types::DynamicObject & detecte
   std::generate(uuid_msg.uuid.begin(), uuid_msg.uuid.end(), bit_eng);
   object_.uuid = uuid_msg;
 
+  // NERO_MOT_FAST_BIRTH: the first measured box
+  nero_first_x = nero_last_x = detected_object.pose.position.x;
+  nero_first_y = nero_last_y = detected_object.pose.position.y;
+  nero_last_yaw = tf2::getYaw(detected_object.pose.orientation);
+  nero_first_t = nero_last_t = time;
+
   // Initialize existence probabilities
   existence_probabilities_.resize(types::max_channel_size, 0.001);
   total_existence_probability_ = 0.001;
@@ -76,6 +84,7 @@ void Tracker::initializeExistenceProbabilities(
   constexpr float min_probability = 0.100;
   total_existence_probability_ =
     std::max(std::min(existence_probability, max_probability), min_probability);
+  nero_min_meas_prob = existence_probability;  // NERO_MOT_FAST_BIRTH: the spawning measurement
 }
 
 bool Tracker::updateWithMeasurement(
@@ -113,6 +122,17 @@ bool Tracker::updateWithMeasurement(
       total_existence_probability_, existence_probability, probability_false_detection);
   }
 
+  // NERO_MOT_FAST_BIRTH: count each detection stamp once
+  if (measurement_time != last_update_with_measurement_time_) ++nero_distinct_stamps;
+  if (channel_info.trust_extension) {
+    nero_last_x = object.pose.position.x;
+    nero_last_y = object.pose.position.y;
+    nero_last_yaw = tf2::getYaw(object.pose.orientation);
+    nero_last_t = measurement_time;
+  }
+  if (channel_info.trust_existence_probability) {
+    nero_min_meas_prob = std::min(nero_min_meas_prob, object.existence_probability);
+  }
   last_update_with_measurement_time_ = measurement_time;
   if (channel_info.trust_extension) nero_last_full_update_time = measurement_time;
 

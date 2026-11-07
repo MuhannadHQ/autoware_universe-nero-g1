@@ -94,6 +94,13 @@ public:
   // NERO_MOT_DUP_FRESH (tbx): the last update by a channel that trusts the box extent (upstream's "full measurement";
   // detection_by_tracker, can_trust_extension false, only re-measures the track's own shape)
   rclcpp::Time nero_last_full_update_time;
+  // NERO_MOT_FAST_BIRTH (realize-3): measurements at distinct detection stamps (a message the input manager applies twice
+  // counts once) and the lowest existence probability among them
+  int nero_distinct_stamps{1};
+  float nero_min_meas_prob{1.0f};
+  // and its first / latest measured box (map frame) for the motion test
+  double nero_first_x{0.0}, nero_first_y{0.0}, nero_last_x{0.0}, nero_last_y{0.0}, nero_last_yaw{0.0};
+  rclcpp::Time nero_first_t, nero_last_t;
   double neroElapsedFromFullUpdate(const rclcpp::Time & current_time) const
   {
     return (current_time - nero_last_full_update_time).seconds();

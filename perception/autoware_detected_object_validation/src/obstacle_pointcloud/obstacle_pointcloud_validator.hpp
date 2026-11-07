@@ -234,6 +234,113 @@ private:
   void neroBodyEvidence(
     const autoware_perception_msgs::msg::DetectedObjects & transformed_objects,
     const std::vector<size_t> & candidates, std::vector<char> & body,
+    const builtin_interfaces::msg::Time & stamp, const std::string & frame_id,
+    std::vector<int> * slab = nullptr);
+
+  // [nero 2026-11-04 REALIZE] NERO_VAL_MOVER=<n>,<win_s>,<rms_m>,<vmin_mps>,<yaw_deg>,<min_travel_m>,<min_slab>[,<min_range_m>
+  // [,<min_body>,<k_r2_body>,<min_score>,<v_first_mps>[,<min_road_body>,<road_h_m>[,<max_stay>,<twin_m>]]]]:
+  // a vehicle box (CAR / TRUCK / BUS / TRAILER) that the obstacle-cloud count (and NERO_VAL_BODY, when on) drops is
+  // still validated when CenterPoint's own boxes of it MOVE ON A LINE: its chain of vehicle boxes in the MAP frame
+  // (associated frame to frame by the nearest predicted centre, gate 1.0 m + 2.5 m/s x the gap, gaps <= 0.35 s) has
+  // >= <n> boxes within the last <win_s> s whose centres fit a straight line at constant speed (rms <= <rms_m>), at
+  // >= <vmin_mps>, travelled >= <min_travel_m>, the box's heading within <yaw_deg> of that motion (either sign), and
+  // (with NERO_VAL_BODY on) >= <min_slab> raw points in the box's lower-body slab (NERO_VAL_BODY's lo-hi band; 0 = not
+  // required), from <min_range_m> m on (default 0). A far moving vehicle shows few points in the 0.52 m obstacle band
+  // and often no lower body, but CenterPoint boxes it every frame along its way; standing clutter boxes do not move
+  // and 1-2 frame boxes never form a chain. No map tf at the objects' stamp = no mover validation that frame.
+  // NERO_VAL_MOVER_DEBUG=1: one log line per mover pass. Unset / malformed = no mover validation (the node as before).
+  struct NeroMover
+  {
+    bool on{false};
+    int n{4};
+    double win{0.5};
+    double rms{0.3};
+    double vmin{3.0};
+    double yaw{30.0};
+    double travel{1.0};
+    int min_slab{0};
+    double min_range{0.0};
+    // v2 (fields 9-12): raw body support >= max(<min_body>, <k_r2_body> / range^2) raw points in the box footprint from
+    // 0.25 m over its bottom to 0.5 m over its top (0 = not required); the chain's last n boxes' mean existence
+    // probability >= <min_score>; a chain of ONE box accepts its 2nd box within 1.0 m + <v_first> m/s x the gap (v1: 2.5)
+    int min_body{0};
+    double k_r2_body{0.0};
+    double min_score{0.0};
+    double v_first{2.5};
+    // v3 (fields 13-14, realize-6): the body must STAND on the road: >= <min_road_body> raw points in the footprint
+    // more than <road_h_m> over the ROAD (the 2nd lowest raw point within the footprint + 1.5 m, from 1.5 m under the
+    // box bottom; CenterPoint's own bottom sinks under the road for boxes on empty ground) (0 = not required)
+    int min_road_body{0};
+    double road_h{0.3};
+    // v4 (fields 15-16, realize-6; need fields 13-14 on): the body must MOVE: share of its standing points that had a standing raw
+    // point within 0.25 m in the raw cloud ~0.3 s earlier < <max_stay> (1 = off; a standing car under a jittering box: 0.9-1.0,
+    // real far movers <= 0.46), and no other kept vehicle box within <twin_m> m with a heading within 30 deg (a duplicate box
+    // beside a real vehicle; 0 = off)
+    double max_stay{1.0};
+    double twin_m{0.0};
+    // realize-8 (field 17, optional): a twin only when the boxes overlap across: |lateral offset| in the kept box's frame
+    // < <twin_lat_m> (0 = any offset, the v4 rule)
+    double twin_lat{0.0};
+    bool debug{false};
+  };
+  NeroMover nero_mv_;
+  struct NeroMvChain
+  {
+    std::vector<std::array<double, 4>> pts;  // t (s), map x, map y, existence probability; the last <n> + a few kept
+    double last_t{0.0};
+  };
+  std::vector<NeroMvChain> nero_mv_chains_;
+  std::array<uint64_t, 6> nero_mv_count_{};  // mover passes per range band
+  void neroMoverPass(
+    const autoware_perception_msgs::msg::DetectedObjects & transformed_objects, std::vector<char> & keep,
+    const std::vector<int> & slab, const builtin_interfaces::msg::Time & stamp, const std::string & frame_id);
+
+  // [nero 2026-11-04 REALIZE-7] NERO_VAL_PED=<min_body>,<k_r2>,<min_ext>,<n_move>,<w_move_s>,<v_move_mps>,<rms_m>,
+  // <min_travel_m>,<n_stand>,<w_stand_s>,<d_stand_m>,<over_lo_m>,<over_hi_m>,<iso_pad_m>,<iso_abs>,<iso_rel> (needs
+  // NERO_VAL_BODY on: its raw cloud): a PEDESTRIAN / BICYCLE box that the car's validation drops is still validated (rule
+  // R5 of the realize-5 people census, r5/valped) when its RAW body shows: >= max(<min_body>, <k_r2> / range^2) raw points
+  // in its footprint + 0.15 m from 0.3 to 1.9 m over its bottom (centre z - H / 2) spanning >= <min_ext> m in height, AND
+  // its chain of CenterPoint people boxes (map frame; every PED / BIKE box of each message, kept or not, associated like
+  // NERO_VAL_MOVER: predicted centre, gate 1.0 m + 2.5 m/s x the gap, gaps <= 0.35 s) either MOVES on a line (>= <n_move>
+  // boxes within <w_move_s>, rms <= <rms_m>, >= <v_move_mps>, travel >= <min_travel_m>) or STANDS as a lone column (>=
+  // <n_stand> boxes within <w_stand_s> pairwise within <d_stand_m>, no raw point <over_lo_m>-<over_hi_m> over its bottom
+  // in the footprint + 0.15 m (a pole / trunk / wall goes on up) and at most max(<iso_abs>, <iso_rel> x body points) more
+  // body-band points in the footprint + <iso_pad_m> (a wall / bush / car side)). A box the car keeps stays kept. No raw
+  // cloud or no map tf at the objects' stamp = no people validation that frame. NERO_VAL_PED_DEBUG=1: one log line per
+  // dropped people box evaluated. Unset / malformed = no people validation (the node as before).
+  // R5 = 5,4000,0.9,6,1.5,0.8,0.25,0.5,8,1.0,0.5,2.2,3.5,0.5,2,0.15
+  struct NeroPed
+  {
+    bool on{false};
+    int min_body{5};
+    double k_r2{4000.0};
+    double min_ext{0.9};
+    int n_move{6};
+    double w_move{1.5};
+    double v_move{0.8};
+    double rms{0.25};
+    double min_travel{0.5};
+    int n_stand{8};
+    double w_stand{1.0};
+    double d_stand{0.5};
+    double over_lo{2.2};
+    double over_hi{3.5};
+    double iso_pad{0.5};
+    double iso_abs{2.0};
+    double iso_rel{0.15};
+    bool debug{false};
+  };
+  NeroPed nero_ped_;
+  struct NeroPedChain
+  {
+    std::vector<std::array<double, 3>> pts;  // t (s), map x, map y; the last >= 2 s kept
+    double last_t{0.0};
+    size_t total{0};  // boxes since the chain started
+  };
+  std::vector<NeroPedChain> nero_ped_chains_;
+  std::array<uint64_t, 6> nero_ped_count_{};  // people passes per range band
+  void neroPedPass(
+    const autoware_perception_msgs::msg::DetectedObjects & transformed_objects, std::vector<char> & keep,
     const builtin_interfaces::msg::Time & stamp, const std::string & frame_id);
 
 private:

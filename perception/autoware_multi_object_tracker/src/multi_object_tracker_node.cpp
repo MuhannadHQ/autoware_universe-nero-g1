@@ -332,6 +332,13 @@ void MultiObjectTracker::runProcess(const types::DynamicObjectList & detected_ob
     }
   }
 
+  // NERO_MOT_FAST_BIRTH: the robot's position at this measurement time (range of a new vehicle)
+  if (processor_->neroFastBirthOn()) {
+    if (const auto ego = odometry_->getTransform(measurement_time)) {
+      processor_->neroSetEgo(ego->translation.x, ego->translation.y);
+    }
+  }
+
   /* predict trackers to the measurement time */
   processor_->predict(measurement_time);
 

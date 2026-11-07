@@ -145,6 +145,37 @@ private:
   // channels a duplicate born from the other channel's detection otherwise survives every prune, gets published with
   // the speed of its first boxes' motion and nearer the path (10-26e #59: 279a07 on the parked 41db95, -2.82)
   double nero_dup_fresh_{0.0};
+  // NERO_MOT_FAST_BIRTH=<frames>,<max_gap_s>,<min_prob> (realize-3): a VEHICLE track (highest label car / truck / bus /
+  // trailer) measured at >= <frames> distinct detection stamps, the last within <max_gap_s>, every measurement's existence
+  // probability >= <min_prob>, is published before the stock count; until the stock count it is published only while its
+  // measurements keep coming (a 2-frame box that stops is withdrawn at once instead of coasting).
+  struct NeroFastBirth
+  {
+    bool on{false};
+    int frames{2};
+    double max_gap{0.15};
+    double min_prob{0.0};
+    double vmin{0.0};      // the measured boxes move >= vmin m/s ...
+    double yaw_deg{180.0};  // ... along the box's own heading (either sign) within yaw_deg
+    double iso_m{-1.0};     // no published vehicle within (l1 + l2) / 2 + iso_m (a second box of a known car); < 0 off
+    double far_m{1e9};      // from this range to the robot ...
+    int far_frames{2};      // ... this many distinct frames
+  };
+  double nero_ego_x_{0.0}, nero_ego_y_{0.0};
+  bool nero_ego_ok_{false};
+
+public:
+  bool neroFastBirthOn() const { return nero_fast_birth_.on; }
+  void neroSetEgo(const double x, const double y)
+  {
+    nero_ego_x_ = x;
+    nero_ego_y_ = y;
+    nero_ego_ok_ = true;
+  }
+
+private:
+  NeroFastBirth nero_fast_birth_;
+  bool neroFastBirthPublish(const std::shared_ptr<Tracker> & tracker, const rclcpp::Time & time) const;
 
   // NERO_MOT_UNKNOWN_MOVER (oncomingtrack, 2026-10-31; unset = stock; UnknownTracker holds the rule): an UNKNOWN
   // measurement that no track took but that continues a recently measured UNKNOWN track's straight mover line updates
