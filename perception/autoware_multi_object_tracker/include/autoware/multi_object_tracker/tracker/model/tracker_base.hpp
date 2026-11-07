@@ -117,6 +117,8 @@ public:
   virtual bool predict(const rclcpp::Time & time) = 0;
   // NERO_MOT_FLIP_DEFER (flipspeed): a vehicle track judging a turn that has not been published yet
   virtual bool neroJudgedUnpublished() const { return false; }
+  // NERO_MOT_STAND_SPEED (vstoplag): adjust an object for the PUBLISHED output only (internal users keep getTrackedObject's)
+  virtual void neroRefinePublished(types::DynamicObject & /*object*/) const {}
   // the track is published from now on; a published vehicle track whose centre lies in its box (the same object)
   // and that track's velocity, if there is one
   virtual void neroOnPublished(

@@ -46,6 +46,7 @@ public:
     const types::DynamicObject & object, const rclcpp::Time & time,
     const types::InputChannel & channel_info) override;
   bool getTrackedObject(const rclcpp::Time & time, types::DynamicObject & object) const override;
+  void neroRefinePublished(types::DynamicObject & object) const override;
   virtual ~MultipleVehicleTracker() {}
 };
 

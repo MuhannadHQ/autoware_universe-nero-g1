@@ -119,7 +119,11 @@ VehicleTracker::VehicleTracker(
 
   // Set motion model parameters
   {
-    const double q_stddev_acc_long = object_model_.process_noise.acc_long;
+    // NERO_MOT_STAND_SPEED (vstoplag): field 1 > 0 = the longitudinal process noise from the switch (research option;
+    // the shipped 0 keeps the model's 0.35 g: the filter untouched)
+    const double q_stddev_acc_long = neroStandSpeedParams().enabled && neroStandSpeedParams().q_g > 0.0
+                                       ? neroStandSpeedParams().q_g * 9.80665
+                                       : object_model_.process_noise.acc_long;
     const double q_stddev_acc_lat = object_model_.process_noise.acc_lat;
     const double q_stddev_yaw_rate_min = object_model_.process_noise.yaw_rate_min;
     const double q_stddev_yaw_rate_max = object_model_.process_noise.yaw_rate_max;
@@ -423,6 +427,14 @@ bool VehicleTracker::measure(
     neroAddTurnedPosition(updating_object, time);
     neroDecideTurned();
   }
+  if (neroStandSpeedParams().enabled) {
+    // NERO_MOT_STAND_SPEED: the raw box (before the anchor offset) and the filter after this update
+    nero_stand_.measure(
+      time.seconds(), channel_info.index,
+      {in_object.pose.position.x, in_object.pose.position.y, tf2::getYaw(in_object.pose.orientation),
+       in_object.shape.dimensions.x, in_object.anchor_point.x},
+      motion_model_.getStateElement(IDX::YAW), motion_model_.getStateElement(IDX::VEL));
+  }
 
   return true;
 }
@@ -566,6 +578,24 @@ bool VehicleTracker::getTrackedObject(
     autoware_utils::rotate_polygon(object.shape.footprint, origin_yaw - ekf_pose_yaw);
 
   return true;
+}
+
+void VehicleTracker::neroRefinePublished(types::DynamicObject & object) const
+{
+  if (neroStandSpeedParams().enabled && nero_stand_.valid() && !(nero_turned_ && nero_show_turned_)) {
+    // NERO_MOT_STAND_SPEED: publish the refined speed (0 while the boxes stand; a measured start speed after a stand),
+    // the filter's state untouched; the twist scaled as a whole (a standing vehicle has no yaw rate either)
+    const double vel = motion_model_.getStateElement(IDX::VEL);
+    const double v_out = nero_stand_.output();
+    if (std::fabs(vel) > 1e-3) {
+      const double f = v_out / vel;
+      object.twist.linear.x *= f;
+      object.twist.linear.y *= f;
+      object.twist.angular.z *= f;
+    } else {
+      object.twist.linear.x = v_out;
+    }
+  }
 }
 
 }  // namespace autoware::multi_object_tracker

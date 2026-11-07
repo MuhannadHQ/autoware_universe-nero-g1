@@ -81,4 +81,16 @@ bool MultipleVehicleTracker::getTrackedObject(
   return true;
 }
 
+void MultipleVehicleTracker::neroRefinePublished(types::DynamicObject & object) const
+{
+  // NERO_MOT_STAND_SPEED: the model getTrackedObject published
+  using Label = autoware_perception_msgs::msg::ObjectClassification;
+  const uint8_t label = getHighestProbLabel();
+  if (label == Label::CAR) {
+    normal_vehicle_tracker_.neroRefinePublished(object);
+  } else if (label == Label::BUS || label == Label::TRUCK || label == Label::TRAILER) {
+    big_vehicle_tracker_.neroRefinePublished(object);
+  }
+}
+
 }  // namespace autoware::multi_object_tracker

@@ -27,6 +27,8 @@
 #include <autoware/kalman_filter/kalman_filter.hpp>
 
 #include <algorithm>
+#include "autoware/multi_object_tracker/tracker/model/nero_stand_speed.hpp"
+
 #include <array>
 #include <optional>
 
@@ -69,6 +71,8 @@ private:
   const char * nero_first_pub_{""};  // what the vehicle track at its place said at its first publication (log)
   std::array<uint8_t, 4> nero_log_uuid_{};
   const char * nero_log_model_{""};
+  // NERO_MOT_STAND_SPEED (vstoplag): the published speed of a vehicle whose boxes stand / start again
+  NeroStandSpeed nero_stand_;
   bool updateMotionModel(
     BicycleMotionModel & motion_model, const types::DynamicObject & object,
     const bool is_yaw_available) const;
@@ -97,6 +101,7 @@ public:
     const types::DynamicObject & object, const types::InputChannel & channel_info);
   bool measureWithShape(const types::DynamicObject & object);
   bool getTrackedObject(const rclcpp::Time & time, types::DynamicObject & object) const override;
+  void neroRefinePublished(types::DynamicObject & object) const override;
 
   // NERO_MOT_FLIP_DEFER (flipspeed): switch state and the names its log lines use
   static bool neroFlipDeferEnabled();

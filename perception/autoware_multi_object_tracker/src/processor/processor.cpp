@@ -799,6 +799,7 @@ void TrackerProcessor::getTrackedObjects(
     if (nero_rebirth_.enabled && neroHidden(tracker, time)) continue;
     // Get the tracked object, extrapolated to the given time
     if (tracker->getTrackedObject(time, tracked_object)) {
+      tracker->neroRefinePublished(tracked_object);  // NERO_MOT_STAND_SPEED (no-op unless set)
       tracked_objects.objects.push_back(toTrackedObjectMsg(tracked_object));
     }
   }
