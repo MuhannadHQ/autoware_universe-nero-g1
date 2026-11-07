@@ -25,6 +25,15 @@
 // evidence from its own motion, re-judged every cycle and revoked as soon as it speeds up or moves on. Where it is
 // used (the collision check of mapped junctions, crosshold's mouths) its stop must also stay <margin> m clear of ego's
 // way.
+// yieldroll (2026-11-03, QUEUE YSIG case 11-02 #28): two more fields <roll_v m/s>,<roll_d m> (absent / 0 = as above):
+//   a yield may also START while the module's own collision stop is bringing ego to its line: that stop is held,
+//   ego is at most <roll_d> m before the line and at most <roll_v> fast (#28: the driver stood while the robot still
+//   rolled the last 2 m to its stop point at 1.5-2 m/s; the 1 m/s gate held the release ~0.9 s). A robot at speed
+//   far from its stop point keeps the rule above.
+//   Fields 13-14 <t_pos s>,<r_pos m> (absent / 0 = off): while ego rolls so (and for a yield started so), a braked
+//   vehicle (reported <= v_crawl, not speeding up) whose box centre has stayed within r_pos of its newest place for
+//   >= t_pos stands (its own positions: the tracker's reported speed of a car that stopped hard trails its stop by
+//   ~1.2 s, #28); its stop reach is then taken at r_pos / t_pos at most. At the line nothing changes.
 // Unset = nothing of this runs.
 
 #ifndef NERO_YIELD_INTENT_HPP_
@@ -36,6 +45,7 @@
 #include <tf2/utils.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -59,6 +69,10 @@ struct Param
   double queue{6.0};
   double ego_v{1.0};
   double margin{0.5};
+  double roll_v{0.0};   // yieldroll: 0 = off (yieldsignal_1101 exactly)
+  double roll_d{0.0};
+  double t_pos{0.0};    // yieldroll: 0 = no stand from positions
+  double r_pos{0.0};
 };
 
 inline const Param & param()
@@ -67,11 +81,11 @@ inline const Param & param()
     Param r;
     const char * e = std::getenv("NERO_IX_YIELD_INTENT");
     if (e == nullptr) return r;
-    double v[10] = {r.v_in, r.t_win, r.v_stand, r.t_stand, r.v_crawl,
-                    r.t_crawl, r.acc_th, r.queue, r.ego_v, r.margin};
+    double v[14] = {r.v_in,  r.t_win, r.v_stand, r.t_stand, r.v_crawl, r.t_crawl, r.acc_th,
+                    r.queue, r.ego_v, r.margin,  r.roll_v,  r.roll_d,  r.t_pos,   r.r_pos};
     const int n = std::sscanf(
-      e, "%lf,%lf,%lf,%lf,%lf,%lf,%lf,%lf,%lf,%lf", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5], &v[6], &v[7],
-      &v[8], &v[9]);
+      e, "%lf,%lf,%lf,%lf,%lf,%lf,%lf,%lf,%lf,%lf,%lf,%lf,%lf,%lf", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5],
+      &v[6], &v[7], &v[8], &v[9], &v[10], &v[11], &v[12], &v[13]);
     if (n < 1 || v[0] <= 0.0) return r;
     r.on = true;
     r.v_in = v[0];
@@ -84,6 +98,14 @@ inline const Param & param()
     r.queue = std::max(0.0, v[7]);
     r.ego_v = std::max(0.0, v[8]);
     r.margin = v[9];
+    if (n >= 12 && v[10] > 0.0 && v[11] > 0.0) {  // yieldroll
+      r.roll_v = v[10];
+      r.roll_d = v[11];
+      if (n >= 14 && v[12] > 0.0 && v[13] > 0.0) {
+        r.t_pos = v[12];
+        r.r_pos = v[13];
+      }
+    }
     return r;
   }();
   return p;
@@ -113,6 +135,7 @@ inline double speed(const autoware_perception_msgs::msg::PredictedObject & o)
 struct Hist
 {
   std::deque<std::pair<double, double>> s;  // (stamp, reported speed)
+  std::deque<std::array<double, 3>> xy;      // yieldroll: (stamp, x, y) of its box centre (only with t_pos)
   double last{0.0};
   double t_fast{-1.0};         // last stamp it was >= v_in
   double stand_since{-1.0};    // start of its current run <= v_stand after the braking (-1: none)
@@ -162,9 +185,14 @@ inline Hist & update(const autoware_perception_msgs::msg::PredictedObject & o, c
       h.crawl_since = v <= p.v_crawl ? (h.crawl_since < 0.0 ? t : h.crawl_since) : -1.0;
       h.stand_since = v <= p.v_stand ? (h.stand_since < 0.0 ? t : h.stand_since) : -1.0;
     }
+    if (p.t_pos > 0.0) {
+      const auto & pp = o.kinematics.initial_pose_with_covariance.pose.position;
+      h.xy.push_back({t, pp.x, pp.y});
+    }
   }
   h.last = t;
   while (!h.s.empty() && t - h.s.front().first > p.t_win + 0.5) h.s.pop_front();
+  while (!h.xy.empty() && t - h.xy.front()[0] > p.t_pos + 0.5) h.xy.pop_front();
   static double last_prune = 0.0;
   if (t - last_prune > 5.0 || t < last_prune) {
     last_prune = t;
@@ -185,6 +213,8 @@ struct View
   double gain_1s{0.0};   // speed gained over the last 1 s (v now - min of the last 1 s)
   double v{0.0};
   bool yielding_motion{false};  // braked, stands / crawls long enough, not speeding up
+  double pos_stand_s{0.0};       // yieldroll: s its box centre has stayed within r_pos of its newest place
+  bool pos_stand{false};         // yieldroll: braked, reported <= v_crawl, not speeding up, pos_stand_s >= t_pos
 };
 
 inline View view(const Hist & h, const double t)
@@ -212,6 +242,18 @@ inline View view(const Hist & h, const double t)
   w.yielding_motion =
     w.gain_1s <= p.acc_th &&
     ((w.stand_s >= p.t_stand && w.v <= p.v_stand) || (w.crawl_s >= p.t_crawl && w.v <= p.v_crawl));
+  if (p.t_pos > 0.0 && h.xy.size() >= 3) {
+    const auto & n = h.xy.back();
+    int k = 0;
+    double t_old = n[0];
+    for (auto it = h.xy.rbegin(); it != h.xy.rend(); ++it) {
+      if (std::hypot((*it)[1] - n[1], (*it)[2] - n[2]) > p.r_pos) break;
+      t_old = (*it)[0];
+      ++k;
+    }
+    w.pos_stand_s = k >= 3 ? n[0] - t_old : 0.0;
+    w.pos_stand = w.gain_1s <= p.acc_th && w.v <= p.v_crawl && w.pos_stand_s >= p.t_pos;
+  }
   return w;
 }
 

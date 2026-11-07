@@ -726,6 +726,11 @@ private:
   //! anything else (the sight rule) made it unsafe: the stop ends without the hold only when all of them yield now
   std::set<std::string> nero_yi_stop_causes_;
   bool nero_yi_stop_other_{false};
+  //! NERO_IX_YIELD_INTENT fields 11-12 (yieldroll, 2026-11-03): this cycle, the collision stop held since last cycle is
+  //! bringing ego to its line (ego <= roll_v, 0..roll_d m before it): a yield may start (distance to the line, -1: no)
+  double nero_yi_roll_d_{-1.0};
+  //! NERO_IX_YIELD_INTENT fields 13-14 (yieldroll): this module's yields that its positions started (last / this cycle)
+  nero_yield_intent::Was nero_yi_pos_was_;
   //! NERO_IX_PRIORITY_NO_EXIT: position history of the cars with a priority verdict, uuidKey() -> (stamp, x, y): their
   //! direction of motion over the last second (the tracker's heading is noisier)
   std::map<std::string, std::vector<std::array<double, 3>>> nero_priority_xy_hist_;

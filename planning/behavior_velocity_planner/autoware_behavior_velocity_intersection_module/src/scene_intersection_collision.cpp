@@ -1865,6 +1865,7 @@ void IntersectionModule::updateObjectInfoManagerArea()
   nero_yi_yielders_.clear();  // NERO_IX_YIELD_INTENT
   if (nero_yield_intent::param().on) {
     nero_yi_was_.next(rclcpp::Time(planner_data_->predicted_objects->header.stamp).seconds());
+    nero_yi_pos_was_.next(rclcpp::Time(planner_data_->predicted_objects->header.stamp).seconds());
   }
   nero_priority_pv_.clear();
   nero_priority_pv_late_.clear();
@@ -2132,12 +2133,22 @@ void IntersectionModule::updateObjectInfoManagerArea()
       double clear = -1.0;
       bool is_queued = false;
       // (ego's speed gates only the start of a yield: once ego goes on it, only the car's own motion ends it)
-      if (yv.yielding_motion && (ego_v_yi < yp.ego_v || was_yielder)) {
+      // yieldroll (fields 11-12): or this module's collision stop is bringing ego to its line (nero_yi_roll_d_ >= 0)
+      const bool ego_rolls_to_line = nero_yi_roll_d_ >= 0.0 && ego_v_yi >= yp.ego_v && !was_yielder;
+      // yieldroll (fields 13-14): its own positions show it stands: may start a yield while ego rolls to its line under
+      // this module's stop, and keeps a yield (never starts one at the line: there yieldsignal_1101's evidence decides)
+      // (ego still moving: >= 0.3 m/s; a robot already standing at its line keeps yieldsignal_1101's evidence, and a
+      // yield the reported speeds started keeps their test)
+      const bool pos_was = nero_yi_pos_was_.was(ykey);
+      const bool pos_yield = yv.pos_stand && !yv.yielding_motion &&
+                             ((nero_yi_roll_d_ >= 0.0 && ego_v_yi >= 0.3 && !was_yielder) || pos_was);
+      if ((yv.yielding_motion && (ego_v_yi < yp.ego_v || was_yielder || ego_rolls_to_line)) || pos_yield) {
         const auto & cp = nero_creep_ix();
         const double t_react = cp.v_creep > 0.0 ? cp.t_react : 0.5;
         const double t_pass = cp.v_creep > 0.0 ? cp.t_pass : 1.5;
         const double a_stop = cp.v_creep > 0.0 ? cp.a_stop : 2.0;
-        const double v = yv.v;
+        // (a car that stands by its positions: its reach at the speed its positions allow at most)
+        const double v = pos_yield ? std::min(yv.v, yp.r_pos / yp.t_pos) : yv.v;
         const double d_stop = v * (t_react + t_pass) + v * v / (2.0 * a_stop);
         auto stop_pose = predicted_object.kinematics.initial_pose_with_covariance.pose;
         const double yaw = tf2::getYaw(stop_pose.orientation);
@@ -2172,8 +2183,17 @@ void IntersectionModule::updateObjectInfoManagerArea()
             "%.2f m/s (gained %.2f in 1 s), its stop %.2f m clear of ego's path (ego v %.2f): yielding, left out",
             lane_id_, yid.c_str(), yv.v_peak, yv.since_fast, yv.stand_s, yv.crawl_s, yv.v, yv.gain_1s, clear,
             ego_v_yi);
+          if (ego_rolls_to_line || pos_yield) {
+            RCLCPP_INFO(
+              logger_,
+              "[NERO_IX] yieldroll: lane %ld %s yields while the collision stop brings ego to its line (%.2f m "
+              "ahead, ego v %.2f, roll gate %d), by its positions %d (stands %.2f s within %.2f m, reported %.2f)",
+              lane_id_, yid.c_str(), nero_yi_roll_d_, ego_v_yi, ego_rolls_to_line ? 1 : 0, pos_yield ? 1 : 0,
+              yv.pos_stand_s, yp.r_pos, yv.v);
+          }
         }
         nero_yi_was_.now.insert(ykey);
+        if (pos_yield || pos_was) nero_yi_pos_was_.now.insert(ykey);  // yieldroll: started by its positions
         nero_yi_yielders_.insert(uuidKey(predicted_object.object_id));
         continue;  // it braked for ego and waits: yielding
       }

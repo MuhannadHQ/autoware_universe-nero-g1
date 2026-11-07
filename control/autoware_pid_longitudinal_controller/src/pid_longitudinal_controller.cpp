@@ -89,6 +89,13 @@ struct NeroStartLead
   double max_gain{0.0};
   double dist{0.0};
   bool applied{false};
+  // yieldroll (2026-11-03, QUEUE RREL) 5th field: a release while DRIVE brakes toward a near stop (the stop point was
+  // within ROLL_ARM_M last cycle and is beyond clear_m now, the robot still rolling) arms a departure too; its lead is
+  // roll_lead_s (faded out between the release speed and v_end) and the plan's own braking tail is not fed forward
+  double roll_lead_s{0.0};      // 0 = off (pulloff_1101 exactly)
+  bool roll{false};             // the active departure is a rolling release
+  double v_roll{0.0};           // the robot's speed at that release
+  double prev_stop_dist{1e9};   // the stop point's distance in the last DRIVE cycle
 };
 NeroStartLead & neroStartLead(const void * controller)
 {
@@ -330,14 +337,17 @@ PidLongitudinalController::PidLongitudinalController(
   // [nero] NERO_PID_START_LEAD=<lead_s>,<v_end_mps>,<clear_m> (pulloff, QUEUE PULLOFF)
   if (const char * e = std::getenv("NERO_PID_START_LEAD"); e && *e) {
     auto & p = neroStartLead(this);
-    double l = 0.0, ve = 0.0, c = 0.0, ra = 0.0;
-    const int n = std::sscanf(e, "%lf,%lf,%lf,%lf", &l, &ve, &c, &ra);
-    if ((n == 3 || n == 4) && l > 0.0 && l <= 2.0 && ve > 0.0 && c >= 0.0 && ra <= 0.0 && ra >= -3.4) {
+    double l = 0.0, ve = 0.0, c = 0.0, ra = 0.0, rl = 0.0;
+    const int n = std::sscanf(e, "%lf,%lf,%lf,%lf,%lf", &l, &ve, &c, &ra, &rl);
+    if (
+      (n == 3 || n == 4 || n == 5) && l > 0.0 && l <= 2.0 && ve > 0.0 && c >= 0.0 && ra <= 0.0 && ra >= -3.4 &&
+      rl >= 0.0 && rl <= 3.0) {
       p.enabled = true;
       p.lead_s = l;
       p.v_end = ve;
       p.clear_m = c;
-      p.revoke_acc = n == 4 ? ra : 0.0;
+      p.revoke_acc = n >= 4 ? ra : 0.0;
+      p.roll_lead_s = n == 5 ? rl : 0.0;  // yieldroll
       p.scenario_sub = node.create_subscription<autoware_internal_planning_msgs::msg::Scenario>(
         "/planning/scenario_planning/scenario", rclcpp::QoS{1},
         [&p](const autoware_internal_planning_msgs::msg::Scenario::ConstSharedPtr msg) {
@@ -350,6 +360,13 @@ PidLongitudinalController::PidLongitudinalController(
         "ahead (faded out by %.2f m/s), never below the car's target, not with a stop point within "
         "%.1f m; a departure the plan takes back stops at <= %.2f m/s2 (0 = the car's smooth stop)",
         l, ve, c, p.revoke_acc);
+      if (p.roll_lead_s > 0.0) {
+        RCLCPP_INFO(
+          logger_,
+          "[NERO_PID_START_LEAD] rolling releases (yieldroll): a stop that vanishes while the robot rolls toward it "
+          "arms a departure with the plan's own speed %.2f s ahead, its braking tail not fed forward",
+          p.roll_lead_s);
+      }
     } else {
       RCLCPP_ERROR(logger_, "[NERO_PID_START_LEAD] bad value '%s': off", e);
     }
@@ -910,6 +927,7 @@ void PidLongitudinalController::updateControlState(const ControlData & control_d
       }
       if (nl.enabled && std::abs(current_vel) < nl.v_end) {
         nl.active = true;
+        nl.roll = false;
         nl.t0 = clock_->now().seconds();
         nl.max_gain = 0.0;
         nl.dist = 0.0;
@@ -962,6 +980,7 @@ void PidLongitudinalController::updateControlState(const ControlData & control_d
       if (auto & nl = neroStartLead(this); nl.enabled) {
         // [nero] NERO_PID_START_LEAD: a departure from standstill
         nl.active = true;
+        nl.roll = false;
         nl.t0 = clock_->now().seconds();
         nl.max_gain = 0.0;
         nl.dist = 0.0;
@@ -1017,6 +1036,7 @@ PidLongitudinalController::Motion PidLongitudinalController::calcCtrlCmd(
       nl.contest_dist = 0.0;
     }
     nl.active = false;
+    nl.roll = false;
   }
   // [nero] NERO_PID_START_LEAD: a contested place is left after CONTEST_CLEAR_M driven (or v_end, below)
   if (auto & nl = neroStartLead(this); nl.contested) {
@@ -1062,6 +1082,33 @@ PidLongitudinalController::Motion PidLongitudinalController::calcCtrlCmd(
         // by v_end) when it is higher than the car's target and no stop point is within clear_m
         double nero_lead_vel = -1.0;
         neroStartLead(this).revoked = false;
+        // [nero] NERO_PID_START_LEAD 5th field (yieldroll, QUEUE RREL): a stop that vanishes while DRIVE brakes toward
+        // it (within ROLL_ARM_M last cycle, beyond clear_m and ROLL_JUMP_M further now; the robot rolling 0.3 m/s ..
+        // v_end) arms a departure
+        if (auto & nl = neroStartLead(this); nl.enabled && nl.roll_lead_s > 0.0) {
+          constexpr double ROLL_ARM_M = 10.0;
+          constexpr double ROLL_JUMP_M = 2.0;  // the stop point vanished / jumped away (not a stop approached)
+          const double v = std::abs(control_data.current_motion.vel);
+          if (
+            !nl.active && !nl.contested && nl.scenario == 1 && control_data.shift == Shift::Forward && v >= 0.3 &&
+            v < nl.v_end && nl.prev_stop_dist <= ROLL_ARM_M && control_data.stop_dist > nl.clear_m &&
+            control_data.stop_dist >= nl.prev_stop_dist + ROLL_JUMP_M) {
+            nl.active = true;
+            nl.roll = true;
+            nl.v_roll = v;
+            nl.t0 = clock_->now().seconds();
+            nl.max_gain = 0.0;
+            nl.dist = 0.0;
+            nl.applied = false;
+            RCLCPP_INFO(
+              logger_,
+              "[NERO_PID_START_LEAD] rolling release at %.2f m/s (stop point %.1f -> %.1f m): departure, lead "
+              "%.2f s",
+              v, nl.prev_stop_dist, control_data.stop_dist, nl.roll_lead_s);
+          }
+          nl.prev_stop_dist = control_data.stop_dist;
+        }
+        bool nero_roll_ff = false;  // the rolling lead applies: the plan's braking tail is not fed forward
         if (auto & nl = neroStartLead(this); nl.active) {
           const double v = std::abs(control_data.current_motion.vel);
           nl.dist += v * control_data.dt;
@@ -1073,16 +1120,22 @@ PidLongitudinalController::Motion PidLongitudinalController::calcCtrlCmd(
               v, clock_->now().seconds() - nl.t0, nl.dist, nl.applied ? "applied" : "never applied",
               nl.max_gain);
             nl.active = false;
+            nl.roll = false;
             if (nl.contested) {
               RCLCPP_INFO(logger_, "[NERO_PID_START_LEAD] place left (%.2f m/s): lead again", v);
             }
             nl.contested = false;
           } else if (control_data.stop_dist > nl.clear_m && nl.scenario == 1 && !nl.contested) {
-            const double lead = nl.lead_s * std::clamp(1.0 - v / nl.v_end, 0.0, 1.0);
+            // (a rolling release: roll_lead_s, faded out from the release speed to v_end)
+            const double lead =
+              nl.roll ? nl.roll_lead_s *
+                          std::clamp((nl.v_end - v) / std::max(0.1, nl.v_end - nl.v_roll), 0.0, 1.0)
+                      : nl.lead_s * std::clamp(1.0 - v / nl.v_end, 0.0, 1.0);
             const double ahead =
               neroPlanSpeedAhead(control_data.interpolated_traj, control_data.nearest_idx, lead);
             if (ahead > raw_ctrl_cmd.vel + 1e-3) {
               nero_lead_vel = ahead;
+              nero_roll_ff = nl.roll;
               nl.max_gain = std::max(nl.max_gain, ahead - raw_ctrl_cmd.vel);
               if (!nl.applied) {
                 RCLCPP_INFO(
@@ -1101,6 +1154,10 @@ PidLongitudinalController::Motion PidLongitudinalController::calcCtrlCmd(
           ControlData lead_data = control_data;
           lead_data.interpolated_traj.points.at(control_data.target_idx).longitudinal_velocity_mps =
             static_cast<float>(nero_lead_vel);
+          if (nero_roll_ff) {  // yieldroll: no braking feedforward from the plan's tail after a rolling release
+            auto & a = lead_data.interpolated_traj.points.at(control_data.target_idx).acceleration_mps2;
+            a = std::max(0.0f, a);
+          }
           raw_ctrl_cmd.vel = nero_lead_vel;
           raw_ctrl_cmd.acc = applyVelocityFeedback(lead_data);
           raw_ctrl_cmd = keepBrakeBeforeStop(lead_data, raw_ctrl_cmd, target_idx);

@@ -227,6 +227,19 @@ DecisionResult IntersectionModule::modifyPathVelocityDetail(PathWithLaneId * pat
   // classify the objects to attention_area/intersection_area and update their position, velocity,
   // belonging attention lanelet, distance to corresponding stopline
   // ==========================================================================================
+  // NERO_IX_YIELD_INTENT fields 11-12 (yieldroll, 2026-11-03): is this module's collision stop (held since last cycle)
+  // bringing ego to its line now? Then a car that stops for ego may be read as yielding although ego still rolls
+  nero_yi_roll_d_ = -1.0;
+  if (
+    nero_yield_intent::param().roll_v > 0.0 &&
+    collision_state_machine_.getState() == StateMachine::State::STOP &&
+    std::abs(planner_data_->current_velocity->twist.linear.x) <= nero_yield_intent::param().roll_v &&
+    !util::isOverTargetIndex(
+      *path, intersection_stoplines.closest_idx, planner_data_->current_odometry->pose, default_stopline_idx)) {
+    const double d_line = autoware::motion_utils::calcSignedArcLength(
+      path->points, planner_data_->current_odometry->pose.position, default_stopline_idx);
+    if (d_line >= 0.0 && d_line <= nero_yield_intent::param().roll_d) nero_yi_roll_d_ = d_line;
+  }
   updateObjectInfoManagerArea();
 
   // ==========================================================================================
