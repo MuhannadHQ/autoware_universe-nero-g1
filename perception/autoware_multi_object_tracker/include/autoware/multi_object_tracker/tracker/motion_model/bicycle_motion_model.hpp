@@ -21,6 +21,7 @@
 
 #include "autoware/kalman_filter/kalman_filter.hpp"
 #include "autoware/multi_object_tracker/tracker/motion_model/motion_model_base.hpp"
+#include "autoware/multi_object_tracker/tracker/motion_model/nero_turn_onset.hpp"
 
 #include <Eigen/Core>
 #include <rclcpp/rclcpp.hpp>

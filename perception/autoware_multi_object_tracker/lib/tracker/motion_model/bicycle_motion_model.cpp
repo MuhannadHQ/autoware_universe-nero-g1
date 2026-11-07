@@ -465,6 +465,11 @@ bool BicycleMotionModel::predictStateStep(const double dt, KalmanFilter & ekf) c
       std::pow(motion_params_.q_stddev_acc_lat * sin_slip / vel, 2) + std::pow(sin_slip * 1.5, 2);
     q_cov_slip_rate = std::min(q_cov_slip_rate, motion_params_.q_cov_slip_rate_max);
     q_cov_slip_rate = std::max(q_cov_slip_rate, motion_params_.q_cov_slip_rate_min);
+    // NERO_MOT_TURN_ONSET (yawlag): a moving vehicle may start turning from slip 0
+    if (const auto & onset = neroTurnOnsetParams(); onset.enabled && vel >= onset.v_on) {
+      const double sd_onset = std::min(onset.yaw_acc * lr_ / vel, onset.slip_rate_max);
+      q_cov_slip_rate = std::max(q_cov_slip_rate, sd_onset * sd_onset);
+    }
   }
   const double dt2 = dt * dt;
   const double dt4 = dt2 * dt2;
