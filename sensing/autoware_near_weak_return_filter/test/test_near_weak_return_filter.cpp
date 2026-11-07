@@ -143,3 +143,284 @@ TEST(NearWeakReturnFilter, EmptyCloud)
   EXPECT_TRUE(drop->empty());
   EXPECT_EQ(remove_points(c, *drop).width, 0u);
 }
+
+// [nero 2026-11-05 AEBD2] the dust stage
+namespace
+{
+using autoware::near_weak_return_filter::DustParams;
+using autoware::near_weak_return_filter::DustStage;
+using autoware::near_weak_return_filter::DustStats;
+
+struct Ret
+{
+  double az, el, d;
+  uint8_t i;
+};
+
+// returns in base_link from an E1R at (1.19, 0, 0.16) looking along +x: azimuth / elevation / distance as the driver
+// writes them (the sensor frame's azimuth = atan2(-y, x))
+PointCloud2 e1r_cloud(const std::vector<Ret> & rs)
+{
+  std::vector<Pt> pts;
+  for (const auto & r : rs) {
+    const double ux = std::cos(r.el) * std::cos(r.az), uy = -std::cos(r.el) * std::sin(r.az), uz = std::sin(r.el);
+    pts.push_back({static_cast<float>(1.19 + r.d * ux), static_cast<float>(r.d * uy), static_cast<float>(0.16 + r.d * uz), r.i});
+  }
+  auto c = make_cloud(pts);
+  for (size_t k = 0; k < rs.size(); ++k) {
+    uint8_t * p = c.data.data() + k * 32;
+    const float az = rs[k].az, el = rs[k].el, d = rs[k].d;
+    std::memcpy(p + 16, &az, 4);
+    std::memcpy(p + 20, &el, 4);
+    std::memcpy(p + 24, &d, 4);
+  }
+  return c;
+}
+
+uint32_t lcg_state = 12345;
+double rnd()
+{
+  lcg_state = lcg_state * 1664525u + 1013904223u;
+  return (lcg_state >> 8) / 16777216.0;
+}
+
+// a dust volume: n returns on random pixels of a 0.01 rad grid, at random ranges 0.7-1.6 m, intensity 2
+std::vector<Ret> dust(int n)
+{
+  std::vector<Ret> v;
+  for (int k = 0; k < n; ++k) {
+    const double az = std::round((rnd() - 0.5) * 60.0) * 0.01, el = std::round(rnd() * 20.0) * 0.01;
+    v.push_back({az, el, 0.7 + 0.9 * rnd(), 2});
+  }
+  return v;
+}
+
+// a black wall facing the sensor at range r: every pixel of a 0.01 rad grid
+std::vector<Ret> wall(double r, double az0, double az1, double el0, double el1, uint8_t i)
+{
+  std::vector<Ret> v;
+  for (double az = az0; az <= az1 + 1e-9; az += 0.01)
+    for (double el = el0; el <= el1 + 1e-9; el += 0.01) v.push_back({az, el, r / (std::cos(az) * std::cos(el)), i});
+  return v;
+}
+
+size_t count_drops(const std::optional<std::vector<bool>> & d, size_t from, size_t to)
+{
+  size_t n = 0;
+  for (size_t k = from; k < to; ++k) n += (*d)[k] ? 1 : 0;
+  return n;
+}
+}  // namespace
+
+TEST(NearDustStage, EmptyCloud)
+{
+  DustParams p;
+  p.enabled = true;
+  DustStage s(p);
+  DustStats st;
+  const auto d = s.process(e1r_cloud({}), 0.0, st);
+  ASSERT_TRUE(d.has_value());
+  EXPECT_TRUE(d->empty());
+}
+
+TEST(NearDustStage, MissingAzimuthIsNotFiltered)
+{
+  auto c = e1r_cloud(dust(200));
+  c.fields.erase(c.fields.begin() + 6);  // azimuth
+  DustParams p;
+  p.enabled = true;
+  DustStage s(p);
+  DustStats st;
+  EXPECT_FALSE(s.process(c, 0.0, st).has_value());
+}
+
+TEST(NearDustStage, DustVolumeDroppedOnlyInABurst)
+{
+  DustParams p;
+  p.enabled = true;
+  {
+    DustStage s(p);
+    DustStats st;
+    const auto v = dust(600);
+    const auto d = s.process(e1r_cloud(v), 0.0, st);
+    ASSERT_TRUE(d.has_value());
+    EXPECT_TRUE(st.gate_open);
+    EXPECT_GT(count_drops(d, 0, v.size()), v.size() * 8 / 10);
+  }
+  {
+    DustStage s(p);  // a handful of dust-like returns and no burst before: nothing is touched
+    DustStats st;
+    const auto v = dust(30);
+    const auto d = s.process(e1r_cloud(v), 0.0, st);
+    ASSERT_TRUE(d.has_value());
+    EXPECT_FALSE(st.gate_open);
+    EXPECT_EQ(count_drops(d, 0, v.size()), 0u);
+  }
+}
+
+TEST(NearDustStage, KeepsABlackWallInsideTheDust)
+{
+  DustParams p;
+  p.enabled = true;
+  DustStage s(p);
+  DustStats st;
+  auto v = wall(1.4, -0.15, 0.15, 0.0, 0.12, 1);  // black, 0.4 x 0.17 m
+  const size_t nw = v.size();
+  const auto dv = dust(600);
+  v.insert(v.end(), dv.begin(), dv.end());
+  const auto d = s.process(e1r_cloud(v), 0.0, st);
+  ASSERT_TRUE(d.has_value());
+  EXPECT_TRUE(st.gate_open);
+  EXPECT_EQ(count_drops(d, 0, nw), 0u);              // the wall: every return kept
+  EXPECT_GT(count_drops(d, nw, v.size()), 300u);      // the dust around it: removed
+}
+
+TEST(NearDustStage, BrightCarSideAloneNeverOpensTheGate)
+{
+  DustParams p;
+  p.enabled = true;
+  DustStage s(p);
+  DustStats st;
+  auto v = dust(200);
+  for (auto & r : v) r.i = 120;  // fragmented but bright (reflectors, paint): the weak share is the gate's test
+  const auto d = s.process(e1r_cloud(v), 0.0, st);
+  ASSERT_TRUE(d.has_value());
+  EXPECT_FALSE(st.gate_open);
+  EXPECT_EQ(count_drops(d, 0, v.size()), 0u);
+}
+
+TEST(NearDustStage, HoldsOneSecondWhileWeakDustRemains)
+{
+  DustParams p;
+  p.enabled = true;
+  DustStage s(p);
+  DustStats st;
+  s.process(e1r_cloud(dust(600)), 10.0, st);
+  EXPECT_TRUE(st.gate_open);
+  const auto v = dust(40);  // the tail of the cloud: below the burst count
+  auto d = s.process(e1r_cloud(v), 10.5, st);
+  EXPECT_TRUE(st.gate_open);
+  EXPECT_GT(count_drops(d, 0, v.size()), 0u);
+  d = s.process(e1r_cloud(v), 11.6, st);  // more than hold_sec after the burst
+  EXPECT_FALSE(st.gate_open);
+  EXPECT_EQ(count_drops(d, 0, v.size()), 0u);
+}
+
+// [nero 2026-11-06 aebdust_1106] the gate's own volume, the follower, planes need returns
+namespace
+{
+// dust beside the robot, |y| 1.4-1.9 (inside the drop box, outside the gate's volume)
+std::vector<Ret> side_dust(int n)
+{
+  std::vector<Ret> v;
+  while (static_cast<int>(v.size()) < n) {
+    const double az = -0.7 - 0.6 * rnd(), el = std::round(rnd() * 20.0) * 0.01, d = 1.6 + 0.8 * rnd();
+    const double y = -d * std::cos(el) * std::sin(az), x = 1.19 + d * std::cos(el) * std::cos(az);
+    if (y > 1.4 && y < 1.9 && x > 1.05) v.push_back({az, el, d, 2});
+  }
+  return v;
+}
+}  // namespace
+
+TEST(NearDustStage, GateCountsOnlyItsOwnVolume)
+{
+  DustParams p;
+  p.enabled = true;
+  {
+    DustStage s(p);  // a burst beside the robot alone (outside |y| <= gate_max_abs_y) never opens the gate
+    DustStats st;
+    const auto v = side_dust(600);
+    const auto d = s.process(e1r_cloud(v), 0.0, st);
+    ASSERT_TRUE(d.has_value());
+    EXPECT_FALSE(st.gate_open);
+    EXPECT_EQ(count_drops(d, 0, v.size()), 0u);
+  }
+  {
+    DustStage s(p);  // with a burst in front, the same side dust is dropped too (the wider box)
+    DustStats st;
+    auto v = side_dust(300);
+    const size_t ns = v.size();
+    const auto dv = dust(600);
+    v.insert(v.end(), dv.begin(), dv.end());
+    const auto d = s.process(e1r_cloud(v), 0.0, st);
+    ASSERT_TRUE(d.has_value());
+    EXPECT_TRUE(st.gate_open);
+    EXPECT_GT(count_drops(d, 0, ns), ns * 7 / 10);
+  }
+}
+
+TEST(NearDustStage, FollowerActsOnlyWithinTheLeadersGate)
+{
+  DustParams p;
+  p.enabled = true;
+  p.follow = true;
+  DustStage s(p);
+  DustStats st;
+  const auto v = dust(600);
+  auto d = s.process(e1r_cloud(v), 20.0, st);  // no open frame of the leader yet: nothing looked at
+  ASSERT_TRUE(d.has_value());
+  EXPECT_FALSE(st.gate_open);
+  EXPECT_EQ(count_drops(d, 0, v.size()), 0u);
+  s.external_gate_open(20.0);
+  d = s.process(e1r_cloud(v), 20.1, st);
+  EXPECT_TRUE(st.gate_open);
+  EXPECT_GT(count_drops(d, 0, v.size()), v.size() * 8 / 10);
+  d = s.process(e1r_cloud(v), 20.0 + p.follow_sec + 0.05, st);  // the leader's gate is stale
+  EXPECT_FALSE(st.gate_open);
+  EXPECT_EQ(count_drops(d, 0, v.size()), 0u);
+  const auto few = dust(5);  // no own gate: a follower acts on a handful of dust-like returns while the leader's is open
+  s.external_gate_open(30.0);
+  d = s.process(e1r_cloud(few), 30.05, st);
+  EXPECT_TRUE(st.gate_open);
+}
+
+TEST(NearDustStage, FollowerKeepsABlackWallInsideTheDust)
+{
+  DustParams p;
+  p.enabled = true;
+  p.follow = true;
+  DustStage s(p);
+  DustStats st;
+  auto v = wall(1.4, -0.15, 0.15, 0.0, 0.12, 1);
+  const size_t nw = v.size();
+  const auto dv = dust(600);
+  v.insert(v.end(), dv.begin(), dv.end());
+  s.external_gate_open(5.0);
+  const auto d = s.process(e1r_cloud(v), 5.0, st);
+  ASSERT_TRUE(d.has_value());
+  EXPECT_EQ(count_drops(d, 0, nw), 0u);
+  EXPECT_GT(count_drops(d, nw, v.size()), 300u);
+}
+
+TEST(NearDustStage, KeepsADarkFaceWithDropoutsInsideTheDust)
+{
+  DustParams p;
+  p.enabled = true;
+  DustStage s(p);
+  DustStats st;
+  std::vector<Ret> v;
+  for (const auto & r : wall(1.6, -0.2, 0.2, 0.0, 0.2, 1)) {
+    if (rnd() < 0.5) v.push_back(r);  // half of its pixels return nothing (a dark, partly absorbing face)
+  }
+  const size_t nf = v.size();
+  const auto dv = dust(600);
+  v.insert(v.end(), dv.begin(), dv.end());
+  const auto d = s.process(e1r_cloud(v), 0.0, st);
+  ASSERT_TRUE(d.has_value());
+  EXPECT_TRUE(st.gate_open);
+  EXPECT_LE(count_drops(d, 0, nf), nf / 20);  // at most a few edge returns
+}
+
+TEST(NearDustStage, HoldStaysOpenOnAShortTail)
+{
+  DustParams p;
+  p.enabled = true;
+  DustStage s(p);
+  DustStats st;
+  s.process(e1r_cloud(dust(600)), 10.0, st);
+  EXPECT_TRUE(st.gate_open);
+  const auto v = dust(12);  // a tail of a few weak returns (>= hold_min of them dust-like)
+  const auto d = s.process(e1r_cloud(v), 10.3, st);
+  EXPECT_TRUE(st.gate_open);
+  EXPECT_GT(count_drops(d, 0, v.size()), 0u);
+}
