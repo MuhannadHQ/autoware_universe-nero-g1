@@ -247,6 +247,7 @@ DecisionResult IntersectionModule::modifyPathVelocityDetail(PathWithLaneId * pat
     [is_over_1st_pass_judge_line, is_over_2nd_pass_judge_line, safely_passed_1st_judge_line,
      safely_passed_2nd_judge_line] =
       isOverPassJudgeLinesStatus(*path, is_occlusion_state, intersection_stoplines);
+  neroYieldRevokeCommit();  // NERO_IX_YIELD_REVOKE
 
   // ==========================================================================================
   // calculate the expected vehicle speed and obtain the spatiotemporal profile of ego to the
@@ -298,6 +299,13 @@ DecisionResult IntersectionModule::modifyPathVelocityDetail(PathWithLaneId * pat
   }
 
   if (is_permanent_go_) {
+    // NERO_IX_YIELD_REVOKE: a yielder the commit rested on drives on after all: ego stops where its own stop still
+    // ends short of his way (port of upstream e672f2dd9's stop after the commit, for his path instead of a merge)
+    if (const auto yr_idx = neroYieldRevokeStop(interpolated_path_info, intersection_stoplines.closest_idx)) {
+      return NonOccludedCollisionStop{
+        intersection_stoplines.closest_idx, yr_idx.value(), yr_idx.value(),
+        "yield_revoke: a driver who yielded drives on after all, ego stops short of his way"};
+    }
     // ==========================================================================================
     // Nero c3 (wrong_way_watch): stock never stops after this point. With wrong_way_watch on, ego
     // still stops for an UNSAFE vehicle driving against ego's exit lane towards ego, if it can stop

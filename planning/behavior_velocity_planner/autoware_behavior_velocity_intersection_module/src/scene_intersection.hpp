@@ -620,6 +620,13 @@ private:
 
   //! Nero c3 (wrong_way_watch): stop point latched when the wrong-way stop was first decided
   std::optional<geometry_msgs::msg::Point> wrong_way_stop_point_{std::nullopt};
+  //! NERO_IX_YIELD_REVOKE (yieldrevoke, 2026-11-03): this module's yielders and the objects stamp each was last left
+  //! out, the yielders the permanent GO rested on when it latched, and per such car the decision made once it was
+  //! revoked and unsafe after the commit (true: stop short of its way, false: keep the commit)
+  std::map<std::string, double> nero_yr_yielder_seen_;
+  std::set<std::string> nero_yr_commit_on_;
+  std::map<std::string, std::pair<bool, double>> nero_yr_decided_;  // -> (stop?, objects stamp last needed)
+  bool nero_yr_prev_pgo_{false};
 
   //! NERO_IX_PRIORITY_FROM_SIGNS (T junctions, 2026-10-23): lanes around a straight assigned lanelet that has
   //! no traffic light and no stop line / stop sign of its own, classified by the map's stop lines. Built once;
@@ -1122,6 +1129,23 @@ private:
   std::optional<size_t> findWrongWayWatchStopIndex(
     const autoware_internal_planning_msgs::msg::PathWithLaneId & path,
     const PathLanelets & path_lanelets, const size_t closest_idx);
+
+  //! NERO_IX_YIELD_REVOKE (scene_intersection_nero_revoke.cpp): record the yielders the permanent GO rests on
+  void neroYieldRevokeCommit();
+  //! NERO_IX_YIELD_REVOKE: after the permanent GO, ego's stop index for a revoked yielder the commit rested on, when
+  //! the car's own stop ends short of his way (nullopt: keep the commit)
+  std::optional<size_t> neroYieldRevokeStop(
+    const InterpolatedPathInfo & interpolated_path_info, const size_t closest_idx);
+  //! NERO_IX_YIELD_REVOKE: the decision for one revoked yielder, made once (latched): true = stop short of his way
+  bool neroYieldRevokeDecide(
+    const InterpolatedPathInfo & interpolated_path_info, const ObjectInfo & object_info, const double s_line,
+    const char * where);
+  //! NERO_IX_YIELD_REVOKE: ego's free travel along the path before its footprint meets his way (his box, his predicted
+  //! paths, the unsafe path, his lanes on through every following lanelet for 30 m); n_lanes = his lane sequences
+  double neroYieldRevokeTouch(
+    const InterpolatedPathInfo & interpolated_path_info,
+    const autoware_perception_msgs::msg::PredictedObject & obj, const CollisionInterval & unsafe,
+    size_t * n_lanes = nullptr) const;
 
   /**
    * @brief NERO_IX_PRIORITY_FROM_SIGNS: fill nero_priority_lanes_ (empty if not in scope)

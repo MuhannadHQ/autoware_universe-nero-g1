@@ -14,6 +14,7 @@
 
 #include "scene_intersection.hpp"
 #include "nero_yield_intent.hpp"
+#include "nero_yield_revoke.hpp"  // NERO_IX_YIELD_REVOKE
 
 #include <chrono>
 #include <cstdio>
@@ -1941,6 +1942,12 @@ void IntersectionModule::updateObjectInfoManagerArea()
     if (nero_pullaway_acc() > 0.0 && nero_pullaway_target(predicted_object)) {
       nero_pullaway_update(predicted_object);
     }
+    // NERO_IX_YIELD_REVOKE: the creep rule's speed history of every candidate, also while the yield rule leaves it out
+    // (a revoked yielder is judged on its real gain, not on samples from before its yield)
+    if (nero_yield_revoke::param().on && nero_creep_ix().v_creep > 0.0) {
+      double v_c = 0.0, a_c = 0.0;
+      nero_is_creeper(predicted_object, &v_c, &a_c);
+    }
 
     // ==========================================================================================
     // NOTE: is_parked_vehicle is used because sometimes slow vehicle direction is
@@ -2143,6 +2150,19 @@ void IntersectionModule::updateObjectInfoManagerArea()
                     nero_yield_intent::queued(predicted_object, *planner_data_->predicted_objects, nero_yi_was_);
         yielder = clear > yp.margin && !is_queued;
       }
+      // NERO_IX_YIELD_REVOKE: a yield that ends because the car speeds up: no other exemption takes it as yielding
+      if (nero_yield_revoke::param().on) {
+        if (yielder) {
+          nero_yield_revoke::mark(predicted_object, t_yi, true);
+        } else if (was_yielder && (yv.gain_1s > yp.acc_th || yv.v > yp.v_crawl)) {
+          nero_yield_revoke::mark(predicted_object, t_yi, false);
+          RCLCPP_INFO(
+            logger_,
+            "[NERO_IX] yield_revoke: lane %ld %s drives on (v %.2f, gained %.2f in 1 s): no creep / priority exemption, "
+            "pull-away model, a stop only where it ends short of his way",
+            lane_id_, nero_hex_id(predicted_object).c_str(), yv.v, yv.gain_1s);
+        }
+      }
       const std::string yid = nero_hex_id(predicted_object);
       if (yielder) {
         if (!was_yielder) {
@@ -2168,7 +2188,10 @@ void IntersectionModule::updateObjectInfoManagerArea()
     }
     if (nero_creep_ix().v_creep > 0.0 && nero_ego_path.size() >= 2 && !is_wrong_way_on_ego_lane) {
       double v = 0.0, acc = 0.0;
-      if (nero_is_creeper(predicted_object, &v, &acc)) {
+      if (
+        nero_is_creeper(predicted_object, &v, &acc) &&
+        !nero_yield_revoke::drives_on(  // NERO_IX_YIELD_REVOKE: a yielder that drives on is no creeper
+          predicted_object, rclcpp::Time(planner_data_->predicted_objects->header.stamp).seconds())) {
         const auto & cp = nero_creep_ix();
         const double d_stop = v * (cp.t_react + cp.t_pass) + v * v / (2.0 * cp.a_stop);
         auto stop_pose = predicted_object.kinematics.initial_pose_with_covariance.pose;
@@ -2401,6 +2424,13 @@ void IntersectionModule::updateObjectInfoManagerCollision(
       // Nero c3: a wrong-way driver is not expected to obey the traffic control of its lane
       safe_under_traffic_control = false;
     }
+    // NERO_IX_YIELD_REVOKE: nor is a driver who yielded and drives on after all (its positions show the restart)
+    if (
+      safe_under_traffic_control &&
+      nero_yield_revoke::drives_on(
+        predicted_object, rclcpp::Time(planner_data_->predicted_objects->header.stamp).seconds())) {
+      safe_under_traffic_control = false;
+    }
 
     // ==========================================================================================
     // check the PredictedPath in the ascending order of its confidence to save the safe/unsafe
@@ -2419,7 +2449,13 @@ void IntersectionModule::updateObjectInfoManagerCollision(
       (nero_pullaway_acc() > 0.0 && !is_wrong_way_on_ego_lane && nero_pullaway_target(predicted_object))
         ? nero_pullaway_since(predicted_object)
         : -1.0;
-    if (nero_pullaway_t >= 0.0) {
+    // NERO_IX_YIELD_REVOKE: a yielder that drives on is checked as pulling away from its restart (its positions)
+    const bool nero_yr_pullaway =
+      nero_pullaway_t < 0.0 && nero_pullaway_acc() > 0.0 && !is_wrong_way_on_ego_lane &&
+      nero_pullaway_target(predicted_object) &&
+      nero_yield_revoke::drives_on(
+        predicted_object, rclcpp::Time(planner_data_->predicted_objects->header.stamp).seconds());
+    if (nero_pullaway_t >= 0.0 || nero_yr_pullaway) {
       nero_pullaway = nero_pullaway_paths(
         predicted_object, intersection_lanelets.attention(), planner_param_.common.attention_area_margin,
         planner_param_.common.attention_area_angle_threshold);
