@@ -649,6 +649,17 @@ private:
     //! NERO_IX_PRIORITY_NO_EXIT: SIBLING that is itself a turn (>= 20 deg) off an approach whose every way on is a turn
     //! (a T mouth's other turn): not a straight lane for the "turning off its straight lane" test
     bool turn_sibling{false};
+    //! NERO_IX_PRIORITY_EVIDENCE: YIELD_PRIORITY_ROAD whose entries also go straight on (< 20 deg) into a lane without
+    //! a stop line: a car there may legally drive on, so it is not anticipated to turn
+    bool straight_on{false};
+    double h_start{0.0};  //! NERO_IX_PRIORITY_EVIDENCE: YIELD_PRIORITY_ROAD: heading at its start (the straight on)
+    //! NERO_IX_PRIORITY_READY: YIELD_PRIORITY_ROAD: where its centre line first comes within reach of ego's lane
+    //! (arc length along this turn from its start; < 0 = it never does) and that point (map frame)
+    double ready_s_cross{-1.0};
+    geometry_msgs::msg::Point ready_cross{};
+    //! NERO_IX_PRIORITY_READY: the near / far end of the stretch of ego's lane its body sweeps (on ego's centre line)
+    geometry_msgs::msg::Point ready_near{};
+    geometry_msgs::msg::Point ready_far{};
   };
   std::optional<std::vector<NeroPriorityLane>> nero_priority_lanes_{std::nullopt};
   //! uuidKey() of attention objects treated as yielding to ego this cycle (NERO_IX_PRIORITY_FROM_SIGNS)
@@ -711,11 +722,45 @@ private:
   //! NERO_IX_PRIORITY_NO_EXIT: position history of the cars with a priority verdict, uuidKey() -> (stamp, x, y): their
   //! direction of motion over the last second (the tracker's heading is noisier)
   std::map<std::string, std::vector<std::array<double, 3>>> nero_priority_xy_hist_;
+  //! NERO_IX_PRIORITY_EVIDENCE: per car (uuidKey()) whether it was a vehicle (not UNKNOWN) last cycle: a hand-over
+  //! restarts its histories
+  std::map<std::string, bool> nero_ev_vehicle_;
+  //! NERO_IX_PRIORITY_EVIDENCE: SIBLING lanes (index into nero_priority_lanes_) -> the YIELD_PRIORITY_ROAD turns beside them
+  std::map<size_t, std::vector<size_t>> nero_ev_sib_turns_;
   //! NERO_IX_PRIORITY_NO_EXIT: this cycle's straight swept band of each such car, uuidKey() -> polygon
   std::map<std::string, autoware_utils::Polygon2d> nero_no_exit_bands_;
   //! NERO_IX_PRIORITY_NO_EXIT: the stop pose that keeps ego the margin from such a band, and when it was last needed
   std::optional<geometry_msgs::msg::Pose> nero_no_exit_stop_pose_{std::nullopt};
   double nero_no_exit_stop_time_{-1e9};
+  //! NERO_IX_PRIORITY_TURN (predleft, 2026-11-05): steady time a car last showed its turn in its own positions,
+  //! uuidKey() + turn index -> (consecutive objects messages that showed it, last steady time it held, last stamp counted)
+  mutable std::map<std::string, std::array<double, 3>> nero_turn_shows_;
+  //! NERO_IX_PRIORITY_TURN: the same key -> its heading toward that turn per objects message (stamp, deg; NaN unknown)
+  mutable std::map<std::string, std::deque<std::array<double, 2>>> nero_turn_dev_;
+  //! NERO_IX_PRIORITY_READY (predleft, 2026-11-05): the cars judged straight on (no turn shown yet) that could still
+  //! take a turn across ego without stopping, this cycle (set by the verdict, read by neroReadyCap)
+  struct NeroReadyCand
+  {
+    std::string key;
+    size_t turn{0};
+    double dist_to_line{0.0};
+    double v{0.0};
+    double a{0.0};  //! its deceleration (> 0 slowing), 0 if not braking
+    double acc_up{0.0};   //! its acceleration (> 0 speeding up)
+    double toward{0.0};   //! its sideways drift toward the turn's side over its record [m] (< 0: away)
+    bool slowed{false};   //! it braked toward its line in this record (the likely real turner, also once at its turning speed)
+    double length{4.5};
+    double width{1.9};
+    std::string id;
+  };
+  mutable std::vector<NeroReadyCand> nero_ready_cands_;
+  //! NERO_IX_PRIORITY_READY: cars seen braking toward their line as a READY candidate in their present record, uuidKey()
+  mutable std::set<std::string> nero_ready_slowed_;
+  //! NERO_IX_PRIORITY_READY: ego's arc length to the default stop line (set by isOverPassJudgeLinesStatus; < 0 past it)
+  double nero_ready_dist_to_stop_{-1.0};
+  bool nero_ready_stop_known_{false};
+  //! NERO_IX_PRIORITY_READY: log throttle
+  double nero_ready_last_log_{-1e9};
   //! NERO_IX_PRIORITY_DEBUG (log only): the last verdict's numbers, uuidKey() -> text
   mutable std::string nero_priority_dbg_;
   std::map<std::string, std::string> nero_priority_dbg_text_;
@@ -1083,6 +1128,13 @@ private:
    * @attention this function has access to value() of intersection_lanelets_
    */
   void neroBuildPriorityLanes();
+
+  /**
+   * @brief NERO_IX_PRIORITY_READY: ease ego off (a gentle speed cap ahead of it, never a stop) while a car that has
+   * shown no turn could still take its turn across ego without braking at the moment that would leave ego unable
+   * either to stop before the junction or to clear it once the turn shows
+   */
+  void neroReadyCap(PathWithLaneId * path);
 
   /**
    * @brief NERO_IX_PRIORITY_FROM_SIGNS: 0 = watched as upstream; 1 = yielding (on a lane whose traffic must yield

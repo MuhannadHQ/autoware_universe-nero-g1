@@ -51,6 +51,7 @@
 #include <map>
 #include <list>
 #include <memory>
+#include <sstream>  // NERO_IX_PRIORITY_EVIDENCE
 #include <string>
 #include <utility>
 #include <vector>
@@ -463,6 +464,163 @@ double nero_priority_no_exit()
   return on;
 }
 
+// NERO_IX_PRIORITY_EVIDENCE=<pos_s>,<move_m>[,<right_turn>[,<evidence_only>]] (realize-2, 2026-11-03, QUEUE PREDLEFT; on top of
+// NERO_IX_PRIORITY_CAN_STOP and NERO_IX_PRIORITY_SWING). Ahmed 11-03 #80: "remove anticipating going left from other cars".
+// The priority rule exempts a car that has to yield to ego while it behaves, but CAN_STOP still anticipated a turn from a
+// car that merely could not stop at its turn's line (11-03 #97: a car at a steady 4.1 m/s held the robot at its line and
+// went straight; #90: two braking cars held the robot's right turn 11 s), and the "turning off its lane" test read a
+// fresh track's tracker heading (born 45 deg off its motion) as a turn (#97 first stop). Like Apollo's protected mode
+// (prediction/predictor/predictor.cc: with ego's right of way an obstacle not yet in the junction is not followed into
+// it), with this switch:
+// - the direction of motion of a car (the rule's "heading its lane's way" and "turning off it" tests) comes from its own
+//   positions once it has >= <pos_s> s of them over which it moved >= <move_m> m (NO_EXIT's band uses the same), else
+//   from the tracker's heading as before;
+// - a hand-over (UNKNOWN <-> vehicle) or a position jump restarts a car's speed / heading / position record, a heading flip
+//   (> 90 deg) restarts its heading record, a swing of the tracker's heading counts only when its positions also point
+//   toward the turn (>= 6 deg against the turn's start), and on a priority approach / its straight on only a turn toward
+//   the side of its turns across ego counts as "turning" (none before it has a position record);
+// - <evidence_only> = 1 (absent = 1; Ahmed's #80, DECISIONS PREDLEFT-ANT): on an approach whose turn off the priority road
+//   has a straight on (< 20 deg, no stop line: the car may legally drive on), a car before its line is a potential violator
+//   only when it swings toward the turn (SWING, checked also after ego's pass judge line) or pulls away from a stand
+//   toward its line (CAN_STOP's launch clause, the stand seen in its positions); "cannot stop at its line" alone no longer
+//   anticipates the turn. 0 = CAN_STOP's anticipation as before. A car with no straight on (a T mouth: it must stop either
+//   way) keeps CAN_STOP as before; past its line, turning, creeping or wrong-way it is watched as upstream as before;
+// - <right_turn> = 1: the rule also covers ego's right turn without traffic light and without its own stop line / stop
+//   sign (a right turn off the priority road; the oncoming left turn into the same exit carries the stop line), the
+//   "heading against ego" (PARALLEL) test taken against the right turn's start.
+// Unset = the rules above as before.
+struct NeroEvidenceParam
+{
+  bool on{false};
+  double pos_s{0.5};
+  double move_m{1.0};
+  bool right_turn{false};
+  bool evidence_only{true};
+};
+const NeroEvidenceParam & nero_priority_evidence()
+{
+  static const NeroEvidenceParam p = [] {
+    NeroEvidenceParam q;
+    const char * v = std::getenv("NERO_IX_PRIORITY_EVIDENCE");
+    if (v == nullptr || std::string(v).empty()) return q;
+    std::vector<double> f;
+    std::stringstream ss(v);
+    std::string item;
+    while (std::getline(ss, item, ',')) f.push_back(std::atof(item.c_str()));
+    if (f.size() < 2 || f.at(0) <= 0.0 || f.at(1) <= 0.0) return q;
+    q.on = true;
+    q.pos_s = f.at(0);
+    q.move_m = f.at(1);
+    q.right_turn = f.size() > 2 && f.at(2) > 0.5;
+    q.evidence_only = f.size() <= 3 || f.at(3) > 0.5;
+    return q;
+  }();
+  return p;
+}
+
+// NERO_IX_PRIORITY_TURN=<win_s>,<dev_deg>,<lat_m>[,<n_cycles>[,<hold_s>[,<gate_tol_deg>[,<gate_s>]]]] (predleft, 2026-11-05; QUEUE PREDLEFT, on top of
+// NERO_IX_PRIORITY_EVIDENCE + NERO_IX_PRIORITY_SWING). Ahmed 11-04 (PREDLEFT-ANT (a)): "it should turn and start moving in
+// its direction to slow down for it". A car on the priority road's oncoming approach (or already on its turn, before its
+// line) SHOWS its turn when its own positions over the last <win_s> s move at least <dev_deg> off its lane's direction
+// toward the side of a turn across ego AND at least <lat_m> sideways that way, on <n_cycles> consecutive cycles (the
+// tracker's heading lags a real turn by ~0.5 s: SIM.md 19; the positions lead it). From then (held <hold_s> s after the
+// last cycle that showed it) it is a potential violator, but only once it is SETTLED: for <gate_s> s before the last <win_s>
+// its own heading stayed within <gate_tol_deg> of its lane (a fresh track, a hand-over or a car still turning into the road
+// fakes a turn: the census's false triggers; with the gate 0 of 33 straight passes fired): its turn paths are checked, also after ego's 1st pass judge
+// line (as a SWING). With NERO_IX_PRIORITY_EVIDENCE's <evidence_only>, a car past the stop line of such a turn whose own
+// positions still run along the turn's start (< <dev_deg>) and that has not shown its turn is driving on straight (no
+// anticipation there either: it is not "committed" to the turn). Thresholds from the left-turner census of our own
+// recordings (predleft README). Unset = off.
+struct NeroTurnParam
+{
+  bool on{false};
+  double win_s{0.5};
+  double dev_deg{6.0};
+  double lat_m{0.25};
+  int n_cycles{2};
+  double hold_s{1.5};
+  double gate_tol_deg{4.0};  // settled: its heading over <win_s> stayed within this of its lane ...
+  double gate_s{1.5};        // ... for this long before the last <win_s> (0 = no gate)
+};
+const NeroTurnParam & nero_priority_turn()
+{
+  static const NeroTurnParam p = [] {
+    NeroTurnParam q;
+    const char * v = std::getenv("NERO_IX_PRIORITY_TURN");
+    if (v == nullptr || std::string(v).empty()) return q;
+    std::vector<double> f;
+    std::stringstream ss(v);
+    std::string item;
+    while (std::getline(ss, item, ',')) f.push_back(std::atof(item.c_str()));
+    if (f.size() < 3 || f.at(0) <= 0.0 || f.at(1) <= 0.0 || f.at(2) < 0.0) return q;
+    q.on = true;
+    q.win_s = f.at(0);
+    q.dev_deg = f.at(1);
+    q.lat_m = f.at(2);
+    if (f.size() > 3 && f.at(3) >= 1.0) q.n_cycles = static_cast<int>(f.at(3) + 0.5);
+    if (f.size() > 4 && f.at(4) >= 0.0) q.hold_s = f.at(4);
+    if (f.size() > 5 && f.at(5) > 0.0) q.gate_tol_deg = f.at(5);
+    if (f.size() > 6 && f.at(6) >= 0.0) q.gate_s = f.at(6);
+    return q;
+  }();
+  return p;
+}
+
+// NERO_IX_PRIORITY_READY=<evidence_s>,<react_s>,<a_stop>,<b_max>[,<horizon_s>[,<away_m>[,<acc_release>[,<gap_m>[,<v_floor>]]]]] (predleft, 2026-11-05; QUEUE PREDLEFT, on
+// top of NERO_IX_PRIORITY_EVIDENCE's no-anticipation). Ahmed 10-23: "in saudi you get the occasional crazy driver that
+// doesnt respect the right of way ... we are still ready for him". Without anticipation a car that keeps its speed and
+// turns across ego exactly as ego arrives shows its turn too late for any stop (the turn shows ~0.5-0.8 s after it starts,
+// its body is in ego's path ~1 s after it starts). So while such a car has shown no turn but could still take its turn
+// across ego without braking (before its line, not faster than the turn allows), ego keeps itself READY for him: if its
+// own plan would put it, at the moment he could start that turn + <evidence_s> (until the turn shows) + <react_s> (until
+// ego brakes), too close to the junction to stop at the default stop line with <a_stop> m/s2, and not early enough to
+// clear his way before he could reach it, ego eases off with the gentlest deceleration that restores it (at most <b_max>
+// m/s2, a speed cap ahead of ego: never a stop, never a hard brake for a car that has not turned). He shows no turn ->
+// ego drives on; he turns -> NERO_IX_PRIORITY_TURN / SWING make him a potential violator and the module stops ego in time.
+// Cars more than <horizon_s> s from their turn are not considered; a car is let go when it shows it goes on straight:
+// past the start of its turn by more than it would need to show the turn, drifting at least <away_m> m away from the
+// turn's side over the last ~1.5 s, or speeding up by at least <acc_release> m/s2. <gap_m> > 0: "ready" = able to stop
+// <gap_m> short of the stretch of ego's lane his body would sweep (if that is beyond the stop line), 0 = at the default
+// stop line. <v_floor>: the cap never asks for less than this speed [m/s] (default 1.0). Unset = off.
+struct NeroReadyParam
+{
+  bool on{false};
+  double evidence_s{0.8};
+  double react_s{0.5};
+  double a_stop{3.0};
+  double b_max{1.0};
+  double horizon_s{8.0};
+  double away_m{0.3};       // released when it drifts this far away from its turn side over the last ~1.5 s (0 = off)
+  double acc_release{0.5};  // released when it speeds up at least this much [m/s2] (0 = off)
+  double gap_m{0.0};        // ego may plan its stop up to this short of his swept band instead of the stop line (0 = the line)
+  double v_floor{1.0};      // [m/s] the cap never asks for less
+};
+const NeroReadyParam & nero_priority_ready()
+{
+  static const NeroReadyParam p = [] {
+    NeroReadyParam q;
+    const char * v = std::getenv("NERO_IX_PRIORITY_READY");
+    if (v == nullptr || std::string(v).empty()) return q;
+    std::vector<double> f;
+    std::stringstream ss(v);
+    std::string item;
+    while (std::getline(ss, item, ',')) f.push_back(std::atof(item.c_str()));
+    if (f.size() < 4 || f.at(0) < 0.0 || f.at(1) < 0.0 || f.at(2) <= 0.0 || f.at(3) <= 0.0) return q;
+    q.on = true;
+    q.evidence_s = f.at(0);
+    q.react_s = f.at(1);
+    q.a_stop = f.at(2);
+    q.b_max = f.at(3);
+    if (f.size() > 4 && f.at(4) > 0.0) q.horizon_s = f.at(4);
+    if (f.size() > 5 && f.at(5) >= 0.0) q.away_m = f.at(5);
+    if (f.size() > 6 && f.at(6) >= 0.0) q.acc_release = f.at(6);
+    if (f.size() > 7 && f.at(7) >= 0.0) q.gap_m = f.at(7);
+    if (f.size() > 8 && f.at(8) > 0.0) q.v_floor = f.at(8);
+    return q;
+  }();
+  return p;
+}
+
 // the first 4 bytes of an object's uuid in hex (log lines)
 std::string nero_hex_id(const autoware_perception_msgs::msg::PredictedObject & o)
 {
@@ -753,7 +911,10 @@ void IntersectionModule::neroBuildPriorityLanes()
   const auto routing_graph_ptr = planner_data_->route_handler_->getRoutingGraphPtr();
   const auto assigned_lanelet = lanelet_map_ptr->laneletLayer.get(lane_id_);
   std::string why;
-  if (turn_direction_ != "straight") {
+  // NERO_IX_PRIORITY_EVIDENCE <right_turn>: also ego's right turn off the priority road
+  const bool ev_right_turn = nero_priority_evidence().on && nero_priority_evidence().right_turn &&
+                             turn_direction_ == "right";
+  if (turn_direction_ != "straight" && !ev_right_turn) {
     why = "turn_direction " + turn_direction_;
   } else if (has_traffic_light_) {
     why = "traffic light";
@@ -785,8 +946,13 @@ void IntersectionModule::neroBuildPriorityLanes()
     index[ll.id()] = lanes.size();
     lanes.push_back(NeroPriorityLane{ll, kind, stop_s, 0.0, {}});
   };
-  const double ego_yaw = nero_lanelet_yaw(assigned_lanelet);
+  double ego_yaw = nero_lanelet_yaw(assigned_lanelet);
   const auto ego_centerline = assigned_lanelet.centerline2d();
+  if (ev_right_turn && ego_centerline.size() >= 2) {
+    // NERO_IX_PRIORITY_EVIDENCE: a lane "heading against ego" is judged against the direction ego comes from
+    ego_yaw = std::atan2(
+      ego_centerline[1].y() - ego_centerline[0].y(), ego_centerline[1].x() - ego_centerline[0].x());
+  }
   for (const auto & ll : detection_lanelets) {
     if (!lanelet::utils::contains(conflicting_lanelets, ll)) {
       add(ll, Kind::NORMAL, 0.0);  // wrong-direction neighbours (consider_wrong_direction_vehicle)
@@ -871,6 +1037,10 @@ void IntersectionModule::neroBuildPriorityLanes()
       for (const auto & sibling : routing_graph_ptr->following(entry)) {
         if (sibling.id() != assigned_lanelet.id() && !lanelet::utils::contains(ego_lanelets, sibling)) {
           add(sibling, Kind::SIBLING, 0.0);
+          const auto sit = index.find(sibling.id());  // NERO_IX_PRIORITY_EVIDENCE: the turns it is the straight on of
+          if (sit != index.end() && lanes.at(sit->second).kind == Kind::SIBLING) {
+            nero_ev_sib_turns_[sit->second].push_back(i);
+          }
         }
       }
     }
@@ -888,6 +1058,69 @@ void IntersectionModule::neroBuildPriorityLanes()
     const double dtheta = std::max(0.1, std::fabs(autoware_utils::normalize_radian(h1 - h0)));
     lane.v_turn_max = std::sqrt(kTurnLatAcc * lanelet::utils::getLaneletLength2d(lane.lanelet) / dtheta);
     lane.turn_sign = autoware_utils::normalize_radian(h1 - h0) >= 0.0 ? 1.0 : -1.0;  // NERO_IX_PRIORITY_SWING
+    lane.h_start = h0;                                                               // NERO_IX_PRIORITY_EVIDENCE
+    if (nero_priority_ready().on) {
+      // NERO_IX_PRIORITY_READY: the first point of this turn's centre line within reach of ego's lane (a car's half width
+      // 1.0 m + ego's half width + 0.2 m from ego's centre line), sampled every 0.25 m
+      const double reach = 1.2 + 0.5 * planner_data_->vehicle_info_.vehicle_width_m;
+      const auto ego_cl = assigned_lanelet.centerline2d();
+      const double len = lanelet::utils::getLaneletLength2d(lane.lanelet);
+      // and the stretch of ego's centre line that its body sweeps there (+- its half width 1.0 m along ego's lane)
+      double near = std::numeric_limits<double>::infinity(), far = -near;
+      for (double s = 0.0; s <= len + 1e-6 && ego_cl.size() >= 2; s += 0.25) {
+        const auto pt = lanelet::geometry::interpolatedPointAtDistance(lane.lanelet.centerline2d(), s);
+        if (lanelet::geometry::distance2d(ego_cl, pt) <= reach) {
+          if (lane.ready_s_cross < 0.0) {
+            lane.ready_s_cross = s;
+            lane.ready_cross.x = pt.x();
+            lane.ready_cross.y = pt.y();
+          }
+          const double ea = lanelet::geometry::toArcCoordinates(ego_cl, pt).length;
+          near = std::min(near, ea);
+          far = std::max(far, ea);
+        }
+      }
+      if (lane.ready_s_cross >= 0.0) {
+        const double ego_len = lanelet::geometry::length(ego_cl);
+        const auto pn = lanelet::geometry::interpolatedPointAtDistance(ego_cl, std::clamp(near - 1.0, 0.0, ego_len));
+        const auto pf = lanelet::geometry::interpolatedPointAtDistance(ego_cl, std::clamp(far + 1.0, 0.0, ego_len));
+        lane.ready_near.x = pn.x();
+        lane.ready_near.y = pn.y();
+        lane.ready_far.x = pf.x();
+        lane.ready_far.y = pf.y();
+      }
+    }
+  }
+  // NERO_IX_PRIORITY_EVIDENCE: a turn off the priority road every entry of which also goes straight on (< 20 deg) into a
+  // lane without a stop line / stop sign (the priority road continues there)
+  if (nero_priority_evidence().on) {
+    constexpr double kStraightOnRad = 20.0 / 180.0 * M_PI;
+    auto goes_straight_on = [&](const lanelet::ConstLanelet & entry, const lanelet::ConstLanelet & turn) {
+      for (const auto & sib : routing_graph_ptr->following(entry)) {
+        if (
+          sib.id() == turn.id() || sib.id() == assigned_lanelet.id() ||
+          lanelet::utils::contains(ego_lanelets, sib)) {
+          continue;
+        }
+        const auto c = sib.centerline2d();
+        if (c.size() < 2) continue;
+        const double h0 = std::atan2(c[1].y() - c[0].y(), c[1].x() - c[0].x());
+        const double h1 = std::atan2(
+          c[c.size() - 1].y() - c[c.size() - 2].y(), c[c.size() - 1].x() - c[c.size() - 2].x());
+        if (
+          std::fabs(autoware_utils::normalize_radian(h1 - h0)) < kStraightOnRad && nero_stop_lines(sib).empty()) {
+          return true;
+        }
+      }
+      return false;
+    };
+    for (auto & lane : lanes) {
+      if (lane.kind != Kind::YIELD_PRIORITY_ROAD) continue;
+      const auto entries = routing_graph_ptr->previous(lane.lanelet);
+      lane.straight_on = !entries.empty() && std::all_of(entries.begin(), entries.end(), [&](const auto & e) {
+        return goes_straight_on(e, lane.lanelet);
+      });
+    }
   }
   // distance from the end of each priority-road approach lane to the stop line of each turn it leads into
   std::function<std::vector<std::pair<size_t, double>>(const lanelet::ConstLanelet &, int)> to_line =
@@ -979,6 +1212,7 @@ void IntersectionModule::neroBuildPriorityLanes()
       if (lane.kind == Kind::YIELD_PRIORITY_ROAD && std::isfinite(lane.v_exit_max)) {
         text += fmt::format(", ways on <= {:.1f} m/s", lane.v_exit_max);  // NERO_IX_PRIORITY_NO_EXIT
       }
+      if (lane.straight_on) text += ", straight on";  // NERO_IX_PRIORITY_EVIDENCE
       text += ")";
     }
     if (lane.kind == Kind::APPROACH_PRIORITY && std::isfinite(lane.v_exit_max) && lane.v_exit_max < 15.0) {
@@ -986,7 +1220,9 @@ void IntersectionModule::neroBuildPriorityLanes()
     }
     if (lane.turn_sibling) text += "(a turn)";  // NERO_IX_PRIORITY_NO_EXIT
   }
-  RCLCPP_INFO(logger_, "[NERO_IX] priority_from_signs: lane %ld in scope:%s", lane_id_, text.c_str());
+  RCLCPP_INFO(
+    logger_, "[NERO_IX] priority_from_signs: lane %ld in scope%s:%s", lane_id_,
+    ev_right_turn ? " (right turn, NERO_IX_PRIORITY_EVIDENCE)" : "", text.c_str());
 }
 
 int IntersectionModule::neroPriorityVerdict(
@@ -1014,8 +1250,55 @@ int IntersectionModule::neroPriorityVerdict(
   // direction of motion: velocity direction (heading flipped when reversing, and so the lateral velocity) plus the
   // lateral velocity
   const double lateral = twist.x < 0.0 ? -twist.y : twist.y;
-  const double motion_angle =
+  double motion_angle =
     tf2::getYaw(object_direction.orientation) + std::atan2(lateral, std::fabs(twist.x));
+  // NERO_IX_PRIORITY_EVIDENCE: from its own positions once it has >= pos_s s of them over which it moved >= move_m (a
+  // fresh track's heading can be tens of degrees off its motion and swing back over 1-2 s: 11-03 #97)
+  const auto & ev = nero_priority_evidence();
+  bool motion_from_positions = false;
+  if (ev.on) {
+    const auto xy_it = nero_priority_xy_hist_.find(uuidKey(object.object_id));
+    if (xy_it != nero_priority_xy_hist_.end() && !xy_it->second.empty()) {
+      // the oldest position within the last second; when that is younger than pos_s (a gap: the car was outside the
+      // attention area for a while) the newest one at least pos_s old (the history keeps 1.5 s)
+      const auto & h = xy_it->second;
+      const auto & last = h.back();
+      const std::array<double, 3> * ref = nullptr;
+      for (const auto & q : h) {
+        if (q[0] < last[0] - 1.0 - 1e-3) continue;
+        ref = &q;
+        break;
+      }
+      if (ref == nullptr || last[0] - (*ref)[0] < ev.pos_s - 1e-3) {
+        ref = nullptr;
+        for (auto it = h.rbegin(); it != h.rend(); ++it) {
+          if (last[0] - (*it)[0] >= ev.pos_s - 1e-3) {
+            ref = &(*it);
+            break;
+          }
+        }
+      }
+      if (ref != nullptr && std::hypot(last[1] - (*ref)[1], last[2] - (*ref)[2]) >= ev.move_m) {
+        motion_angle = std::atan2(last[2] - (*ref)[2], last[1] - (*ref)[1]);
+        motion_from_positions = true;
+      }
+    }
+  }
+  // NERO_IX_PRIORITY_EVIDENCE: its own positions show it stood (moved < 0.3 m over >= 0.5 s) within its record (1.5 s): a
+  // fresh track born at 0 m/s or a hand-over reports a "launch" while the car was moving all along
+  auto stood_by_positions = [&]() {
+    const auto xy_it = nero_priority_xy_hist_.find(uuidKey(object.object_id));
+    if (xy_it == nero_priority_xy_hist_.end()) return false;
+    const auto & h = xy_it->second;
+    for (size_t a = 0; a < h.size(); ++a) {
+      for (size_t b = a + 1; b < h.size(); ++b) {
+        if (h[b][0] - h[a][0] < 0.5 - 1e-3) continue;
+        if (std::hypot(h[b][1] - h[a][1], h[b][2] - h[a][2]) < 0.3) return true;
+        break;
+      }
+    }
+    return false;
+  };
   const double stop_dist = speed * speed / (2.0 * kStopDecel);
   // NERO_IX_PRIORITY_CAN_STOP: can it still stop at its line (speed v, distance d), from its actual motion?
   const double can_stop_horizon = nero_priority_can_stop();
@@ -1047,6 +1330,20 @@ int IntersectionModule::neroPriorityVerdict(
     if (!nero_priority_swing_known_) return false;  // < 1 s of heading history: the turning rule watches it
     const std::string key = swing_key + (lanes.at(y).turn_sign > 0.0 ? "L" : "R");
     const double toward = lanes.at(y).turn_sign * nero_priority_swing_;
+    if (ev.on && motion_from_positions) {
+      // NERO_IX_PRIORITY_EVIDENCE: a swing of the tracker's heading counts only if its own positions also point at least
+      // half the turning angle toward the turn (against the turn's start = straight on): at a real turn's onset the
+      // positions lead the reported heading (SIM.md 19); a converging fresh heading moves the heading alone
+      const double dev = lanes.at(y).turn_sign *
+                         autoware_utils::normalize_radian(motion_angle - lanes.at(y).h_start) * 180.0 / M_PI;
+      if (dev < 0.5 * kTurnDeg) {
+        if (toward >= swing_deg && nero_priority_debug()) {
+          nero_priority_dbg_ += fmt::format(" | swing {:.0f} not in its motion (dev {:.0f})", toward, dev);
+        }
+        nero_priority_swinging_.erase(key);
+        return false;
+      }
+    }
     if (toward >= swing_deg) {
       nero_priority_swinging_.insert(key);
     } else if (toward < 0.5 * swing_deg) {
@@ -1060,6 +1357,10 @@ int IntersectionModule::neroPriorityVerdict(
       "v {:.2f} a_obs {:.2f}{}{} t_pj {:.2f}{}", speed, a_obs, braking ? " brk" : "",
       nero_priority_a_launch_ > 0.0 ? fmt::format(" launch {:.2f}", nero_priority_a_launch_) : "", t_ahead,
       nero_priority_swing_known_ ? fmt::format(" swing {:.1f}", nero_priority_swing_) : "");
+    if (motion_from_positions) {  // NERO_IX_PRIORITY_EVIDENCE
+      nero_priority_dbg_ += fmt::format(" pos {:.0f} (yaw {:.0f})", motion_angle * 180.0 / M_PI,
+        (tf2::getYaw(object_direction.orientation) + std::atan2(lateral, std::fabs(twist.x))) * 180.0 / M_PI);
+    }
   }
   auto cannot_stop = [&](const size_t y, const double v, const double d) {
     // it could take the turn only at <= v_turn_max: a car braking toward it is judged by its speed at the line
@@ -1073,6 +1374,107 @@ int IntersectionModule::neroPriorityVerdict(
     // junction with up to kStopDecel (the braking a car that yields uses, 2-3 m/s2)
     const double a_req = d > 0.05 ? v * v / (2.0 * d) : (v > 0.5 ? 1e9 : 0.0);
     return a_req > (braking ? kStopDecel : a_exp);
+  };
+  // NERO_IX_PRIORITY_TURN: the direction of the lane the car is judged on (set in the lane loop below before potential())
+  double cur_lane_angle = 0.0;
+  // NERO_IX_PRIORITY_TURN: past the stop line of the turn being judged, still moving along the turn's start (set below)
+  bool past_straight = false;
+  const auto & tp = nero_priority_turn();
+  const auto & rp = nero_priority_ready();
+  // NERO_IX_PRIORITY_TURN: do its own positions over the last win_s s move toward the side of turn y (vs its lane)?
+  auto turn_shows = [&](const size_t y) {
+    if (!tp.on || !ev.on) return false;
+    const std::string tkey = uuidKey(object.object_id) + "#" + std::to_string(y);
+    const double now = nero_steady_now();
+    bool fire = false, computed = false;
+    double dev = 0.0, lat = 0.0;
+    const auto xy_it = nero_priority_xy_hist_.find(uuidKey(object.object_id));
+    if (xy_it != nero_priority_xy_hist_.end() && xy_it->second.size() >= 2) {
+      const auto & h = xy_it->second;
+      const auto & last = h.back();
+      const std::array<double, 3> * ref = nullptr;
+      for (auto it = h.rbegin(); it != h.rend(); ++it) {
+        if (last[0] - (*it)[0] >= tp.win_s - 1e-3) {
+          ref = &(*it);
+          break;
+        }
+      }
+      if (ref != nullptr) {
+        const double dx = last[1] - (*ref)[1], dy = last[2] - (*ref)[2];
+        const double lon = dx * std::cos(cur_lane_angle) + dy * std::sin(cur_lane_angle);
+        lat = lanes.at(y).turn_sign * (-dx * std::sin(cur_lane_angle) + dy * std::cos(cur_lane_angle));
+        if (std::hypot(dx, dy) >= 1.0 && lon > 0.0) {
+          dev = std::atan2(lat, lon) * 180.0 / M_PI;
+          computed = true;
+          fire = dev >= tp.dev_deg && lat >= tp.lat_m;
+        }
+      }
+    }
+    const double stamp = rclcpp::Time(planner_data_->predicted_objects->header.stamp).seconds();
+    // its heading history (this turn's side, NaN while not computable) for the settled gate, one value per message
+    auto & dh = nero_turn_dev_[tkey];
+    if (dh.empty() || stamp > dh.back()[0] + 1e-6) {
+      dh.push_back({stamp, computed ? dev : std::numeric_limits<double>::quiet_NaN()});
+    }
+    while (!dh.empty() && dh.front()[0] < stamp - (tp.win_s + tp.gate_s + 0.5)) dh.pop_front();
+    if (fire && tp.gate_s > 0.0) {
+      int n = 0;
+      bool settled = true;
+      for (const auto & q : dh) {
+        if (q[0] < stamp - tp.win_s - tp.gate_s - 1e-6 || q[0] > stamp - tp.win_s + 1e-6) continue;
+        if (!std::isfinite(q[1]) || std::fabs(q[1]) > tp.gate_tol_deg) {
+          settled = false;
+          break;
+        }
+        ++n;
+      }
+      if (!settled || n < 5) {
+        if (dbg) nero_priority_dbg_ += fmt::format(" | turn {} pos dev {:.1f} not settled", lanes.at(y).lanelet.id(), dev);
+        fire = false;
+      }
+    }
+    // [0] consecutive objects messages that showed it, [1] steady time it last held, [2] the objects stamp counted last
+    // (a car in two lanes is judged twice per cycle: count each message once)
+    auto & st = nero_turn_shows_[tkey];
+    if (stamp > st[2] + 1e-6) {
+      st[2] = stamp;
+      st[0] = fire ? st[0] + 1.0 : 0.0;
+      if (fire && st[0] >= tp.n_cycles - 1e-6) st[1] = now;
+    }
+    const bool shows = st[1] > 0.0 && now - st[1] <= tp.hold_s;
+    if (dbg && (fire || shows)) {
+      nero_priority_dbg_ += fmt::format(" | turn {} pos dev {:.1f} lat {:.2f}{}", lanes.at(y).lanelet.id(), dev, lat,
+        shows ? " SHOWS" : "");
+    }
+    return shows;
+  };
+  // NERO_IX_PRIORITY_READY: a car judged straight on that could still take turn y without braking (or braking into it)
+  auto ready_candidate = [&](const size_t y, const double dist_to_line) {
+    if (!rp.on || !ev.on || speed < 1.0) return;
+    NeroReadyCand c;
+    c.key = uuidKey(object.object_id);
+    c.turn = y;
+    c.dist_to_line = dist_to_line;
+    c.v = speed;
+    c.a = braking ? std::max(0.0, a_obs) : 0.0;
+    c.acc_up = std::max(0.0, std::max(-a_obs, nero_priority_a_launch_));
+    if (braking) nero_ready_slowed_.insert(c.key);
+    c.slowed = nero_ready_slowed_.count(c.key) > 0;
+    // its sideways drift toward the side of turn y over its record (>= 1 s of positions, the oldest within 1.5 s)
+    const auto xy_it = nero_priority_xy_hist_.find(c.key);
+    if (xy_it != nero_priority_xy_hist_.end() && xy_it->second.size() >= 2) {
+      const auto & h = xy_it->second;
+      const auto & a = h.front();
+      const auto & b = h.back();
+      if (b[0] - a[0] >= 1.0 - 1e-3) {
+        const double dx = b[1] - a[1], dy = b[2] - a[2];
+        c.toward = lanes.at(y).turn_sign * (-dx * std::sin(cur_lane_angle) + dy * std::cos(cur_lane_angle));
+      }
+    }
+    c.length = object.shape.dimensions.x;
+    c.width = object.shape.dimensions.y;
+    c.id = nero_hex_id(object);
+    nero_ready_cands_.push_back(c);
   };
   auto potential = [&](const size_t y, const double dist_to_line) {
     if (can_stop_horizon < 0.0) {
@@ -1094,11 +1496,47 @@ int IntersectionModule::neroPriorityVerdict(
         }
         return;
       }
+      if (turn_shows(y)) {
+        // NERO_IX_PRIORITY_TURN: its positions move toward its turn: its turn paths are checked, also after ego's 1st pass
+        // judge line (as a swing)
+        nero_priority_hard_ = true;
+        pv_turns->push_back(y);
+        if (dbg) {
+          nero_priority_dbg_ += fmt::format(" | turn {} d {:.1f} -> TURN SHOWS (late check)",
+            lanes.at(y).lanelet.id(), dist_to_line);
+        }
+        return;
+      }
       if (braking) {
         // slowing down while heading straight: a signal, not a violation (Ahmed 10-24)
+        // NERO_IX_PRIORITY_READY: it may also be slowing into its turn: ego stays ready for it (gentle, never a stop)
+        if (lanes.at(y).straight_on) ready_candidate(y, dist_to_line);
         if (dbg) {
           nero_priority_dbg_ += fmt::format(" | turn {} d {:.1f} -> braking, no swing: yielding",
             lanes.at(y).lanelet.id(), dist_to_line);
+        }
+        return;
+      }
+      if (ev.on && ev.evidence_only && lanes.at(y).straight_on && (dist_to_line > 0.0 || past_straight)) {
+        // NERO_IX_PRIORITY_EVIDENCE: heading straight before its line with a straight on: no turn is anticipated
+        // ("cannot stop at its line" alone is no violation, Ahmed 11-03 #80); a launch from a stand toward its line
+        // still makes it a potential violator (CAN_STOP's clause below, checked also after ego's pass judge line)
+        const double a_up = std::max(-a_obs, nero_priority_a_launch_);
+        bool launch = false;
+        if (a_up >= kPullAwayAcc && can_stop_horizon > 0.0 && stood_by_positions()) {
+          const double v2 = speed + a_up * can_stop_horizon;
+          const double d2 = dist_to_line - 0.5 * (speed + v2) * can_stop_horizon;
+          launch = v2 <= lanes.at(y).v_turn_max && (d2 > 0.05 ? v2 * v2 / (2.0 * d2) : 1e9) > kStopDecel;
+        }
+        if (launch) {
+          nero_priority_hard_ = true;
+          pv_turns->push_back(y);
+        } else if (speed <= lanes.at(y).v_turn_max) {
+          ready_candidate(y, dist_to_line);  // NERO_IX_PRIORITY_READY: it could still take the turn without braking
+        }
+        if (dbg) {
+          nero_priority_dbg_ += fmt::format(" | turn {} d {:.1f} -> {}", lanes.at(y).lanelet.id(), dist_to_line,
+            launch ? "LAUNCH toward it (late check)" : "straight on, no swing: yielding (evidence)");
         }
         return;
       }
@@ -1147,6 +1585,7 @@ int IntersectionModule::neroPriorityVerdict(
   for (size_t i = 0; i < lanes.size(); ++i) {
     const auto & lane = lanes.at(i);
     if (!lanelet::utils::isInLanelet(object_direction, lane.lanelet, margin)) continue;
+    past_straight = false;  // NERO_IX_PRIORITY_TURN
     const double lane_angle = lanelet::utils::getLaneletAngle(lane.lanelet, object_direction.position);
     const double angle_diff = autoware_utils::normalize_radian(lane_angle - motion_angle, -M_PI);
     const bool along = std::fabs(angle_diff) < angle_thr;
@@ -1165,17 +1604,52 @@ int IntersectionModule::neroPriorityVerdict(
     }
     if (!along) continue;  // exempt only when heading the lane's way (a reversed / wrong-way car stays watched)
     const bool turning = speed >= kTurnMinSpeed && std::fabs(angle_diff) > kTurnDeg / 180.0 * M_PI;
+    // NERO_IX_PRIORITY_EVIDENCE: on a priority-road approach only a turn toward the side of one of its turns across ego
+    // counts (a car easing back into its lane from over the centre line, or veering to its kerb, is not turning in)
+    bool turning_in = turning;
+    const double side = angle_diff < 0.0 ? 1.0 : -1.0;  // +1: it moves to the left of its lane's direction
+    if (
+      ev.on && turning && !motion_from_positions &&
+      ((lane.kind == Kind::APPROACH_PRIORITY && !lane.to_line.empty()) ||
+       (lane.kind == Kind::SIBLING && nero_ev_sib_turns_.count(i) > 0))) {
+      // no record of its own motion yet (< pos_s of positions: a fresh track's heading can be tens of degrees off)
+      turning_in = false;
+      if (dbg) nero_priority_dbg_ += " | no motion record yet";
+    } else if (ev.on && turning && lane.kind == Kind::APPROACH_PRIORITY && !lane.to_line.empty()) {
+      turning_in = std::any_of(lane.to_line.begin(), lane.to_line.end(), [&](const auto & yd) {
+        return side * lanes.at(yd.first).turn_sign > 0.0;
+      });
+      if (dbg && !turning_in) nero_priority_dbg_ += " | veers away from its turns";
+    } else if (ev.on && turning && lane.kind == Kind::SIBLING && nero_ev_sib_turns_.count(i) > 0) {
+      // the straight on next to its turns: the same, toward the side of those turns
+      const auto & sib_turns = nero_ev_sib_turns_.at(i);
+      turning_in = std::any_of(sib_turns.begin(), sib_turns.end(), [&](const size_t y) {
+        return side * lanes.at(y).turn_sign > 0.0;
+      });
+      if (dbg && !turning_in) nero_priority_dbg_ += " | veers away from the turn beside";
+    }
     // leaving its straight lane, toward ego or not (NERO_IX_PRIORITY_NO_EXIT: a T mouth's other turn is no straight lane)
-    if (straight_lane && turning && !lane.turn_sibling) watched = true;
+    if (straight_lane && turning_in && !lane.turn_sibling) watched = true;
     if (lane.kind == Kind::YIELD_PRIORITY_ROAD) {
       const double s_obj = lanelet::utils::getArcCoordinates({lane.lanelet}, object_direction).length;
-      if (s_obj > lane.stop_s) {
+      past_straight = false;
+      if (
+        s_obj > lane.stop_s && tp.on && ev.on && ev.evidence_only && lane.straight_on && motion_from_positions &&
+        speed >= kStraightMinSpeed &&
+        std::fabs(autoware_utils::normalize_radian(motion_angle - lane.h_start)) < tp.dev_deg / 180.0 * M_PI) {
+        // NERO_IX_PRIORITY_TURN: past its line but still running along the turn's start: driving on straight, judged
+        // by its turn evidence (potential() below), not committed to the turn
+        past_straight = true;
+        if (dbg) nero_priority_dbg_ += " | past its line, straight";
+      }
+      if (s_obj > lane.stop_s && !past_straight) {
         committed = true;
       } else {
         exempt = true;
       }
       v_exit_here = lane.v_exit_max;  // NERO_IX_PRIORITY_NO_EXIT
       no_exit_lane_yaw = lane_angle;
+      cur_lane_angle = lane.h_start;  // NERO_IX_PRIORITY_TURN: against the turn's start (its local direction already turns)
       potential(i, lane.stop_s - s_obj);  // negative past the line: it may still turn if slow enough
     } else if (lane.kind == Kind::APPROACH_PRIORITY) {
       exempt = true;
@@ -1183,11 +1657,12 @@ int IntersectionModule::neroPriorityVerdict(
                           lanelet::utils::getArcCoordinates({lane.lanelet}, object_direction).length;
       v_exit_here = lane.v_exit_max;  // NERO_IX_PRIORITY_NO_EXIT
       no_exit_lane_yaw = lane_angle;
+      cur_lane_angle = lane_angle;  // NERO_IX_PRIORITY_TURN
       for (const auto & [y, d] : lane.to_line) potential(y, rest + d);
     } else {  // PARALLEL, SIBLING
       if (lane.kind == Kind::PARALLEL) exempt = true;
       if (
-        !turning && speed >= kStraightMinSpeed &&
+        !turning_in && speed >= kStraightMinSpeed &&  // turning_in == turning unless NERO_IX_PRIORITY_EVIDENCE
         lanelet::utils::isInLanelet(object_direction, lane.lanelet, 0.0)) {
         straight_on = true;
       }
@@ -1199,6 +1674,163 @@ int IntersectionModule::neroPriorityVerdict(
   std::sort(pv_turns->begin(), pv_turns->end());
   pv_turns->erase(std::unique(pv_turns->begin(), pv_turns->end()), pv_turns->end());
   return pv_turns->empty() ? kYielding : kPotential;
+}
+
+void IntersectionModule::neroReadyCap(PathWithLaneId * path)
+{
+  // NERO_IX_PRIORITY_READY (predleft, 2026-11-05): see nero_priority_ready()
+  const auto & rp = nero_priority_ready();
+  if (!rp.on || nero_ready_cands_.empty() || !nero_priority_lanes_ || !nero_ready_stop_known_) return;
+  const double d_sl = nero_ready_dist_to_stop_;  // ego (base_link) to the default stop line
+  if ((d_sl <= 0.0 && rp.gap_m <= 0.0) || path->points.size() < 2) return;
+  const double v_e = std::max(0.0, planner_data_->current_velocity->twist.linear.x);
+  const double kVFloor = rp.v_floor;  // [m/s] the cap never asks for less
+  if (v_e < 1.0) return;  // (between 1.0 and the floor the cap holds ego at the floor while it is not ready)
+  constexpr double kStopMargin = 0.5;  // [m] ego's stop short of the default stop line
+  constexpr double kClearMargin = 0.5;  // [s] ego through his way this long before he could reach it
+  // [m/s2] the stop ego keeps ready for a car slowing into its turn, as planned here: a short stop at the line is realized
+  // ~1.6x firmer by the controller under field braking (rt90 slow_left_n: planned 1.33-1.60 -> command 2.16-2.73), so 1.3
+  // keeps the command near 2.0
+  constexpr double kGentleStop = 1.3;
+  const auto & lanes = nero_priority_lanes_.value();
+  const auto & ego_pos = planner_data_->current_odometry->pose.position;
+  const double rear = planner_data_->vehicle_info_.rear_overhang_m;
+  constexpr double kInf = std::numeric_limits<double>::infinity();
+  // arc length along the path to a point's projection on its nearest segment = motion_utils' findNearestSegmentIndex +
+  // calcLongitudinalOffsetToSegment arithmetic without their per-call path copies (nero_lint; trajgap / bppstall)
+  const size_t n_pts = path->points.size();
+  std::vector<double> cum(n_pts, 0.0);
+  for (size_t i = 1; i < n_pts; ++i) {
+    const auto & a = path->points.at(i - 1).point.pose.position;
+    const auto & q = path->points.at(i).point.pose.position;
+    cum.at(i) = cum.at(i - 1) + std::hypot(q.x - a.x, q.y - a.y);
+  }
+  auto lon_to_seg = [&](const size_t k, const geometry_msgs::msg::Point & p) {
+    const auto & a = path->points.at(k).point.pose.position;
+    const auto & q = path->points.at(k + 1).point.pose.position;
+    const double dx = q.x - a.x, dy = q.y - a.y, len = std::hypot(dx, dy);
+    return len > 1e-9 ? ((p.x - a.x) * dx + (p.y - a.y) * dy) / len : 0.0;
+  };
+  auto seg_of = [&](const geometry_msgs::msg::Point & p) -> size_t {
+    const size_t i = autoware::motion_utils::findNearestIndex(path->points, p);  // a scan, no copy
+    if (i == 0) return 0;
+    if (i >= n_pts - 1) return n_pts - 2;
+    return lon_to_seg(i, p) <= 0.0 ? i - 1 : i;
+  };
+  auto s_of = [&](const geometry_msgs::msg::Point & p) {
+    const size_t k = seg_of(p);
+    return cum.at(k) + lon_to_seg(k, p);
+  };
+  const size_t seg = seg_of(ego_pos);
+  const double off = lon_to_seg(seg, ego_pos);
+  const double s_ego = cum.at(seg) + off;
+  // ego's arc length to the near / far end of each turn's swept stretch of its lane (one lookup per turn and cycle)
+  std::map<size_t, std::pair<double, double>> d_band;
+  const double front = planner_data_->vehicle_info_.max_longitudinal_offset_m;
+  double b_need = 0.0;
+  const NeroReadyCand * worst = nullptr;
+  double worst_ts = 0.0;
+  double worst_allow = d_sl;
+  bool worst_full = true;
+  for (const auto & c : nero_ready_cands_) {
+    const auto & turn = lanes.at(c.turn);
+    if (turn.ready_s_cross < 0.0) continue;
+    // his time to the start of the turn and until his front reaches ego's lane through it, at his speed; a car braking
+    // into its turn as slowing at its present rate down to a turning speed (kTurnV) and keeping that
+    constexpr double kTurnV = 2.5;  // [m/s] the slowest real turners kept through the turn (census: predleft README)
+    auto t_at = [&](const double d) {
+      if (d <= 0.0) return 0.0;
+      if (c.a > 0.1 && c.v > kTurnV) {
+        const double d_slow = (c.v * c.v - kTurnV * kTurnV) / (2.0 * c.a);
+        if (d <= d_slow) return (c.v - std::sqrt(std::max(0.0, c.v * c.v - 2.0 * c.a * d))) / c.a;
+        return (c.v - kTurnV) / c.a + (d - d_slow) / kTurnV;
+      }
+      return d / c.v;
+    };
+    const double d_start = c.dist_to_line - turn.stop_s;
+    // let go: past the start of its turn by more than it needs to show the turn, drifting away from its turn's side,
+    // or speeding up (a car does not speed up into a turn across ego)
+    if (d_start < -(c.v * rp.evidence_s + 1.0)) continue;
+    if (rp.away_m > 0.0 && c.toward <= -rp.away_m) continue;
+    if (rp.acc_release > 0.0 && c.acc_up >= rp.acc_release) continue;
+    const double t_s = t_at(d_start);
+    const double t_in = t_at(d_start + turn.ready_s_cross - 0.5 * c.length);
+    if (!std::isfinite(t_s) || t_s > rp.horizon_s) continue;
+    if (d_band.count(c.turn) == 0) {
+      d_band[c.turn] = {s_of(turn.ready_near) - s_ego, s_of(turn.ready_far) - s_ego};
+    }
+    const double d_near = d_band.at(c.turn).first, d_far = d_band.at(c.turn).second;
+    if (d_far + rear < 0.0) continue;  // ego is through his way
+    // ego, keeping its speed, is through his way (its rear past the far end) before he could reach ego's lane
+    if (std::isfinite(t_in) && d_far + rear <= v_e * (t_in - kClearMargin)) continue;
+    // where ego must be able to stop: the default stop line, or (a car keeping its speed) up to gap_m short of his swept
+    // stretch; a car slowing into its turn is the likely real turner: ego keeps to the line and to a gentle stop (also
+    // once it has slowed to its turning speed and holds it: rt90 slow_left_n, 6 -> 3.1 m/s, then a 3.0 stop was kept)
+    const bool slowing = c.a > 0.1 || c.slowed;
+    const double a_stop = slowing ? std::min(rp.a_stop, kGentleStop) : rp.a_stop;
+    const double d_allow =
+      std::max(d_sl - kStopMargin, (rp.gap_m > 0.0 && !slowing) ? d_near - front - rp.gap_m : -kInf);
+    // can ego still stop at the default stop line when his turn would show (t_s + evidence) and it reacts (+ react)?
+    const double t_e = t_s + rp.evidence_s + rp.react_s;
+    auto ready_with = [&](const double b) {
+      const double t1 = b > 1e-6 ? std::min(t_e, std::max(0.0, (v_e - kVFloor) / b)) : t_e;
+      const double v1 = v_e - b * t1;
+      const double x = v_e * t1 - 0.5 * b * t1 * t1 + v1 * (t_e - t1);
+      return d_allow - x >= v1 * v1 / (2.0 * a_stop);
+    };
+    if (d_allow <= 0.0) continue;  // ego cannot stop short of it any more: the module's own checks decide
+    if (ready_with(0.0)) continue;
+    double b = rp.b_max;
+    const bool full = ready_with(rp.b_max);
+    if (full) {
+      double lo = 0.0, hi = rp.b_max;
+      for (int k = 0; k < 14; ++k) {
+        const double mid = 0.5 * (lo + hi);
+        (ready_with(mid) ? hi : lo) = mid;
+      }
+      b = hi;
+    }
+    if (b > b_need) {
+      b_need = b;
+      worst = &c;
+      worst_ts = t_s;
+      worst_allow = d_allow;
+      worst_full = full;
+    }
+  }
+  if (b_need <= 0.0 || worst == nullptr) return;
+  // the cap: v(s) = sqrt(v_e^2 - 2 b s) ahead of ego (not below kVFloor), ego's speed on the points behind it (the
+  // trajectory starts behind ego: an uncapped point there leaks into the speed planned at ego)
+  double s = -off;
+  size_t n_capped = 0;
+  for (size_t i = 0; i < path->points.size(); ++i) {
+    if (i > seg) {
+      const auto & a = path->points.at(i - 1).point.pose.position;
+      const auto & q = path->points.at(i).point.pose.position;
+      s += std::hypot(q.x - a.x, q.y - a.y);
+    }
+    const double cap = i <= seg ? v_e : std::sqrt(std::max(kVFloor * kVFloor, v_e * v_e - 2.0 * b_need * std::max(0.0, s)));
+    auto & vel = path->points.at(i).point.longitudinal_velocity_mps;
+    if (vel > cap) {
+      vel = static_cast<float>(cap);
+      ++n_capped;
+    }
+    if (i > seg && s > std::max(d_sl, worst_allow) + 2.0) break;
+  }
+  char txt[96];
+  std::snprintf(txt, sizeof(txt), " | NERO ready -%.2f for %s (%.1f s to its turn)", b_need, worst->id.c_str(), worst_ts);
+  internal_debug_data_.decision_type += txt;
+  const double now = nero_steady_now();
+  if (now - nero_ready_last_log_ > 0.5 || nero_priority_debug()) {
+    nero_ready_last_log_ = now;
+    RCLCPP_INFO(
+      logger_,
+      "[NERO_IX] priority ready: lane %ld, car %s v %.1f m/s (a %.1f), %.1f m to its line (turn %ld, %.1f s to its "
+      "turn): ego %.1f m/s, %.1f m to its stop line, eases off %.2f m/s2%s%s (%zu pts)",
+      lane_id_, worst->id.c_str(), worst->v, worst->a, worst->dist_to_line, lanes.at(worst->turn).lanelet.id(),
+      worst_ts, v_e, d_sl, b_need, worst_full ? "" : " (the most it may: not fully ready)",
+      worst->slowed ? " [slowed: gentle stop]" : "", n_capped);
+  }
 }
 
 void IntersectionModule::updateObjectInfoManagerArea()
@@ -1213,6 +1845,19 @@ void IntersectionModule::updateObjectInfoManagerArea()
 
   // Nero c3 (unknown_filter): keep the per-object speed streaks up to date
   updateUnknownSpeedHistory();
+  nero_ready_cands_.clear();  // NERO_IX_PRIORITY_READY: this cycle's candidates
+  if (!nero_turn_shows_.empty()) {  // NERO_IX_PRIORITY_TURN: forget cars not judged for a while
+    const double now = nero_steady_now();
+    const double stamp = rclcpp::Time(planner_data_->predicted_objects->header.stamp).seconds();
+    for (auto it = nero_turn_shows_.begin(); it != nero_turn_shows_.end();) {
+      if (stamp - it->second[2] > 5.0 && now - it->second[1] > 5.0) {
+        nero_turn_dev_.erase(it->first);
+        it = nero_turn_shows_.erase(it);
+      } else {
+        ++it;
+      }
+    }
+  }
 
   // NERO_IX_PRIORITY_FROM_SIGNS: classify the lanes once, then flag yielding objects every cycle
   nero_priority_yield_uuids_.clear();
@@ -1239,8 +1884,10 @@ void IntersectionModule::updateObjectInfoManagerArea()
     for (auto it = nero_priority_v_hist_.begin(); it != nero_priority_v_hist_.end();) {
       if (it->second.empty() || it->second.back().first < t_now - 2.0) {
         nero_priority_braking_.erase(it->first);
+        nero_ready_slowed_.erase(it->first);       // NERO_IX_PRIORITY_READY
         nero_priority_yaw_hist_.erase(it->first);  // NERO_IX_PRIORITY_SWING
         nero_priority_xy_hist_.erase(it->first);   // NERO_IX_PRIORITY_NO_EXIT
+        nero_ev_vehicle_.erase(it->first);         // NERO_IX_PRIORITY_EVIDENCE
         nero_priority_swinging_.erase(it->first + "L");
         nero_priority_swinging_.erase(it->first + "R");
         it = nero_priority_v_hist_.erase(it);
@@ -1360,9 +2007,44 @@ void IntersectionModule::updateObjectInfoManagerArea()
       auto & hist = nero_priority_v_hist_[uuidKey(predicted_object.object_id)];
       const double t_obj = rclcpp::Time(planner_data_->predicted_objects->header.stamp).seconds();
       const auto & tw = predicted_object.kinematics.initial_twist_with_covariance.twist.linear;
+      if (nero_priority_evidence().on) {
+        // NERO_IX_PRIORITY_EVIDENCE: a hand-over (UNKNOWN <-> vehicle) or a jump of its position starts a new motion
+        // record: the history before it belongs to another track (11-03 #97: a standing cluster's 0 m/s and ego-yaw,
+        // taken over by a vehicle track at 5.5 m/s, read as a launch and a 168 deg swing toward its turn)
+        const std::string key = uuidKey(predicted_object.object_id);
+        const bool vehicle =
+          predicted_object.classification.at(0).label != autoware_perception_msgs::msg::ObjectClassification::UNKNOWN;
+        const auto & p = predicted_object.kinematics.initial_pose_with_covariance.pose.position;
+        bool reset = false;
+        const auto cls_it = nero_ev_vehicle_.find(key);
+        if (cls_it != nero_ev_vehicle_.end() && cls_it->second != vehicle) reset = true;
+        nero_ev_vehicle_[key] = vehicle;
+        const auto xy_it = nero_priority_xy_hist_.find(key);
+        if (!reset && xy_it != nero_priority_xy_hist_.end() && !xy_it->second.empty()) {
+          const auto & q = xy_it->second.back();
+          const double dt = t_obj - q[0];
+          if (dt > 1e-3 && std::hypot(p.x - q[1], p.y - q[2]) > 1.0 + (std::hypot(tw.x, tw.y) + 2.0) * dt) {
+            reset = true;
+          }
+        }
+        if (reset) {
+          hist.clear();
+          for (auto it = nero_turn_dev_.lower_bound(key + "#"); it != nero_turn_dev_.end() &&
+                                                                it->first.compare(0, key.size() + 1, key + "#") == 0;) {
+            it = nero_turn_dev_.erase(it);  // NERO_IX_PRIORITY_TURN: its heading history belongs to the old record
+          }
+          nero_priority_xy_hist_.erase(key);
+          nero_priority_yaw_hist_.erase(key);
+          nero_priority_braking_.erase(key);
+          nero_ready_slowed_.erase(key);  // NERO_IX_PRIORITY_READY
+          nero_priority_swinging_.erase(key + "L");
+          nero_priority_swinging_.erase(key + "R");
+        }
+      }
       if (hist.empty() || t_obj > hist.back().first + 1e-3) hist.emplace_back(t_obj, std::hypot(tw.x, tw.y));
       while (!hist.empty() && hist.front().first < t_obj - 1.5) hist.erase(hist.begin());
-      if (nero_priority_no_exit() > 0.0) {  // NERO_IX_PRIORITY_NO_EXIT: its direction of motion
+      // NERO_IX_PRIORITY_NO_EXIT (and NERO_IX_PRIORITY_EVIDENCE): its direction of motion
+      if (nero_priority_no_exit() > 0.0 || nero_priority_evidence().on) {
         auto & xy = nero_priority_xy_hist_[uuidKey(predicted_object.object_id)];
         const auto & p = predicted_object.kinematics.initial_pose_with_covariance.pose.position;
         if (xy.empty() || t_obj > xy.back()[0] + 1e-3) xy.push_back({t_obj, p.x, p.y});
@@ -1401,6 +2083,11 @@ void IntersectionModule::updateObjectInfoManagerArea()
         auto & yh = nero_priority_yaw_hist_[uuidKey(predicted_object.object_id)];
         const double yaw =
           tf2::getYaw(predicted_object.kinematics.initial_pose_with_covariance.pose.orientation);
+        if (
+          nero_priority_evidence().on && !yh.empty() &&
+          std::fabs(autoware_utils::normalize_radian(yaw - yh.back().second)) > M_PI / 2.0) {
+          yh.clear();  // NERO_IX_PRIORITY_EVIDENCE: a heading flip is not a swing
+        }
         if (yh.empty() || t_obj > yh.back().first + 1e-3) yh.emplace_back(t_obj, yaw);
         while (!yh.empty() && yh.front().first < t_obj - 1.5) yh.erase(yh.begin());
         double n_now = 0.0, s_now = 0.0, n_ref = 0.0, s_ref = 0.0;

@@ -109,6 +109,7 @@ bool IntersectionModule::modifyPathVelocity(PathWithLaneId * path)
 
   initializeRTCStatus();
 
+  nero_ready_stop_known_ = false;  // NERO_IX_PRIORITY_READY: set this cycle by isOverPassJudgeLinesStatus
   const auto decision_result = modifyPathVelocityDetail(path);
   prev_decision_result_ = decision_result;
 
@@ -122,6 +123,11 @@ bool IntersectionModule::modifyPathVelocity(PathWithLaneId * path)
   prepareRTCStatus(decision_result, *path);
 
   reactRTCApproval(decision_result, path);
+
+  // NERO_IX_PRIORITY_READY: ready for a car that could still turn across ego (a gentle cap, never a stop)
+  if (!std::holds_alternative<InternalError>(decision_result)) {
+    neroReadyCap(path);
+  }
 
   // NERO_IX_CROSSING_HOLD: a stop-sign lane where this module has no attention lane (InternalError) holds ego for
   // crossing traffic on roads the map lacks (scene_intersection_nero_crossing.cpp)
@@ -1734,6 +1740,9 @@ IntersectionModule::PassJudgeStatus IntersectionModule::isOverPassJudgeLinesStat
   nero_over_1st_pass_judge_ = is_over_1st_pass_judge_line;  // NERO_IX_PRIORITY_FROM_SIGNS
   nero_dist_to_1st_pass_judge_ = autoware::motion_utils::calcSignedArcLength(
     path.points, current_pose.position, pass_judge_line_idx);  // NERO_IX_PRIORITY_CAN_STOP
+  nero_ready_dist_to_stop_ = autoware::motion_utils::calcSignedArcLength(
+    path.points, current_pose.position, default_stopline_idx);  // NERO_IX_PRIORITY_READY
+  nero_ready_stop_known_ = true;
   bool safely_passed_1st_judge_line_first_time = false;
   if (is_over_1st_pass_judge_line && was_safe && !safely_passed_1st_judge_line_time_) {
     safely_passed_1st_judge_line_time_ = std::make_pair(clock_->now(), current_pose);
