@@ -526,6 +526,8 @@ void VehicleTracker::neroFlipOrientationSign(const char * why)
   // the anchor offset is kept in the object's coordinates: the same offset in the map is the negated vector
   tracking_offset_ = -tracking_offset_;
   nero_sign_.onFlipped();
+  // NERO_MOT_STAND_SPEED (vstoplag_1104) keeps its frames and start speed along the heading: turn them with it
+  if (neroStandSpeedParams().enabled) nero_stand_.onHeadingTurned();
   if (neroSignBeliefParams().debug > 0) {
     RCLCPP_INFO(
       logger_,

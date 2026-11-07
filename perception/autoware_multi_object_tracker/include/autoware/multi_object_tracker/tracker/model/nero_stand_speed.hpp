@@ -115,8 +115,28 @@ public:
   bool standing() const { return cur_.standing; }
   double output() const { return cur_.v_out; }
 
+  // NERO_MOT_SIGN_BELIEF (signbelief_1106): the track's heading was turned by exactly 180 deg (its speed negated). Everything
+  // here is kept along the heading: seen from the turned heading the same frames have front and rear swapped and every
+  // displacement, start direction and output speed negated (the stand / release / start decisions continue unchanged).
+  void onHeadingTurned()
+  {
+    turnState(before_);
+    turnState(cur_);
+  }
+
 private:
   enum { F = 0, R = 1, C = 2 };
+
+  static int swappedKey(const int k) { return k == F ? R : (k == R ? F : k); }
+
+  template <class Frames>
+  static void turnFrames(Frames & frames)
+  {
+    for (auto & f : frames) {
+      std::swap(f.p[F], f.p[R]);
+      f.key = swappedKey(f.key);
+    }
+  }
   struct Frame
   {
     double t;
@@ -147,6 +167,23 @@ private:
     double boost_v{0.0}, boost_until{0.0}, boost_dir{1.0};
     double v_out{0.0};
   };
+
+  static void turnState(State & s)
+  {
+    turnFrames(s.h);
+    turnFrames(s.band);
+    turnFrames(s.allst);
+    s.last_d = -s.last_d;
+    std::swap(s.post_an[F], s.post_an[R]);
+    std::swap(s.post_sg[F], s.post_sg[R]);
+    for (auto & q : s.post_hist) {
+      q.dn = -q.dn;
+      q.dc = -q.dc;
+      q.key = swappedKey(q.key);
+    }
+    s.boost_dir = -s.boost_dir;
+    s.v_out = -s.v_out;
+  }
 
   State before_, cur_;
   bool has_frame_{false};
