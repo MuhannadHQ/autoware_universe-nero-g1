@@ -135,6 +135,9 @@ private:
     const std::shared_ptr<Tracker> & vehicle, const std::shared_ptr<Tracker> & unknown,
     const rclcpp::Time & time) const;
   void neroHandOver(const rclcpp::Time & time);
+  // NERO_MOT_STILL_BOX (boxyaw): the published box of a still vehicle track re-aligned with its points
+  void neroStillBox(
+    const std::shared_ptr<Tracker> & tracker, const rclcpp::Time & time, types::DynamicObject & object) const;
   bool neroHidden(const std::shared_ptr<Tracker> & tracker, const rclcpp::Time & time) const;
 
   // NERO_MOT_DUP_FRESH=<fresh s> (tbx, 2026-10-28; unset = stock; upstream's freshness tier, autoware_universe #12996 /

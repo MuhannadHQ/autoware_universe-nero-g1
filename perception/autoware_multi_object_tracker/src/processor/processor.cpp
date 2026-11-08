@@ -17,6 +17,7 @@
 #include "autoware/multi_object_tracker/object_model/object_model.hpp"
 #include "autoware/multi_object_tracker/object_model/shapes.hpp"
 #include "autoware/multi_object_tracker/object_model/types.hpp"
+#include "autoware/multi_object_tracker/tracker/model/nero_still_box.hpp"
 #include "autoware/multi_object_tracker/tracker/tracker.hpp"
 
 #include <autoware/object_recognition_utils/object_recognition_utils.hpp>
@@ -619,6 +620,192 @@ void TrackerProcessor::neroHandOver(const rclcpp::Time & time)
   }
 }
 
+void TrackerProcessor::neroStillBox(
+  const std::shared_ptr<Tracker> & tracker, const rclcpp::Time & time, types::DynamicObject & object) const
+{
+  // NERO_MOT_STILL_BOX (boxyaw): nero_still_box.hpp
+  const auto & p = neroStillBoxParams();
+  const uint8_t label = tracker->getHighestProbLabel();
+  if (
+    (label != Label::CAR && label != Label::TRUCK && label != Label::BUS && label != Label::TRAILER) ||
+    object.shape.type != autoware_perception_msgs::msg::Shape::BOUNDING_BOX) {
+    return;
+  }
+  const double t = time.seconds();
+  const double v = std::hypot(object.twist.linear.x, object.twist.linear.y);
+  const auto predecessor = std::dynamic_pointer_cast<UnknownTracker>(tracker->nero_predecessor.lock());
+  const bool birth = tracker->nero_is_successor && predecessor && !predecessor->neroIsMover() &&
+                     t - tracker->nero_first_t.seconds() <= p.t_birth && v <= p.v_birth;
+  if (v > p.v_still && !birth) return;  // a moving vehicle: as today
+
+  const double psi = tf2::getYaw(object.pose.orientation);
+  const double L = object.shape.dimensions.x;
+  const double W = object.shape.dimensions.y;
+  if (L < p.min_length) return;  // a box shorter than min_length: as today
+  // the heading difference folded within +-90 deg (the box's sign is kept)
+  const auto fold = [psi](const double a) {
+    double d = autoware_utils::normalize_radian(a - psi);
+    if (d > M_PI_2) d -= M_PI;
+    if (d < -M_PI_2) d += M_PI;
+    return d;
+  };
+  // the points' heading: the median of the point-fitted boxes of the last t_hold within max_dev of the box (the first
+  // of them is fitted around a newborn track's own heading: 11-08 #19 31.7 deg against the road's 25.5), in the birth
+  // window together with the standing predecessor's outline (its longest edge along the box)
+  std::vector<double> devs;
+  for (const auto & b : tracker->nero_sb_boxes) {
+    const double d = fold(b[3]);
+    if (t - b[0] <= p.t_fresh && std::fabs(d) <= p.max_dev) devs.push_back(d);
+  }
+  const std::array<double, 6> * box = nullptr;  // the newest of them
+  for (const auto & b : tracker->nero_sb_boxes) {
+    if (t - b[0] <= p.t_fresh && std::fabs(fold(b[3])) <= p.max_dev) box = &b;
+  }
+  const std::vector<std::array<double, 2>> * outline = nullptr;
+  {
+    // a measured outline: this track's own, else (birth) its standing predecessor's
+    const Tracker * owners[2] = {tracker.get(), birth ? predecessor.get() : nullptr};
+    for (const Tracker * owner : owners) {
+      if (owner == nullptr || owner->nero_sb_outline_t < 0.0 || t - owner->nero_sb_outline_t > p.t_fresh) continue;
+      const auto & poly = owner->nero_sb_outline;
+      double best = p.min_edge_ratio * L;
+      bool found = false;
+      double d_best = 0.0;
+      for (size_t i = 0; i < poly.size(); ++i) {
+        const auto & a = poly[i];
+        const auto & b = poly[(i + 1) % poly.size()];
+        const double len = std::hypot(b[0] - a[0], b[1] - a[1]);
+        const double d = fold(std::atan2(b[1] - a[1], b[0] - a[0]));
+        if (len >= best && std::fabs(d) <= p.max_dev) {
+          best = len;
+          d_best = d;
+          found = true;
+        }
+      }
+      if (found) {
+        devs.push_back(d_best);
+        outline = &poly;
+        break;
+      }
+    }
+  }
+  if (devs.empty()) return;
+  std::sort(devs.begin(), devs.end());
+  const size_t m = devs.size() / 2;
+  const double dev = devs.size() % 2 == 1 ? devs[m] : 0.5 * (devs[m - 1] + devs[m]);
+  const double phi = psi + dev;
+  // the points: only a measured outline (its points as measured). The point-fitted box gives the heading only: its
+  // edges away from the robot are detection_by_tracker's reference size, not points (c23 14:27:15.6: a CAR grown 1.5 m
+  // toward the path by them)
+  std::vector<std::array<double, 2>> pts;
+  const char * src = box != nullptr ? (outline != nullptr ? "points boxes + outline" : "points boxes") : "outline";
+  if (outline != nullptr) pts = *outline;
+  // the points must be this box's object: their centroid inside the box + 0.5 m
+  if (!pts.empty()) {
+    double cx = 0.0;
+    double cy = 0.0;
+    for (const auto & q : pts) {
+      cx += q[0];
+      cy += q[1];
+    }
+    cx = cx / pts.size() - object.pose.position.x;
+    cy = cy / pts.size() - object.pose.position.y;
+    if (
+      std::fabs(cx * std::cos(psi) + cy * std::sin(psi)) > 0.5 * L + 0.5 ||
+      std::fabs(-cx * std::sin(psi) + cy * std::cos(psi)) > 0.5 * W + 0.5) {
+      return;
+    }
+  }
+  // the box at the points' heading (centre and size kept) united with the points, in that heading's frame
+  const double c = std::cos(phi);
+  const double s = std::sin(phi);
+  const double x0 = object.pose.position.x;
+  const double y0 = object.pose.position.y;
+  double u0 = -0.5 * L;
+  double u1 = 0.5 * L;
+  double v0 = -0.5 * W;
+  double v1 = 0.5 * W;
+  for (const auto & q : pts) {
+    const double dx = q[0] - x0;
+    const double dy = q[1] - y0;
+    const double u = dx * c + dy * s;
+    const double w = -dx * s + dy * c;
+    u0 = std::min(u0, u);
+    u1 = std::max(u1, u);
+    v0 = std::min(v0, w);
+    v1 = std::max(v1, w);
+  }
+  const double new_l = u1 - u0;
+  const double new_w = v1 - v0;
+  if (new_l - L > p.max_grow || new_w - W > p.max_grow) {
+    if (p.debug > 0) {
+      const auto & id = object.uuid.uuid;
+      RCLCPP_INFO(
+        rclcpp::get_logger("multi_object_tracker"),
+        "[NERO_MOT_STILL_BOX] %02x%02x%02x%02x t %.2f %s: union grows %.2fx%.2f -> %.2fx%.2f: kept as is", id[0], id[1],
+        id[2], id[3], t, src, L, W, new_l, new_w);
+    }
+    return;
+  }
+  const double um = 0.5 * (u0 + u1);
+  const double vm = 0.5 * (v0 + v1);
+  // never toward the robot's line: the box's corners ahead of the robot may not come closer to the line along the robot's
+  // heading than today's (c23 14:27:01.7: a parked CAR beside the standing robot would have come 0.58 -> 0.33 m from the
+  // line by a heading the points did not confirm); a box whose points say it reaches further is left as today
+  if (tracker->nero_sb_has_ego) {
+    const double ex = tracker->nero_sb_ego[0];
+    const double ey = tracker->nero_sb_ego[1];
+    const double ec = std::cos(tracker->nero_sb_ego[2]);
+    const double es = std::sin(tracker->nero_sb_ego[2]);
+    const auto min_lat = [&](const double bx, const double by, const double byaw, const double bl, const double bw) {
+      const double bc = std::cos(byaw);
+      const double bs = std::sin(byaw);
+      double ahead = std::numeric_limits<double>::max();
+      double all = std::numeric_limits<double>::max();
+      for (const double a : {-0.5 * bl, 0.5 * bl}) {
+        for (const double b : {-0.5 * bw, 0.5 * bw}) {
+          const double qx = bx + a * bc - b * bs - ex;
+          const double qy = by + a * bs + b * bc - ey;
+          const double lat = std::fabs(-qx * es + qy * ec);
+          all = std::min(all, lat);
+          if (qx * ec + qy * es > 0.0) ahead = std::min(ahead, lat);
+        }
+      }
+      return ahead < std::numeric_limits<double>::max() ? ahead : all;
+    };
+    const double before = min_lat(x0, y0, psi, L, W);
+    const double after = min_lat(x0 + um * c - vm * s, y0 + um * s + vm * c, phi, new_l, new_w);
+    if (after < before - 0.02) {
+      if (p.debug > 0) {
+        const auto & id = object.uuid.uuid;
+        RCLCPP_INFO(
+          rclcpp::get_logger("multi_object_tracker"),
+          "[NERO_MOT_STILL_BOX] %02x%02x%02x%02x t %.2f %s: yaw %.1f -> %.1f would bring it %.2f -> %.2f m from the robot's "
+          "line: kept as is",
+          id[0], id[1], id[2], id[3], t, src, psi * 180.0 / M_PI, phi * 180.0 / M_PI, before, after);
+      }
+      return;
+    }
+  }
+  if (p.debug > 0) {
+    const auto & id = object.uuid.uuid;
+    RCLCPP_INFO(
+      rclcpp::get_logger("multi_object_tracker"),
+      "[NERO_MOT_STILL_BOX] %02x%02x%02x%02x t %.2f %s%s v %.2f: yaw %.1f -> %.1f, %.2fx%.2f -> %.2fx%.2f, centre +(%.2f, %.2f)",
+      id[0], id[1], id[2], id[3], t, src, birth && v > p.v_still ? " (birth)" : "", v, psi * 180.0 / M_PI,
+      phi * 180.0 / M_PI, L, W, new_l, new_w, um, vm);
+  }
+  object.pose.position.x = x0 + um * c - vm * s;
+  object.pose.position.y = y0 + um * s + vm * c;
+  // the vehicle models publish a yaw-only orientation (bicycle model)
+  object.pose.orientation.x = 0.0;
+  object.pose.orientation.y = 0.0;
+  object.pose.orientation.z = std::sin(0.5 * phi);
+  object.pose.orientation.w = std::cos(0.5 * phi);
+  object.shape.dimensions.x = new_l;
+  object.shape.dimensions.y = new_w;
+}
+
 void TrackerProcessor::removeOldTracker(const rclcpp::Time & time)
 {
   std::unique_ptr<ScopedTimeTrack> st_ptr;
@@ -869,6 +1056,7 @@ void TrackerProcessor::getTrackedObjects(
     // Get the tracked object, extrapolated to the given time
     if (tracker->getTrackedObject(time, tracked_object)) {
       tracker->neroRefinePublished(tracked_object);  // NERO_MOT_STAND_SPEED (no-op unless set)
+      if (neroStillBoxParams().enabled) neroStillBox(tracker, time, tracked_object);
       tracked_objects.objects.push_back(toTrackedObjectMsg(tracked_object));
     }
   }

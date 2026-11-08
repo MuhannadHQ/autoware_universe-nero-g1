@@ -180,6 +180,8 @@ public:
   // crossmover c3: its measured positions passed a CROSSING mover's line within the mover hold before <time> (a mover
   // now, or one whose line just ended): the speed it is published with comes from that line, not from the stock filter
   bool neroMoverRecent(const rclcpp::Time & time) const;
+  // NERO_MOT_STILL_BOX (boxyaw): the track is (was last judged) a mover
+  bool neroIsMover() const { return nero_mover_; }
   // crossmover c3: a crossing mover at <time>: how long its line has passed, from the first passing start test of the
   // run that started it (its <cross_tests> consecutive passes count) [s] (< 0: none)
   double neroCrossHeld(const rclcpp::Time & time) const;

@@ -14,6 +14,8 @@
 
 #include "input_manager.hpp"
 
+#include "autoware/multi_object_tracker/tracker/model/nero_still_box.hpp"
+
 #include <cmath>
 
 #include "autoware/multi_object_tracker/object_model/shapes.hpp"
@@ -107,6 +109,13 @@ void InputStream::onMessage(
     object.nero_range = std::hypot(
       object.pose.position.x - self_transform->translation.x,
       object.pose.position.y - self_transform->translation.y);
+    if (neroStillBoxParams().enabled) {
+      const auto & q = self_transform->rotation;
+      object.nero_has_ego = true;
+      object.nero_ego_x = self_transform->translation.x;
+      object.nero_ego_y = self_transform->translation.y;
+      object.nero_ego_yaw = std::atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z));
+    }
 
     // if object extension is not reliable, enlarge covariance of position and extend shape
   }

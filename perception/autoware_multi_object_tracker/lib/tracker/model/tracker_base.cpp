@@ -16,9 +16,12 @@
 
 #include "autoware/multi_object_tracker/tracker/model/tracker_base.hpp"
 
+#include "autoware/multi_object_tracker/tracker/model/nero_still_box.hpp"
+
 #include <tf2/utils.h>
 
 #include <algorithm>
+#include <cmath>
 #include <random>
 #include <vector>
 
@@ -64,6 +67,7 @@ Tracker::Tracker(const rclcpp::Time & time, const types::DynamicObject & detecte
   nero_first_y = nero_last_y = detected_object.pose.position.y;
   nero_last_yaw = tf2::getYaw(detected_object.pose.orientation);
   nero_first_t = nero_last_t = time;
+  if (neroStillBoxParams().enabled) neroStillBoxRecord(detected_object, time, nullptr);
 
   // Initialize existence probabilities
   existence_probabilities_.resize(types::max_channel_size, 0.001);
@@ -143,6 +147,8 @@ bool Tracker::updateWithMeasurement(
       autoware_perception_msgs::msg::ObjectClassification::UNKNOWN) {
     updateClassification(object.classification);
   }
+
+  if (neroStillBoxParams().enabled) neroStillBoxRecord(object, measurement_time, &channel_info);
 
   // Update object
   measure(object, measurement_time, channel_info);
@@ -242,4 +248,39 @@ void Tracker::limitObjectExtension(const object_model::ObjectModel object_model)
     object_extension.z, object_model.size_limit.height_min, object_model.size_limit.height_max);
 }
 
+}  // namespace autoware::multi_object_tracker
+
+namespace autoware::multi_object_tracker
+{
+void Tracker::neroStillBoxRecord(
+  const types::DynamicObject & object, const rclcpp::Time & time, const types::InputChannel * channel_info)
+{
+  // NERO_MOT_STILL_BOX (boxyaw): keep this measurement's evidence of the points (map frame)
+  if (object.nero_has_ego) {
+    nero_sb_has_ego = true;
+    nero_sb_ego = {object.nero_ego_x, object.nero_ego_y, object.nero_ego_yaw};
+  }
+  const double x = object.pose.position.x;
+  const double y = object.pose.position.y;
+  const double yaw = tf2::getYaw(object.pose.orientation);
+  const double c = std::cos(yaw);
+  const double s = std::sin(yaw);
+  if (object.shape.type == autoware_perception_msgs::msg::Shape::POLYGON) {
+    if (object.shape.footprint.points.size() < 3) return;
+    nero_sb_outline.clear();
+    for (const auto & p : object.shape.footprint.points) {
+      nero_sb_outline.push_back({x + p.x * c - p.y * s, y + p.x * s + p.y * c});
+    }
+    nero_sb_outline_t = time.seconds();
+    return;
+  }
+  if (
+    channel_info == nullptr || channel_info->trust_extension || channel_info->trust_orientation ||
+    object.shape.type != autoware_perception_msgs::msg::Shape::BOUNDING_BOX) {
+    return;
+  }
+  nero_sb_boxes.push_back(
+    {time.seconds(), x, y, yaw, object.shape.dimensions.x, object.shape.dimensions.y});
+  if (nero_sb_boxes.size() > 5) nero_sb_boxes.pop_front();
+}
 }  // namespace autoware::multi_object_tracker

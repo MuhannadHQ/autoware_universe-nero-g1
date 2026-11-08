@@ -32,6 +32,8 @@
 #include <geometry_msgs/msg/point.hpp>
 #include <unique_identifier_msgs/msg/uuid.hpp>
 
+#include <array>
+#include <deque>
 #include <memory>
 #include <vector>
 
@@ -97,6 +99,15 @@ public:
   // NERO_MOT_FAST_BIRTH (realize-3): measurements at distinct detection stamps (a message the input manager applies twice
   // counts once) and the lowest existence probability among them
   int nero_distinct_stamps{1};
+  // NERO_MOT_STILL_BOX (boxyaw): the last point-fitted boxes (a channel that trusts neither extent nor heading:
+  // detection_by_tracker) and the last measured outline (a polygon measurement), in the map frame
+  std::deque<std::array<double, 6>> nero_sb_boxes;  // the last 5: t, x, y, yaw, length, width
+  double nero_sb_outline_t{-1.0};
+  std::vector<std::array<double, 2>> nero_sb_outline;
+  bool nero_sb_has_ego{false};
+  std::array<double, 3> nero_sb_ego{};  // the robot's pose (x, y, yaw) at the last measurement
+  void neroStillBoxRecord(
+    const types::DynamicObject & object, const rclcpp::Time & time, const types::InputChannel * channel_info);
   float nero_min_meas_prob{1.0f};
   // and its first / latest measured box (map frame) for the motion test
   double nero_first_x{0.0}, nero_first_y{0.0}, nero_last_x{0.0}, nero_last_y{0.0}, nero_last_yaw{0.0};

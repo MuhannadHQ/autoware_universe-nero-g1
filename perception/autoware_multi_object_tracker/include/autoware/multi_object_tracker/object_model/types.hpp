@@ -98,6 +98,11 @@ struct DynamicObject
   // NERO_MOT_SIGN_BELIEF (signbelief): the box centre's distance from the robot at its measurement time [m] (-1 = not set;
   // set by the input manager for vehicle-like boxes; only the belief's range-weighted votes read it)
   double nero_range{-1.0};
+  // NERO_MOT_STILL_BOX (boxyaw): the robot's pose at the measurement (set by the input manager only with the switch)
+  bool nero_has_ego{false};
+  double nero_ego_x{0.0};
+  double nero_ego_y{0.0};
+  double nero_ego_yaw{0.0};
 };
 
 struct DynamicObjectList
