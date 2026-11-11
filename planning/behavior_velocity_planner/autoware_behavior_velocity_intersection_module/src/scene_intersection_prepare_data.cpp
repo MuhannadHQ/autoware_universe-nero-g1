@@ -14,6 +14,7 @@
 
 #include "scene_intersection.hpp"
 #include "util.hpp"
+#include "nero_geom_cache.hpp"  // NERO_IX_GEOM_CACHE (trjrate-2)
 
 #include <autoware/behavior_velocity_planner_common/utilization/boost_geometry_helper.hpp>  // for to_bg2d
 #include <autoware/behavior_velocity_planner_common/utilization/util.hpp>  // for planning_utils::
@@ -244,7 +245,7 @@ Result<IntersectionModule::BasicData, InternalError> IntersectionModule::prepare
     traffic_prioritized_level == TrafficPrioritizedLevel::FULLY_PRIORITIZED;
 
   // spline interpolation
-  const auto interpolated_path_info_opt = util::generateInterpolatedPath(
+  auto interpolated_path_info_opt = util::generateInterpolatedPath(  // trjrate-2: not const (moved out below)
     lane_id_, associative_ids_, *path, planner_param_.common.path_interpolation_ds, logger_);
   if (!interpolated_path_info_opt) {
     return make_err<IntersectionModule::BasicData, InternalError>("splineInterpolate failed");
@@ -348,6 +349,11 @@ Result<IntersectionModule::BasicData, InternalError> IntersectionModule::prepare
     }
   }
 
+  if (nero_geom::mode() != 0) {
+    // NERO_IX_GEOM_CACHE (trjrate-2): the last use of the 0.1 m path here: moved out instead of copied
+    return make_ok<IntersectionModule::BasicData, InternalError>(
+      std::move(interpolated_path_info_opt.value()), intersection_stoplines, path_lanelets);
+  }
   return make_ok<IntersectionModule::BasicData, InternalError>(
     interpolated_path_info, intersection_stoplines, path_lanelets);
 }

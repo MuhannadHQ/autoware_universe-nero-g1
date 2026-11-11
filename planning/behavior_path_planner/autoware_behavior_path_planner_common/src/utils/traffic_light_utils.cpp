@@ -14,6 +14,7 @@
 
 #include <autoware/behavior_path_planner_common/utils/traffic_light_utils.hpp>
 #include "autoware/behavior_path_planner_common/utils/nero_mu.hpp"  // NERO_BPP_PROJ_FAST
+#include "autoware/behavior_path_planner_common/utils/nero_geom_fast.hpp"  // NERO_BPP_GEOM_FAST
 #include <autoware/motion_utils/trajectory/trajectory.hpp>
 #include <autoware/traffic_light_utils/traffic_light_utils.hpp>
 
@@ -28,7 +29,7 @@ double getDistanceToNextTrafficLight(
   const Pose & current_pose, const lanelet::ConstLanelets & lanelets)
 {
   lanelet::ConstLanelet current_lanelet;
-  if (!lanelet::utils::query::getClosestLanelet(lanelets, current_pose, &current_lanelet)) {
+  if (!nero_geom_fast::getClosestLanelet(lanelets, current_pose, &current_lanelet)) {
     return std::numeric_limits<double>::infinity();
   }
 

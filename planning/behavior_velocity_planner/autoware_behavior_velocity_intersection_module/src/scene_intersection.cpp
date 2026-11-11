@@ -174,7 +174,8 @@ DecisionResult IntersectionModule::modifyPathVelocityDetail(PathWithLaneId * pat
   if (!prepare_data) {
     return prepare_data.err();
   }
-  const auto [interpolated_path_info, intersection_stoplines, path_lanelets] = prepare_data.ok();
+  // trjrate-2: bound to the result (lives to the end of this function) instead of a copy of it
+  const auto & [interpolated_path_info, intersection_stoplines, path_lanelets] = prepare_data.ok();
   const auto & intersection_lanelets = intersection_lanelets_.value();
 
   // NOTE: this level is based on the updateTrafficSignalObservation() which is latest

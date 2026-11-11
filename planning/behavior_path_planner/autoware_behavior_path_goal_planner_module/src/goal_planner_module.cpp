@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "autoware/behavior_path_goal_planner_module/goal_planner_module.hpp"
+#include "autoware/behavior_path_planner_common/utils/nero_geom_fast.hpp"  // NERO_BPP_GEOM_FAST (trjrate-2)
 
 #include "autoware/behavior_path_goal_planner_module/default_fixed_goal_planner.hpp"
 #include "autoware/behavior_path_goal_planner_module/goal_searcher.hpp"
@@ -885,7 +886,7 @@ bool GoalPlannerModule::isExecutionRequested() const
     *(route_handler), left_side_parking_, parameters_.backward_goal_search_length,
     parameters_.forward_goal_search_length);
   lanelet::ConstLanelet target_lane{};
-  lanelet::utils::query::getClosestLanelet(pull_over_lanes, goal_pose, &target_lane);
+  nero_geom_fast::getClosestLanelet(pull_over_lanes, goal_pose, &target_lane);
 
   // Get the lanelet of the ego vehicle's side edge at the terminal pose of the previous module's
   // path. Check if the lane is the target lane or the neighboring lane. NOTE: This is because in
@@ -896,8 +897,8 @@ bool GoalPlannerModule::isExecutionRequested() const
   const Pose previous_terminal_vehicle_edge_pose = calc_offset_pose(
     previous_terminal_pose, 0, left_side_parking_ ? vehicle_half_width : -vehicle_half_width, 0);
   lanelet::ConstLanelet previous_module_terminal_vehicle_edge_lane{};
-  route_handler->getClosestLaneletWithinRoute(
-    previous_terminal_vehicle_edge_pose, &previous_module_terminal_vehicle_edge_lane);
+  nero_geom_fast::getClosestLaneletWithinRoute(
+    *route_handler, previous_terminal_vehicle_edge_pose, &previous_module_terminal_vehicle_edge_lane);
 
   if (!isCrossingPossible(previous_module_terminal_vehicle_edge_lane, target_lane)) {
     return false;
@@ -2061,7 +2062,7 @@ TurnSignalInfo GoalPlannerModule::calcTurnSignalInfo(const PullOverContextData &
   }
 
   lanelet::Lanelet closest_lanelet;
-  lanelet::utils::query::getClosestLanelet(current_lanes, current_pose, &closest_lanelet);
+  nero_geom_fast::getClosestLanelet(current_lanes, current_pose, &closest_lanelet);
 
   if (is_ignore_signal(closest_lanelet.id())) {
     return getPreviousModuleOutput().turn_signal_info;
@@ -2334,10 +2335,10 @@ bool GoalPlannerModule::isCrossingPossible(
   const Pose & start_pose, const Pose & end_pose, const lanelet::ConstLanelets lanes) const
 {
   lanelet::ConstLanelet start_lane{};
-  lanelet::utils::query::getClosestLanelet(lanes, start_pose, &start_lane);
+  nero_geom_fast::getClosestLanelet(lanes, start_pose, &start_lane);
 
   lanelet::ConstLanelet end_lane{};
-  lanelet::utils::query::getClosestLanelet(lanes, end_pose, &end_lane);
+  nero_geom_fast::getClosestLanelet(lanes, end_pose, &end_lane);
 
   return isCrossingPossible(start_lane, end_lane);
 }

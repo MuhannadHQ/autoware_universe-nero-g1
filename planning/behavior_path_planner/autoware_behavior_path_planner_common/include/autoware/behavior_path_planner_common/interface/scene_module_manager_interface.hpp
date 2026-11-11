@@ -28,6 +28,7 @@
 
 #include <cstddef>
 #include <limits>
+#include <cstdlib>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -150,6 +151,24 @@ public:
   {
     using autoware_utils::append_marker_array;
 
+    // NERO_BPP_DEBUG_ON_DEMAND (trjrate-2, QUEUE TRJ3): =1 builds and publishes the module's info / debug / drivable-lanes
+    // marker arrays only while the topic has a subscriber (RViz, a recorder): nobody else reads them, and serializing them
+    // every cycle for nobody was ~2 % of the planning container; a subscriber gets exactly the same messages. Unset = the car.
+    static const bool nero_on_demand = [] {
+      const char * e = std::getenv("NERO_BPP_DEBUG_ON_DEMAND");
+      return e != nullptr && std::atoi(e) == 1;
+    }();
+    const auto nero_wanted = [](const auto & pub) {
+      return !nero_on_demand ||
+             pub->get_subscription_count() + pub->get_intra_process_subscription_count() > 0;
+    };
+    const bool want_info = nero_wanted(pub_info_marker_);
+    const bool want_debug = nero_wanted(pub_debug_marker_);
+    const bool want_lanes = nero_wanted(pub_drivable_lanes_);
+    if (!want_info && !want_debug && !want_lanes) {
+      return;
+    }
+
     MarkerArray info_markers{};
     MarkerArray debug_markers{};
     MarkerArray drivable_lanes_markers{};
@@ -162,33 +181,41 @@ public:
         continue;
       }
 
-      for (auto & marker : m.lock()->getInfoMarkers().markers) {
-        marker.id += marker_id;
-        info_markers.markers.push_back(marker);
+      if (want_info) {
+        for (auto & marker : m.lock()->getInfoMarkers().markers) {
+          marker.id += marker_id;
+          info_markers.markers.push_back(marker);
+        }
       }
 
-      for (auto & marker : m.lock()->getDebugMarkers().markers) {
-        marker.id += marker_id;
-        debug_markers.markers.push_back(marker);
+      if (want_debug) {
+        for (auto & marker : m.lock()->getDebugMarkers().markers) {
+          marker.id += marker_id;
+          debug_markers.markers.push_back(marker);
+        }
       }
 
-      for (auto & marker : m.lock()->getDrivableLanesMarkers().markers) {
-        marker.id += marker_id;
-        drivable_lanes_markers.markers.push_back(marker);
+      if (want_lanes) {
+        for (auto & marker : m.lock()->getDrivableLanesMarkers().markers) {
+          marker.id += marker_id;
+          drivable_lanes_markers.markers.push_back(marker);
+        }
       }
 
       marker_id += marker_offset;
     }
 
     if (observers_.empty() && idle_module_ptr_ != nullptr) {
-      append_marker_array(idle_module_ptr_->getInfoMarkers(), &info_markers);
-      append_marker_array(idle_module_ptr_->getDebugMarkers(), &debug_markers);
-      append_marker_array(idle_module_ptr_->getDrivableLanesMarkers(), &drivable_lanes_markers);
+      if (want_info) append_marker_array(idle_module_ptr_->getInfoMarkers(), &info_markers);
+      if (want_debug) append_marker_array(idle_module_ptr_->getDebugMarkers(), &debug_markers);
+      if (want_lanes) {
+        append_marker_array(idle_module_ptr_->getDrivableLanesMarkers(), &drivable_lanes_markers);
+      }
     }
 
-    pub_info_marker_->publish(info_markers);
-    pub_debug_marker_->publish(debug_markers);
-    pub_drivable_lanes_->publish(drivable_lanes_markers);
+    if (want_info) pub_info_marker_->publish(info_markers);
+    if (want_debug) pub_debug_marker_->publish(debug_markers);
+    if (want_lanes) pub_drivable_lanes_->publish(drivable_lanes_markers);
   }
 
   bool exist(const SceneModulePtr & module_ptr) const

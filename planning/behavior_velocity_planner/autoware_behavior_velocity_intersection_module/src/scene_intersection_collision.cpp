@@ -24,6 +24,7 @@
 #include <cstdlib>
 #include <string>
 #include "util.hpp"
+#include "nero_geom_cache.hpp"  // NERO_IX_GEOM_CACHE (trjrate)
 
 #include <autoware/behavior_velocity_planner_common/utilization/boost_geometry_helper.hpp>  // for toGeomPoly
 #include <autoware/behavior_velocity_planner_common/utilization/trajectory_utils.hpp>  // for smoothPath
@@ -328,7 +329,7 @@ std::vector<autoware_perception_msgs::msg::PredictedPath> nero_pullaway_paths(
   const double a = nero_pullaway_acc();
   for (const auto & ll : attention_lanelets) {
     if (!lanelet::utils::isInLanelet(pose, ll, margin)) continue;
-    const double ll_yaw = lanelet::utils::getLaneletAngle(ll, pose.position);
+    const double ll_yaw = autoware::behavior_velocity_planner::nero_geom::getLaneletAngle(ll, pose.position);
     if (std::fabs(autoware_utils::normalize_radian(ll_yaw - pose_yaw)) > angle_thr) continue;
     const auto centerline = ll.centerline2d();
     const double length = lanelet::geometry::length(centerline);
@@ -976,7 +977,7 @@ bool IntersectionModule::isWrongWayOnLanelets(
     if (!lanelet::utils::isInLanelet(pose, ll, 0.0)) {
       continue;
     }
-    const double ll_angle = lanelet::utils::getLaneletAngle(ll, pose.position);
+    const double ll_angle = autoware::behavior_velocity_planner::nero_geom::getLaneletAngle(ll, pose.position);
     const double angle_diff = autoware_utils::normalize_radian(ll_angle - pose_angle, -M_PI);
     if (std::fabs(angle_diff) > M_PI / 2.0) {
       return true;
@@ -1742,7 +1743,7 @@ int IntersectionModule::neroPriorityVerdict(
     const auto & lane = lanes.at(i);
     if (!lanelet::utils::isInLanelet(object_direction, lane.lanelet, margin)) continue;
     past_straight = false;  // NERO_IX_PRIORITY_TURN
-    const double lane_angle = lanelet::utils::getLaneletAngle(lane.lanelet, object_direction.position);
+    const double lane_angle = autoware::behavior_velocity_planner::nero_geom::getLaneletAngle(lane.lanelet, object_direction.position);
     const double angle_diff = autoware_utils::normalize_radian(lane_angle - motion_angle, -M_PI);
     const bool along = std::fabs(angle_diff) < angle_thr;
     const bool reversed_parked =
@@ -2781,7 +2782,7 @@ void IntersectionModule::updateObjectInfoManagerCollision(
       bool along = true;
       for (size_t i = b; i <= e && i < iv.path.size(); ++i) {
         const auto & q = iv.path.at(i);
-        const double lane_yaw = lanelet::utils::getLaneletAngle(ego_lane, q.position);
+        const double lane_yaw = autoware::behavior_velocity_planner::nero_geom::getLaneletAngle(ego_lane, q.position);
         dmax = std::max(dmax, std::fabs(autoware_utils::normalize_radian(tf2::getYaw(q.orientation) - lane_yaw)));
         if (dmax >= thr) along = false;
       }
@@ -2793,7 +2794,7 @@ void IntersectionModule::updateObjectInfoManagerCollision(
         const auto & q = iv.path.at(e + 1);
         for (const auto & ll : nero_ego_nexts) {
           if (!lanelet::geometry::inside(ll, lanelet::BasicPoint2d(q.position.x, q.position.y))) continue;
-          const double ll_yaw = lanelet::utils::getLaneletAngle(ll, q.position);
+          const double ll_yaw = autoware::behavior_velocity_planner::nero_geom::getLaneletAngle(ll, q.position);
           if (std::fabs(autoware_utils::normalize_radian(tf2::getYaw(q.orientation) - ll_yaw)) < thr) {
             out_ok = true;
             out_ll = ll.id();
@@ -3497,10 +3498,10 @@ std::optional<size_t> IntersectionModule::checkAngleForTargetLanelets(
 
   for (unsigned i = 0; i < target_lanelets.size(); ++i) {
     const auto & ll = target_lanelets.at(i);
-    if (!lanelet::utils::isInLanelet(pose, ll, dist_margin)) {
+    if (!nero_geom::isInLanelet(pose, ll, dist_margin)) {  // NERO_IX_GEOM_CACHE (unset = upstream)
       continue;
     }
-    const double ll_angle = lanelet::utils::getLaneletAngle(ll, pose.position);
+    const double ll_angle = autoware::behavior_velocity_planner::nero_geom::getLaneletAngle(ll, pose.position);
     const double pose_angle = tf2::getYaw(pose.orientation);
     const double angle_diff = autoware_utils::normalize_radian(ll_angle - pose_angle, -M_PI);
     if (consider_wrong_direction_vehicle) {

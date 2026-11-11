@@ -26,6 +26,8 @@ class Result
 {
 public:
   explicit Result(const Ok & ok) : data_(ok) {}
+  // trjrate-2: a temporary Ok (make_ok) is moved in, not copied (the module's 0.1 m path: ~3000 points)
+  explicit Result(Ok && ok) : data_(std::move(ok)) {}
   explicit Result(const Error & err) : data_(err) {}
   explicit operator bool() const noexcept { return std::holds_alternative<Ok>(data_); }
   bool operator!() const noexcept { return !static_cast<bool>(*this); }

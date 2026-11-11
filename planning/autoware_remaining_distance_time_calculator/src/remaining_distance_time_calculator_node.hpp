@@ -96,6 +96,10 @@ private:
    * @brief calculate mission remaining distance
    */
   void calculate_remaining_distance();
+  // NERO_RDTC_FAST (trjrate): see the .cpp
+  void calculate_remaining_distance_upstream();
+  void calculate_remaining_distance_nero();
+  void calculate_remaining_distance_fast(bool cur_found, const lanelet::ConstLanelet & current_lanelet);
 
   /**
    * @brief calculate mission remaining time

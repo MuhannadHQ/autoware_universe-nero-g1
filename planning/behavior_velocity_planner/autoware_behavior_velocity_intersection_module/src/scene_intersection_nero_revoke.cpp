@@ -26,6 +26,7 @@
 // inside his way (contact, v3).
 
 #include "nero_yield_revoke.hpp"
+#include "nero_geom_cache.hpp"  // NERO_IX_GEOM_CACHE (trjrate-2)
 #include "scene_intersection.hpp"
 #include "util.hpp"
 
@@ -218,7 +219,7 @@ double IntersectionModule::neroYieldRevokeTouch(
           ll.attribute(lanelet::AttributeName::Subtype).value() == lanelet::AttributeValueString::Crosswalk) {
         continue;
       }
-      const double ll_yaw = lanelet::utils::getLaneletAngle(ll, mpose.position);
+      const double ll_yaw = autoware::behavior_velocity_planner::nero_geom::getLaneletAngle(ll, mpose.position);
       if (std::fabs(autoware_utils::normalize_radian(ll_yaw - myaw)) > M_PI / 4.0) continue;
       const auto cl = ll.centerline2d();
       const double s0 = lanelet::geometry::toArcCoordinates(cl, p2).length;

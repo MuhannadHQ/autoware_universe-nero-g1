@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "autoware/behavior_path_goal_planner_module/util.hpp"
+#include "autoware/behavior_path_planner_common/utils/nero_geom_fast.hpp"  // NERO_BPP_GEOM_FAST (trjrate-2)
 
 #include "autoware/behavior_path_planner_common/utils/path_safety_checker/safety_check.hpp"
 #include "autoware/behavior_path_planner_common/utils/utils.hpp"
@@ -69,7 +70,7 @@ lanelet::ConstLanelets getPullOverLanes(
   }
 
   lanelet::ConstLanelet closest_lane{};
-  route_handler.getClosestLaneletWithinRoute(goal_pose, &closest_lane);
+  nero_geom_fast::getClosestLaneletWithinRoute(route_handler, goal_pose, &closest_lane);
   lanelet::ConstLanelet outermost_lane{};
   if (left_side) {
     outermost_lane = route_handler.getMostLeftLanelet(closest_lane, false, true);
@@ -87,7 +88,7 @@ static double getOffsetToLanesBoundary(
   const bool left_side)
 {
   lanelet::ConstLanelet closest_lanelet;
-  lanelet::utils::query::getClosestLanelet(lanelet_sequence, target_pose, &closest_lanelet);
+  nero_geom_fast::getClosestLanelet(lanelet_sequence, target_pose, &closest_lanelet);
 
   // the boundary closer to ego. if left_side, take right boundary
   const auto & boundary3d = left_side ? closest_lanelet.rightBound() : closest_lanelet.leftBound();
@@ -752,7 +753,7 @@ std::optional<Pose> calcRefinedGoal(
     parameters.forward_goal_search_length);
 
   lanelet::Lanelet closest_pull_over_lanelet{};
-  lanelet::utils::query::getClosestLanelet(pull_over_lanes, goal_pose, &closest_pull_over_lanelet);
+  nero_geom_fast::getClosestLanelet(pull_over_lanes, goal_pose, &closest_pull_over_lanelet);
 
   // calc closest center line pose
   Pose center_pose{};

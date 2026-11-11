@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "autoware/behavior_path_planner_common/utils/path_safety_checker/objects_filtering.hpp"
+#include "autoware/behavior_path_planner_common/utils/nero_geom_fast.hpp"  // NERO_BPP_GEOM_FAST (trjrate-2)
 #include "autoware/behavior_path_planner_common/utils/nero_mu.hpp"  // NERO_BPP_PROJ_FAST
 
 #include "autoware/behavior_path_planner_common/utils/utils.hpp"
@@ -81,14 +82,14 @@ bool isCentroidWithinLanelet(
   const PredictedObject & object, const lanelet::ConstLanelet & lanelet, const double yaw_threshold)
 {
   const auto & object_pose = object.kinematics.initial_pose_with_covariance.pose;
-  if (!boost::geometry::within(
+  if (!nero_geom_fast::withinLanelet(
         lanelet::utils::to2D(lanelet::utils::conversion::toLaneletPoint(object_pose.position))
           .basicPoint(),
-        lanelet.polygon2d().basicPolygon())) {
+        lanelet)) {
     return false;
   }
 
-  const auto closest_pose = lanelet::utils::getClosestCenterPose(lanelet, object_pose.position);
+  const auto closest_pose = nero_geom_fast::getClosestCenterPose(lanelet, object_pose.position);
   return std::abs(autoware_utils::calc_yaw_deviation(closest_pose, object_pose)) < yaw_threshold;
 }
 
@@ -101,7 +102,7 @@ bool isPolygonOverlapLanelet(
   }
 
   const auto & object_pose = object.kinematics.initial_pose_with_covariance.pose;
-  const auto closest_pose = lanelet::utils::getClosestCenterPose(lanelet, object_pose.position);
+  const auto closest_pose = nero_geom_fast::getClosestCenterPose(lanelet, object_pose.position);
   return std::abs(autoware_utils::calc_yaw_deviation(closest_pose, object_pose)) < yaw_threshold;
 }
 
@@ -334,7 +335,7 @@ bool isCentroidWithinLanelets(
   lanelet::BasicPoint2d object_centroid(object_pos.x, object_pos.y);
 
   const auto is_within = [&](const auto & llt) {
-    return boost::geometry::within(object_centroid, llt.polygon2d().basicPolygon());
+    return nero_geom_fast::withinLanelet(object_centroid, llt);
   };
 
   return std::any_of(target_lanelets.begin(), target_lanelets.end(), is_within);

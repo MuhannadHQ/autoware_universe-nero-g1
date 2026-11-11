@@ -14,6 +14,7 @@
 #include "autoware/behavior_path_planner_common/utils/drivable_area_expansion/static_drivable_area.hpp"
 
 #include "autoware/behavior_path_planner_common/utils/nero_mu.hpp"  // NERO_BPP_PROJ_FAST
+#include "autoware/behavior_path_planner_common/utils/nero_geom_fast.hpp"  // NERO_BPP_GEOM_FAST (trjrate)
 #include "autoware/behavior_path_planner_common/utils/drivable_area_expansion/drivable_area_expansion.hpp"
 #include "autoware/motion_utils/trajectory/trajectory.hpp"
 
@@ -634,7 +635,9 @@ std::vector<Point> updateBoundary(
 
 namespace autoware::behavior_path_planner::utils
 {
-std::optional<size_t> getOverlappedLaneletId(const std::vector<DrivableLanes> & lanes)
+namespace
+{
+std::optional<size_t> getOverlappedLaneletIdUpstream(const std::vector<DrivableLanes> & lanes)
 {
   auto overlaps = [](const DrivableLanes & lanes, const DrivableLanes & target_lanes) {
     const auto lanelets = utils::transformToLanelets(lanes);
@@ -671,6 +674,67 @@ std::optional<size_t> getOverlappedLaneletId(const std::vector<DrivableLanes> & 
   }
 
   return {};
+}
+
+// NERO_BPP_GEOM_FAST (b): the same pairs in the same order, each lane's polygons built once per call (upstream: per pair)
+// and a lanelet pair whose boxes are more than 1 mm apart skipped (it cannot overlap)
+std::optional<size_t> getOverlappedLaneletIdFast(const std::vector<DrivableLanes> & lanes)
+{
+  if (lanes.size() <= 2) {
+    return {};
+  }
+  auto & st = nero_geom_fast::stats();
+  std::vector<std::vector<std::pair<Polygon2d, nero_geom_fast::Box>>> polys(lanes.size());
+  for (size_t i = 0; i < lanes.size(); ++i) {
+    for (const auto & lanelet : utils::transformToLanelets(lanes.at(i))) {
+      auto poly = toPolygon2d(lanelet);
+      const auto box = nero_geom_fast::Box::of(poly.outer());
+      polys.at(i).emplace_back(std::move(poly), box);
+    }
+  }
+  const auto overlaps = [&](const size_t i, const size_t j) {
+    for (const auto & [pa, ba] : polys.at(i)) {
+      for (const auto & [pb, bb] : polys.at(j)) {
+        st.ov_pairs++;
+        if (ba.apart(bb, 1.0e-3)) {
+          st.ov_skipped++;
+          continue;
+        }
+        std::vector<Polygon2d> intersections{};
+        boost::geometry::intersection(pa, pb, intersections);
+        for (const auto & polygon : intersections) {
+          if (boost::geometry::area(polygon) > 1e-3) {
+            return true;
+          }
+        }
+      }
+    }
+    return false;
+  };
+  for (size_t i = 0; i < lanes.size() - 2; ++i) {
+    for (size_t j = i + 2; j < lanes.size(); ++j) {
+      if (overlaps(i, j)) {
+        return j;
+      }
+    }
+  }
+  return {};
+}
+}  // namespace
+
+std::optional<size_t> getOverlappedLaneletId(const std::vector<DrivableLanes> & lanes)
+{
+  const int m = nero_geom_fast::mode();
+  if (m == 0) return getOverlappedLaneletIdUpstream(lanes);
+  nero_geom_fast::stats().ov_calls++;
+  nero_geom_fast::maybe_print();
+  const auto fast = getOverlappedLaneletIdFast(lanes);
+  if (m == 2) {
+    const auto ref = getOverlappedLaneletIdUpstream(lanes);
+    if (ref != fast) nero_geom_fast::stats().ov_mismatch++;
+    return ref;
+  }
+  return fast;
 }
 
 std::vector<DrivableLanes> cutOverlappedLanes(
@@ -1001,13 +1065,13 @@ std::vector<DrivableLanes> expandLanelets(
     DrivableLanes expanded_lanes;
     if (lanes.left_lane.id() == lanes.right_lane.id()) {
       expanded_lanes.left_lane =
-        lanelet::utils::getExpandedLanelet(lanes.left_lane, l_offset, r_offset);
+        nero_geom_fast::getExpandedLanelet(lanes.left_lane, l_offset, r_offset);
       expanded_lanes.right_lane =
-        lanelet::utils::getExpandedLanelet(lanes.right_lane, l_offset, r_offset);
+        nero_geom_fast::getExpandedLanelet(lanes.right_lane, l_offset, r_offset);
     } else {
-      expanded_lanes.left_lane = lanelet::utils::getExpandedLanelet(lanes.left_lane, l_offset, 0.0);
+      expanded_lanes.left_lane = nero_geom_fast::getExpandedLanelet(lanes.left_lane, l_offset, 0.0);
       expanded_lanes.right_lane =
-        lanelet::utils::getExpandedLanelet(lanes.right_lane, 0.0, r_offset);
+        nero_geom_fast::getExpandedLanelet(lanes.right_lane, 0.0, r_offset);
     }
     expanded_lanes.middle_lanes = lanes.middle_lanes;
     expanded_drivable_lanes.push_back(expanded_lanes);
@@ -1502,14 +1566,18 @@ std::vector<geometry_msgs::msg::Point> postProcess(
         if (checkHasSameLane(ignore_lanelets, transformed_lane)) {
           continue;
         }
-        if (boost::geometry::intersects(
-              lane.polygon2d().basicPolygon(), transformed_lane.polygon2d().basicPolygon())) {
+        // NERO_BPP_GEOM_FAST (f): kept polygons + a box test (unset: upstream's intersects on rebuilt polygons)
+        if (nero_geom_fast::lanelets_intersect(lane, transformed_lane)) {
           return true;
         }
       }
       return false;
     };
 
+  if (nero_geom_fast::mode() != 0) {
+    nero_geom_fast::stats().pp_calls++;
+    nero_geom_fast::maybe_print();
+  }
   std::vector<geometry_msgs::msg::Point> processed_bound;
   std::vector<geometry_msgs::msg::Point> tmp_bound = original_bound;
 

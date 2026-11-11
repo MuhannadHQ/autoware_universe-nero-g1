@@ -15,6 +15,8 @@
 #include "util.hpp"
 
 #include "interpolated_path_info.hpp"
+#include "nero_geom_cache.hpp"  // NERO_IX_GEOM_CACHE (trjrate)
+#include "nero_resample.hpp"  // NERO_IX_GEOM_CACHE (trjrate-2)
 
 #include <autoware/behavior_velocity_planner_common/utilization/boost_geometry_helper.hpp>
 #include <autoware/behavior_velocity_planner_common/utilization/path_utilization.hpp>
@@ -366,8 +368,29 @@ std::optional<InterpolatedPathInfo> generateInterpolatedPath(
   const rclcpp::Logger logger)
 {
   InterpolatedPathInfo interpolated_path_info;
-  if (!splineInterpolate(input_path, ds, interpolated_path_info.path, logger)) {
-    return std::nullopt;
+  const int nero_mode = nero_geom::mode();
+  if (nero_mode == 0) {
+    if (!splineInterpolate(input_path, ds, interpolated_path_info.path, logger)) {
+      return std::nullopt;
+    }
+  } else {
+    // NERO_IX_GEOM_CACHE (trjrate-2): = splineInterpolate (behavior_velocity_planner_common: resamplePath(input, ds, false,
+    // true, true, false), false below 2 points) through the exact replica
+    if (input_path.points.size() < 2) {
+      RCLCPP_DEBUG(logger, "Do not interpolate because path size is 1.");
+      return std::nullopt;
+    }
+    nero_geom::stats().sp_calls++;
+    bool reused = false;
+    interpolated_path_info.path =
+      nero_resample::resamplePathReuse(input_path, ds, false, true, true, &reused);
+    if (reused) nero_geom::stats().sp_reused++;
+    if (nero_mode == 2) {
+      autoware_internal_planning_msgs::msg::PathWithLaneId ref;
+      splineInterpolate(input_path, ds, ref, logger);
+      if (!nero_resample::same_path(ref, interpolated_path_info.path)) nero_geom::stats().sp_mismatch++;
+      interpolated_path_info.path = std::move(ref);
+    }
   }
   interpolated_path_info.ds = ds;
   interpolated_path_info.lane_id = lane_id;

@@ -14,6 +14,7 @@
 
 #include "autoware/behavior_path_planner_common/utils/utils.hpp"
 #include "autoware/behavior_path_planner_common/utils/nero_mu.hpp"  // NERO_BPP_PROJ_FAST
+#include "autoware/behavior_path_planner_common/utils/nero_geom_fast.hpp"  // NERO_BPP_GEOM_FAST
 
 #include "autoware/motion_utils/trajectory/path_with_lane_id.hpp"
 
@@ -389,7 +390,7 @@ PathWithLaneId refinePathForGoal(
 bool isInLanelets(const Pose & pose, const lanelet::ConstLanelets & lanes)
 {
   for (const auto & lane : lanes) {
-    if (lanelet::utils::isInLanelet(pose, lane)) {
+    if (nero_geom_fast::isInLanelet(pose, lane)) {
       return true;
     }
   }
@@ -401,11 +402,11 @@ bool isInLaneletWithYawThreshold(
   const double radius)
 {
   const double pose_yaw = tf2::getYaw(current_pose.orientation);
-  const double lanelet_angle = lanelet::utils::getLaneletAngle(lanelet, current_pose.position);
+  const double lanelet_angle = nero_geom_fast::getLaneletAngle(lanelet, current_pose.position);
   const double angle_diff = std::abs(autoware_utils::normalize_radian(lanelet_angle - pose_yaw));
 
   return (angle_diff < std::abs(yaw_threshold)) &&
-         lanelet::utils::isInLanelet(current_pose, lanelet, radius);
+         nero_geom_fast::isInLanelet(current_pose, lanelet, radius);
 }
 
 bool isEgoOutOfRoute(
@@ -450,14 +451,14 @@ bool isEgoOutOfRoute(
   const bool is_in_shoulder_lane = !route_handler->getShoulderLaneletsAtPose(self_pose).empty();
   // Check if ego vehicle is in road lane
   const bool is_in_road_lane = std::invoke([&]() {
-    if (lanelet::utils::isInLanelet(self_pose, closest_road_lane)) {
+    if (nero_geom_fast::isInLanelet(self_pose, closest_road_lane)) {
       return true;
     }
 
     // check previous lanes for backward driving (e.g. pull out)
     const auto prev_lanes = route_handler->getPreviousLanelets(closest_road_lane);
     for (const auto & lane : prev_lanes) {
-      if (lanelet::utils::isInLanelet(self_pose, lane)) {
+      if (nero_geom_fast::isInLanelet(self_pose, lane)) {
         return true;
       }
     }
@@ -472,6 +473,22 @@ bool isEgoWithinOriginalLane(
   const lanelet::ConstLanelets & current_lanes, const Pose & current_pose,
   const BehaviorPathPlannerParameters & common_param, const double outer_margin)
 {
+  const int nero_mode = nero_geom_fast::mode();
+  if (nero_mode != 0) {
+    // NERO_BPP_GEOM_FAST (i): the combined lane polygon kept per lanelet list
+    nero_geom_fast::stats().ew_calls++;
+    nero_geom_fast::maybe_print();
+    const auto poly = nero_geom_fast::combined_lane_polygon(current_lanes);
+    const bool fast = isEgoWithinOriginalLane(*poly, current_pose, common_param, outer_margin);
+    if (nero_mode == 2) {
+      const auto combined_lane = lanelet::utils::combineLaneletsShape(current_lanes);
+      const auto lane_polygon = combined_lane.polygon2d().basicPolygon();
+      const bool ref = isEgoWithinOriginalLane(lane_polygon, current_pose, common_param, outer_margin);
+      if (ref != fast) nero_geom_fast::stats().ew_mismatch++;
+      return ref;
+    }
+    return fast;
+  }
   const auto combined_lane = lanelet::utils::combineLaneletsShape(current_lanes);
   const auto lane_polygon = combined_lane.polygon2d().basicPolygon();
   return isEgoWithinOriginalLane(lane_polygon, current_pose, common_param, outer_margin);
@@ -572,7 +589,7 @@ double getDistanceToNextIntersection(
   const auto & arc_coordinates = lanelet::utils::getArcCoordinates(lanelets, current_pose);
 
   lanelet::ConstLanelet current_lanelet;
-  if (!lanelet::utils::query::getClosestLanelet(lanelets, current_pose, &current_lanelet)) {
+  if (!nero_geom_fast::getClosestLanelet(lanelets, current_pose, &current_lanelet)) {
     return std::numeric_limits<double>::max();
   }
 
@@ -615,7 +632,7 @@ double getDistanceToCrosswalk(
   const auto & arc_coordinates = lanelet::utils::getArcCoordinates(lanelets, current_pose);
 
   lanelet::ConstLanelet current_lanelet;
-  if (!lanelet::utils::query::getClosestLanelet(lanelets, current_pose, &current_lanelet)) {
+  if (!nero_geom_fast::getClosestLanelet(lanelets, current_pose, &current_lanelet)) {
     return std::numeric_limits<double>::infinity();
   }
 
@@ -739,7 +756,7 @@ double getSignedDistanceFromBoundary(
 {
   lanelet::ConstLanelet closest_lanelet;
 
-  if (lanelet::utils::query::getClosestLanelet(lanelets, pose, &closest_lanelet)) {
+  if (nero_geom_fast::getClosestLanelet(lanelets, pose, &closest_lanelet)) {
     return getSignedDistanceFromLaneBoundary(closest_lanelet, pose.position, left_side);
   }
 
@@ -927,7 +944,7 @@ std::shared_ptr<PathWithLaneId> generateCenterLinePath(
   const auto & pose = planner_data->self_odometry->pose.pose;
 
   lanelet::ConstLanelet current_lane;
-  if (!route_handler->getClosestLaneletWithinRoute(pose, &current_lane)) {
+  if (!nero_geom_fast::getClosestLaneletWithinRoute(*route_handler, pose, &current_lane)) {
     RCLCPP_ERROR(
       rclcpp::get_logger("behavior_path_planner").get_child("utils"),
       "failed to find closest lanelet within route!!!");
@@ -1030,7 +1047,7 @@ lanelet::ConstLanelets getCurrentLanes(
   const auto current_pose = planner_data->self_odometry->pose.pose;
 
   lanelet::ConstLanelet current_lane;
-  if (!route_handler->getClosestLaneletWithinRoute(current_pose, &current_lane)) {
+  if (!nero_geom_fast::getClosestLaneletWithinRoute(*route_handler, current_pose, &current_lane)) {
     auto clock{rclcpp::Clock{RCL_ROS_TIME}};
     RCLCPP_ERROR_STREAM_THROTTLE(
       rclcpp::get_logger("behavior_path_planner").get_child("utils"), clock, 1000,
@@ -1081,7 +1098,7 @@ lanelet::ConstLanelets getCurrentLanesFromPath(
   }
 
   lanelet::ConstLanelet current_lane;
-  lanelet::utils::query::getClosestLanelet(reference_lanes, current_pose, &current_lane);
+  nero_geom_fast::getClosestLanelet(reference_lanes, current_pose, &current_lane);
   auto current_lanes = route_handler->getLaneletSequence(
     current_lane, current_pose, p.backward_path_length, p.forward_path_length);
 

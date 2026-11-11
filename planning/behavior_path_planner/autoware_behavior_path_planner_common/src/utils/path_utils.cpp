@@ -16,6 +16,8 @@
 
 #include "autoware/behavior_path_planner_common/utils/drivable_area_expansion/static_drivable_area.hpp"
 #include "autoware/behavior_path_planner_common/utils/utils.hpp"
+#include "autoware/behavior_path_planner_common/utils/nero_geom_fast.hpp"  // NERO_BPP_GEOM_FAST
+#include "autoware/behavior_path_planner_common/utils/nero_resample.hpp"  // NERO_BPP_GEOM_FAST (g)
 
 #include <autoware/interpolation/spline_interpolation.hpp>
 #include <autoware/motion_utils/resample/resample.hpp>
@@ -59,7 +61,9 @@ std::vector<double> calcPathArcLengthArray(
 /**
  * @brief resamplePathWithSpline
  */
-PathWithLaneId resamplePathWithSpline(
+namespace
+{
+PathWithLaneId resamplePathWithSplineUpstream(
   const PathWithLaneId & path, const double interval, const bool keep_input_points,
   const std::pair<double, double> target_section)
 {
@@ -155,6 +159,143 @@ PathWithLaneId resamplePathWithSpline(
   std::sort(s_out.begin(), s_out.end());
 
   return autoware::motion_utils::resamplePath(path, s_out);
+}
+
+PathWithLaneId resamplePathWithSplineFast(
+  const PathWithLaneId & path, const double interval, const bool keep_input_points,
+  const std::pair<double, double> target_section)
+{
+  if (path.points.size() < 2) {
+    return path;
+  }
+
+  std::vector<autoware_planning_msgs::msg::PathPoint> transformed_path(path.points.size());
+  for (size_t i = 0; i < path.points.size(); ++i) {
+    transformed_path.at(i) = path.points.at(i).point;
+  }
+
+  const auto find_almost_same_values =
+    [&](const std::vector<double> & vec, double x) -> std::optional<std::vector<size_t>> {
+    constexpr double epsilon = 0.2;
+    const auto is_close = [&](double v, double x) { return std::abs(v - x) < epsilon; };
+
+    std::vector<size_t> indices;
+    if (vec.empty()) {
+      return std::nullopt;
+    }
+
+    for (size_t i = 0; i < vec.size(); ++i) {
+      if (is_close(vec[i], x)) {
+        indices.push_back(i);
+      }
+    }
+
+    if (indices.empty()) {
+      return std::nullopt;
+    }
+
+    return indices;
+  };
+
+  // Get lane ids that are not duplicated
+  std::vector<double> s_in;
+  std::unordered_set<int64_t> unique_lane_ids;
+  const auto s_vec = autoware::motion_utils::calcSignedArcLengthPartialSum(
+    transformed_path, 0, transformed_path.size());
+  for (size_t i = 0; i < path.points.size(); ++i) {
+    const double s = s_vec.at(i);
+
+    for (const auto & lane_id : path.points.at(i).lane_ids) {
+      if (!keep_input_points && (unique_lane_ids.find(lane_id) != unique_lane_ids.end())) {
+        continue;
+      }
+      unique_lane_ids.insert(lane_id);
+
+      if (!find_almost_same_values(s_in, s)) {
+        s_in.push_back(s);
+      }
+    }
+  }
+
+  std::vector<double> s_out = s_in;
+
+  // NERO_BPP_GEOM_FAST (g): "is any value of s_out within 0.2 of s" answered on two sorted lists (s_in sorted, then the
+  // samples pushed in increasing order) by binary search to s - 0.25 and the same |v - s| < 0.2 test on the values up to
+  // s + 0.25 (no value within 0.2 lies outside that window); s_out itself gets the same values in the same order
+  std::vector<double> s_in_sorted = s_in;
+  std::sort(s_in_sorted.begin(), s_in_sorted.end());
+  std::vector<double> pushed;
+  pushed.reserve(s_vec.empty() ? 0 : static_cast<size_t>(std::max(0.0, s_vec.back() / std::max(interval, 1e-3))) + 2);
+  const auto any_close = [](const std::vector<double> & sorted, const double x) {
+    constexpr double epsilon = 0.2;
+    for (auto it = std::lower_bound(sorted.begin(), sorted.end(), x - 0.25);
+         it != sorted.end() && *it <= x + 0.25; ++it) {
+      if (std::abs(*it - x) < epsilon) return true;
+    }
+    return false;
+  };
+
+  // sampling from interval distance
+  const auto start_s = std::max(target_section.first, 0.0);
+  const auto end_s = std::min(target_section.second, s_vec.back());
+  for (double s = start_s; s < end_s; s += interval) {
+    if (!any_close(s_in_sorted, s) && !any_close(pushed, s)) {
+      s_out.push_back(s);
+      pushed.push_back(s);
+    }
+  }
+  if (!any_close(s_in_sorted, end_s) && !any_close(pushed, end_s)) {  // pushed increases with s: sorted
+    s_out.push_back(end_s);
+  }
+
+  // Insert Stop Point
+  const auto closest_stop_dist =
+    autoware::motion_utils::calcDistanceToForwardStopPoint(transformed_path);
+  if (closest_stop_dist) {
+    const auto close_indices = find_almost_same_values(s_out, *closest_stop_dist);
+    if (close_indices) {
+      // Update the smallest index
+      s_out.at(close_indices->at(0)) = *closest_stop_dist;
+
+      // Remove the rest of the indices in descending order
+      for (size_t i = close_indices->size() - 1; i > 0; --i) {
+        s_out.erase(s_out.begin() + close_indices->at(i));
+      }
+    } else {
+      s_out.push_back(*closest_stop_dist);
+    }
+  }
+
+  // spline resample required more than 2 points for yaw angle calculation
+  if (s_out.size() < 2) {
+    return path;
+  }
+
+  std::sort(s_out.begin(), s_out.end());
+
+  return nero_resample::resamplePath(path, s_out);
+}
+}  // namespace
+
+// NERO_BPP_GEOM_FAST (g): unset / 0 = upstream's resamplePathWithSpline (below, unchanged); 1 = the same result without its
+// O(n^2) duplicate test and with nero_resample::resamplePath; 2 = check (both, compared field by field, upstream used)
+PathWithLaneId resamplePathWithSpline(
+  const PathWithLaneId & path, const double interval, const bool keep_input_points,
+  const std::pair<double, double> target_section)
+{
+  const int nero_mode = nero_geom_fast::mode();
+  if (nero_mode == 0) {
+    return resamplePathWithSplineUpstream(path, interval, keep_input_points, target_section);
+  }
+  nero_geom_fast::stats().rs_calls++;
+  nero_geom_fast::maybe_print();
+  auto fast = resamplePathWithSplineFast(path, interval, keep_input_points, target_section);
+  if (nero_mode == 2) {
+    auto ref = resamplePathWithSplineUpstream(path, interval, keep_input_points, target_section);
+    if (!nero_resample::same_path(ref, fast)) nero_geom_fast::stats().rs_mismatch++;
+    return ref;
+  }
+  return fast;
 }
 
 size_t getIdxByArclength(
@@ -467,7 +608,7 @@ BehaviorModuleOutput getReferencePath(
   const auto current_lanes_with_backward_margin =
     route_handler->getLaneletSequence(current_lane, backward_length, p.forward_path_length);
   const auto no_shift_pose =
-    lanelet::utils::getClosestCenterPose(current_lane, current_pose.position);
+    nero_geom_fast::getClosestCenterPose(current_lane, current_pose.position);
   reference_path = getCenterLinePath(
     *route_handler, current_lanes_with_backward_margin, no_shift_pose, backward_length,
     p.forward_path_length, p);

@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "autoware/behavior_path_planner_common/turn_signal_decider.hpp"
+#include "autoware/behavior_path_planner_common/utils/nero_geom_fast.hpp"  // NERO_BPP_GEOM_FAST (trjrate-2)
 #include "autoware/behavior_path_planner_common/utils/nero_mu.hpp"  // NERO_BPP_PROJ_FAST
 
 #include "autoware/behavior_path_planner_common/utils/utils.hpp"
@@ -776,7 +777,7 @@ std::pair<TurnSignalInfo, bool> TurnSignalDecider::getBehaviorTurnSignalInfo(
 
   lanelet::ConstLanelet lanelet;
   const auto query_pose = (egos_lane_is_shifted) ? shift_line.end : shift_line.start;
-  if (!rh->getClosestLaneletWithinRoute(query_pose, &lanelet)) {
+  if (!nero_geom_fast::getClosestLaneletWithinRoute(*rh, query_pose, &lanelet)) {
     return std::make_pair(TurnSignalInfo(p_path_start, p_path_end), true);
   }
 

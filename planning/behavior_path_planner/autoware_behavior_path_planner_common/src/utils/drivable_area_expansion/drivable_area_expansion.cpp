@@ -14,6 +14,7 @@
 
 #include "autoware/behavior_path_planner_common/utils/drivable_area_expansion/drivable_area_expansion.hpp"
 #include "autoware/behavior_path_planner_common/utils/nero_mu.hpp"  // NERO_BPP_PROJ_FAST
+#include "autoware/behavior_path_planner_common/utils/nero_geom_fast.hpp"  // NERO_BPP_GEOM_FAST (trjrate)
 
 #include "autoware/behavior_path_planner_common/utils/drivable_area_expansion/footprints.hpp"
 #include "autoware/behavior_path_planner_common/utils/drivable_area_expansion/map_utils.hpp"
@@ -32,8 +33,10 @@
 #include <boost/geometry/strategies/strategies.hpp>
 
 #include <algorithm>
+#include <cmath>
 #include <iostream>
 #include <limits>
+#include <unordered_map>
 #include <memory>
 #include <vector>
 
@@ -296,20 +299,148 @@ void expand_bound(
   }
 
   // remove any self intersection by skipping the points inside of the loop
-  std::vector<Point> no_loop_bound = {bound.front()};
-  for (auto idx = 1LU; idx < bound.size(); ++idx) {
-    bool is_intersecting = false;
-    for (auto succ_idx = idx + 1; succ_idx < bound.size(); ++succ_idx) {
-      const auto intersection =
-        autoware_utils::intersect(bound[idx - 1], bound[idx], bound[succ_idx - 1], bound[succ_idx]);
-      if (
-        intersection && autoware_utils::calc_distance2d(*intersection, bound[idx - 1]) > 1e-3 &&
-        autoware_utils::calc_distance2d(*intersection, bound[idx]) > 1e-3) {
-        idx = succ_idx;
-        is_intersecting = true;
+  // NERO_BPP_GEOM_FAST (c): the same loop; a segment pair whose boxes are more than 1 mm apart cannot intersect: skipped.
+  // (h) (trjrate-2): the pairs NOT box-apart are found through a grid (each segment k = (k-1, k) entered in every 2 m cell
+  // its box touches, padded 2 mm), then box-tested and intersect-tested in increasing k exactly as (c); after a hit the
+  // loop continues from the hit's next segment against the new segment, as upstream's loop does.
+  const auto remove_loops = [&bound](const bool fast) {
+    std::vector<nero_geom_fast::Box> boxes;
+    if (fast) {
+      boxes.resize(bound.size());
+      for (auto k = 1LU; k < bound.size(); ++k) {
+        boxes[k] = nero_geom_fast::Box{
+          std::min(bound[k - 1].x, bound[k].x), std::min(bound[k - 1].y, bound[k].y),
+          std::max(bound[k - 1].x, bound[k].x), std::max(bound[k - 1].y, bound[k].y)};
       }
     }
-    if (!is_intersecting) no_loop_bound.push_back(bound[idx]);
+    // grid of segment indices (each cell's list increasing in k)
+    constexpr double cell = 2.0;
+    constexpr double pad = 2.0e-3;
+    double gx0 = 0.0;
+    double gy0 = 0.0;
+    std::unordered_map<int64_t, std::vector<uint32_t>> grid;
+    const auto cell_key = [](const int64_t cx, const int64_t cy) { return (cx << 32) ^ (cy & 0xffffffffLL); };
+    const auto cell_of = [&](const double v, const double v0) {
+      return static_cast<int64_t>(std::floor((v - v0) / cell));
+    };
+    bool use_grid = fast && bound.size() > 2;
+    if (use_grid) {
+      // a bound with very long segments (a box spanning > 64 cells): the (c) loop
+      for (auto k = 1LU; k < bound.size() && use_grid; ++k) {
+        const auto & b = boxes[k];
+        if (b.maxx - b.minx > 64.0 * cell || b.maxy - b.miny > 64.0 * cell) use_grid = false;
+      }
+    }
+    if (use_grid) {
+      gx0 = std::numeric_limits<double>::max();
+      gy0 = std::numeric_limits<double>::max();
+      for (const auto & p : bound) {
+        gx0 = std::min(gx0, p.x);
+        gy0 = std::min(gy0, p.y);
+      }
+      gx0 -= 1.0;
+      gy0 -= 1.0;
+      for (auto k = 1LU; k < bound.size(); ++k) {
+        const auto & b = boxes[k];
+        for (int64_t cx = cell_of(b.minx - pad, gx0); cx <= cell_of(b.maxx + pad, gx0); ++cx) {
+          for (int64_t cy = cell_of(b.miny - pad, gy0); cy <= cell_of(b.maxy + pad, gy0); ++cy) {
+            grid[cell_key(cx, cy)].push_back(static_cast<uint32_t>(k));
+          }
+        }
+      }
+    }
+    std::vector<uint32_t> cand;
+    const auto candidates = [&](const size_t idx, const size_t from) {
+      cand.clear();
+      const auto & a = boxes[idx];
+      for (int64_t cx = cell_of(a.minx, gx0); cx <= cell_of(a.maxx, gx0); ++cx) {
+        for (int64_t cy = cell_of(a.miny, gy0); cy <= cell_of(a.maxy, gy0); ++cy) {
+          const auto it = grid.find(cell_key(cx, cy));
+          if (it == grid.end()) continue;
+          const auto & v = it->second;
+          for (auto i = std::lower_bound(v.begin(), v.end(), static_cast<uint32_t>(from)); i != v.end(); ++i) {
+            cand.push_back(*i);
+          }
+        }
+      }
+      std::sort(cand.begin(), cand.end());
+      cand.erase(std::unique(cand.begin(), cand.end()), cand.end());
+    };
+    uint64_t pairs = 0;
+    uint64_t skipped = 0;
+    std::vector<Point> no_loop_bound = {bound.front()};
+    for (auto idx = 1LU; idx < bound.size(); ++idx) {
+      bool is_intersecting = false;
+      if (use_grid) {
+        size_t from = idx + 1;
+        bool again = true;
+        while (again && from < bound.size()) {
+          again = false;
+          candidates(idx, from);
+          for (const auto c : cand) {
+            const size_t succ_idx = c;
+            ++pairs;
+            if (boxes[idx].apart(boxes[succ_idx], 1.0e-3)) {
+              ++skipped;
+              continue;
+            }
+            const auto intersection = autoware_utils::intersect(
+              bound[idx - 1], bound[idx], bound[succ_idx - 1], bound[succ_idx]);
+            if (
+              intersection && autoware_utils::calc_distance2d(*intersection, bound[idx - 1]) > 1e-3 &&
+              autoware_utils::calc_distance2d(*intersection, bound[idx]) > 1e-3) {
+              idx = succ_idx;
+              is_intersecting = true;
+              from = succ_idx + 1;
+              again = true;  // the rest is tested against the new segment idx, as upstream's loop does
+              break;
+            }
+          }
+        }
+      } else {
+        for (auto succ_idx = idx + 1; succ_idx < bound.size(); ++succ_idx) {
+          if (fast) {
+            ++pairs;
+            if (boxes[idx].apart(boxes[succ_idx], 1.0e-3)) {
+              ++skipped;
+              continue;
+            }
+          }
+          const auto intersection = autoware_utils::intersect(
+            bound[idx - 1], bound[idx], bound[succ_idx - 1], bound[succ_idx]);
+          if (
+            intersection && autoware_utils::calc_distance2d(*intersection, bound[idx - 1]) > 1e-3 &&
+            autoware_utils::calc_distance2d(*intersection, bound[idx]) > 1e-3) {
+            idx = succ_idx;
+            is_intersecting = true;
+          }
+        }
+      }
+      if (!is_intersecting) no_loop_bound.push_back(bound[idx]);
+    }
+    if (fast) {
+      nero_geom_fast::stats().eb_pairs += pairs;
+      nero_geom_fast::stats().eb_skipped += skipped;
+    }
+    return no_loop_bound;
+  };
+  const int nero_mode = nero_geom_fast::mode();
+  if (nero_mode == 0) {
+    bound = remove_loops(false);
+    return;
+  }
+  nero_geom_fast::stats().eb_calls++;
+  nero_geom_fast::maybe_print();
+  auto no_loop_bound = remove_loops(true);
+  if (nero_mode == 2) {
+    const auto ref = remove_loops(false);
+    bool same = ref.size() == no_loop_bound.size();
+    for (size_t k = 0; same && k < ref.size(); ++k) {
+      same = ref[k].x == no_loop_bound[k].x && ref[k].y == no_loop_bound[k].y &&
+             ref[k].z == no_loop_bound[k].z;
+    }
+    if (!same) nero_geom_fast::stats().eb_mismatch++;
+    no_loop_bound = ref;
   }
   bound = no_loop_bound;
 }

@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "autoware/behavior_path_planner_common/utils/utils.hpp"
+#include "autoware/behavior_path_planner_common/utils/nero_geom_fast.hpp"  // NERO_BPP_GEOM_FAST (trjrate-2)
 #include "autoware/behavior_path_planner_common/utils/nero_mu.hpp"  // NERO_BPP_PROJ_FAST
 
 #include "autoware/behavior_path_planner_common/utils/drivable_area_expansion/static_drivable_area.hpp"
@@ -268,7 +269,7 @@ std::vector<lanelet::ConstLineString3d> stopLines(const lanelet::ConstLanelet & 
 double distanceToStopLineOrJunction(const ObjectData & object, const lanelet::ConstLanelets & lanelets)
 {
   lanelet::ConstLanelet current;
-  if (!lanelet::utils::query::getClosestLanelet(lanelets, object.getPose(), &current)) {
+  if (!nero_geom_fast::getClosestLanelet(lanelets, object.getPose(), &current)) {
     return std::numeric_limits<double>::infinity();
   }
   const auto centerline = lanelet::utils::to2D(current.centerline());
@@ -750,7 +751,7 @@ bool isOnEgoLane(const ObjectData & object, const std::shared_ptr<RouteHandler> 
 bool isParallelToEgoLane(const ObjectData & object, const double threshold)
 {
   const auto closest_pose =
-    lanelet::utils::getClosestCenterPose(object.overhang_lanelet, object.getPosition());
+    nero_geom_fast::getClosestCenterPose(object.overhang_lanelet, object.getPosition());
   const auto yaw_deviation = std::abs(calc_yaw_deviation(closest_pose, object.getPose()));
 
   return yaw_deviation < threshold || yaw_deviation > M_PI - threshold;
@@ -759,7 +760,7 @@ bool isParallelToEgoLane(const ObjectData & object, const double threshold)
 bool isMergingToEgoLane(const ObjectData & object)
 {
   const auto closest_pose =
-    lanelet::utils::getClosestCenterPose(object.overhang_lanelet, object.getPosition());
+    nero_geom_fast::getClosestCenterPose(object.overhang_lanelet, object.getPosition());
   const auto yaw_deviation = calc_yaw_deviation(closest_pose, object.getPose());
 
   if (isOnRight(object)) {
@@ -806,7 +807,7 @@ bool isParkedVehicle(
   }
 
   const auto centerline_pos =
-    lanelet::utils::getClosestCenterPose(object.overhang_lanelet, object.getPosition()).position;
+    nero_geom_fast::getClosestCenterPose(object.overhang_lanelet, object.getPosition()).position;
 
   bool is_left_side_parked_vehicle = false;
   if (!isOnRight(object)) {
@@ -1476,7 +1477,7 @@ double getRoadShoulderDistance(
   }
 
   const auto centerline_pose =
-    lanelet::utils::getClosestCenterPose(object.overhang_lanelet, object.getPosition());
+    nero_geom_fast::getClosestCenterPose(object.overhang_lanelet, object.getPosition());
   // TODO(Satoshi OTA): check if the basic point is on right or left of bound.
   const auto bound = isOnRight(object) ? data.left_bound : data.right_bound;
   const auto envelope_polygon_width = boost::geometry::area(object.envelope_poly) /
@@ -2775,7 +2776,7 @@ std::vector<ExtendedPredictedObject> getSafetyCheckTargetObjects(
 
   lanelet::ConstLanelet closest_lanelet;
   const auto & ego_pose = planner_data->self_odometry->pose.pose;
-  if (!lanelet::utils::query::getClosestLanelet(
+  if (!nero_geom_fast::getClosestLanelet(
         data.current_lanelets, ego_pose, &closest_lanelet)) {
     return {};
   }

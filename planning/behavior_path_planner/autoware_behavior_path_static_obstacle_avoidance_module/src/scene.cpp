@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "autoware/behavior_path_static_obstacle_avoidance_module/scene.hpp"
+#include "autoware/behavior_path_planner_common/utils/nero_geom_fast.hpp"  // NERO_BPP_GEOM_FAST (trjrate-2)
 #include "autoware/behavior_path_planner_common/utils/nero_mu.hpp"  // NERO_BPP_PROJ_FAST
 
 #include "nero_proj.hpp"
@@ -1041,7 +1042,7 @@ void StaticObstacleAvoidanceModule::fillFundamentalData(
     data.current_lanelets, getEgoPose(), planner_data_);
 
   lanelet::ConstLanelet closest_lanelet{};
-  if (lanelet::utils::query::getClosestLanelet(
+  if (nero_geom_fast::getClosestLanelet(
         data.current_lanelets, getEgoPose(), &closest_lanelet))
     data.closest_lanelet = closest_lanelet;
 
@@ -1173,7 +1174,7 @@ void StaticObstacleAvoidanceModule::fillFundamentalData(
         });
         lanelet::ConstLanelet lane;
         const bool has_lane =
-          lanelet::utils::query::getClosestLanelet(data.current_lanelets, o.getPose(), &lane);
+          nero_geom_fast::getClosestLanelet(data.current_lanelets, o.getPose(), &lane);
         const int num = has_lane ? rh->getNumLaneToPreferredLane(lane) : 0;
         const bool on_right = utils::static_obstacle_avoidance::isOnRight(o);
         const bool toward_route_lc = (num > 0 && on_right) || (num < 0 && !on_right);
@@ -1666,7 +1667,7 @@ void StaticObstacleAvoidanceModule::fillEgoStatus(
     const bool nero_slow = getEgoSpeed() < 0.6;
     const auto nero_overhang_ok = [&]() {
       lanelet::ConstLanelet ll;
-      if (!lanelet::utils::query::getClosestLanelet(data.current_lanelets, getEgoPose(), &ll)) {
+      if (!nero_geom_fast::getClosestLanelet(data.current_lanelets, getEgoPose(), &ll)) {
         return false;
       }
       const lanelet::BasicPoint2d p{getEgoPosition().x, getEgoPosition().y};
@@ -1979,7 +1980,7 @@ void StaticObstacleAvoidanceModule::updateEgoBehavior(
 double StaticObstacleAvoidanceModule::neroBodyOverLaneBound() const
 {
   lanelet::ConstLanelet ll;
-  if (!lanelet::utils::query::getClosestLanelet(avoid_data_.current_lanelets, getEgoPose(), &ll)) {
+  if (!nero_geom_fast::getClosestLanelet(avoid_data_.current_lanelets, getEgoPose(), &ll)) {
     return std::numeric_limits<double>::quiet_NaN();
   }
   const lanelet::BasicPoint2d p{getEgoPosition().x, getEgoPosition().y};
@@ -2091,7 +2092,7 @@ std::optional<double> StaticObstacleAvoidanceModule::neroInLaneShiftLimit(
   lanelet::ConstLanelet ll;
   if (
     data.reference_path.points.empty() ||
-    !lanelet::utils::query::getClosestLanelet(data.current_lanelets, getEgoPose(), &ll)) {
+    !nero_geom_fast::getClosestLanelet(data.current_lanelets, getEgoPose(), &ll)) {
     return std::nullopt;
   }
   const auto bound = left ? ll.leftBound2d() : ll.rightBound2d();
@@ -2464,6 +2465,13 @@ std::string StaticObstacleAvoidanceModule::neroBlocker(
   for (const auto & p : body_poses) {
     fps.push_back(autoware_utils::to_footprint(p, vp.base_link2front, vp.base_link2rear, vp.vehicle_width));
   }
+  // NERO_BPP_GEOM_FAST (k): a footprint / object pair whose boxes are apart by more than the margin (+1 um) cannot be
+  // closer than the margin: its distance is not computed (2 = check: computed and compared)
+  const int nero_geom_mode = nero_geom_fast::mode();
+  std::vector<nero_geom_fast::Box> fp_boxes;
+  if (nero_geom_mode != 0) {
+    for (const auto & fp : fps) fp_boxes.push_back(nero_geom_fast::Box::of(fp.outer()));
+  }
   for (const auto & o : planner_data_->dynamic_object->objects) {
     const auto & tw = o.kinematics.initial_twist_with_covariance.twist.linear;
     if (std::hypot(tw.x, tw.y) >= 0.5) continue;  // standing objects only
@@ -2478,7 +2486,7 @@ std::string StaticObstacleAvoidanceModule::neroBlocker(
       const auto & c = o.kinematics.initial_pose_with_covariance.pose.position;
       const lanelet::BasicPoint2d cp{c.x, c.y};
       if (std::any_of(data.current_lanelets.begin(), data.current_lanelets.end(), [&](const auto & ll) {
-            return boost::geometry::within(cp, ll.polygon2d().basicPolygon());
+            return nero_geom_fast::withinLanelet(cp, ll);  // NERO_BPP_GEOM_FAST (k): kept polygons
           })) {
         continue;
       }
@@ -2489,7 +2497,13 @@ std::string StaticObstacleAvoidanceModule::neroBlocker(
                          label == ObjectClassification::MOTORCYCLE;
     const double margin = vehicle ? 0.1 : 0.3;  // obstacle_stop's lateral margins on the car
     const auto poly = autoware_utils::to_polygon2d(o.kinematics.initial_pose_with_covariance.pose, o.shape);
-    for (const auto & fp : fps) {
+    const auto poly_box = nero_geom_mode != 0 ? nero_geom_fast::Box::of(poly.outer()) : nero_geom_fast::Box{};
+    for (size_t fi = 0; fi < fps.size(); ++fi) {
+      const auto & fp = fps[fi];
+      if (nero_geom_mode != 0 && fp_boxes[fi].apart(poly_box, margin + 1.0e-6)) {
+        if (nero_geom_mode == 1) continue;
+        if (boost::geometry::distance(fp, poly) < margin) nero_geom_fast::stats().wi_mismatch++;  // check mode
+      }
       if (boost::geometry::distance(fp, poly) < margin) {
         char buf[48];
         std::snprintf(

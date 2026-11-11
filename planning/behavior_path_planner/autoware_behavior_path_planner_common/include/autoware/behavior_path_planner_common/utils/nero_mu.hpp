@@ -33,6 +33,7 @@
 
 #include <Eigen/Core>
 #include <Eigen/Geometry>
+#include "autoware/behavior_path_planner_common/utils/nero_geom_fast.hpp"  // NERO_BPP_GEOM_FAST
 #include <autoware/motion_utils/trajectory/trajectory.hpp>
 #include <autoware_utils/geometry/geometry.hpp>
 #include <autoware/route_handler/route_handler.hpp>
@@ -722,7 +723,9 @@ inline bool getClosestLaneletWithinRoute(
       return it->second;
     }
     lanelet::ConstLanelet ll;
-    const bool found = rh.getClosestLaneletWithinRoute(pose, &ll);
+    // NERO_BPP_GEOM_FAST (l): the route lanelets near the pose on kept polygons (unset: the route handler's own call)
+    const bool found =
+      autoware::behavior_path_planner::nero_geom_fast::getClosestLaneletWithinRoute(rh, pose, &ll);
     memo.map.emplace(key, std::make_pair(found, ll));
     return {found, ll};
   };
