@@ -1,4 +1,9 @@
 <?xml version="1.0" encoding="UTF-8"?>
+<!-- [nero trkup 2026-11-10] The launch interface of our 0.44.2 tracker kept on upstream-main's node, so that
+     tier4_perception_launch (tracking.launch.xml) stays untouched: selected_input_channels / output / the three param paths.
+     Upstream's own file is multi_object_tracker.upstream.launch.xml (12 channel args + the Agnocast environment include;
+     Agnocast is not enabled in our build: plain rclcpp, no LD_PRELOAD).
+     Channels the car uses (tracking.launch.xml: ['detected_objects', 'detection_by_tracker']); a name that is not selected = none. -->
 <launch>
   <arg name="selected_input_channels" default="['detected_objects']"/>
   <arg name="output" default="objects"/>
@@ -6,11 +11,35 @@
   <arg name="data_association_matrix_path" default="$(find-pkg-share autoware_multi_object_tracker)/config/data_association_matrix.param.yaml"/>
   <arg name="input_channels_path" default="$(find-pkg-share autoware_multi_object_tracker)/config/input_channels.param.yaml"/>
 
+  <!-- [nero trkup] NERO_MOT_PARAMS_DIR (unset = the three paths as passed): a directory holding the three yaml in upstream's format. The
+       0.44.2 autoware_launch passes old-format files the upstream node cannot read; logsim / a staged install points here instead. -->
+  <let name="nero_pdir" value="$(env NERO_MOT_PARAMS_DIR '')"/>
+  <let name="p_tracker" value="$(eval &quot;'$(var nero_pdir)/multi_object_tracker_node.param.yaml' if '$(var nero_pdir)' != '' else '$(var tracker_setting_path)'&quot;)"/>
+  <let name="p_assoc" value="$(eval &quot;'$(var nero_pdir)/data_association_matrix.param.yaml' if '$(var nero_pdir)' != '' else '$(var data_association_matrix_path)'&quot;)"/>
+  <let name="p_channels" value="$(eval &quot;'$(var nero_pdir)/input_channels.param.yaml' if '$(var nero_pdir)' != '' else '$(var input_channels_path)'&quot;)"/>
+  <let name="ch01" value="$(eval &quot;'detected_objects' if 'detected_objects' in \&quot;$(var selected_input_channels)\&quot; else 'none'&quot;)"/>
+  <let name="ch02" value="$(eval &quot;'detection_by_tracker' if 'detection_by_tracker' in \&quot;$(var selected_input_channels)\&quot; else 'none'&quot;)"/>
+
   <node pkg="autoware_multi_object_tracker" exec="multi_object_tracker_node" name="multi_object_tracker" output="both">
-    <param name="selected_input_channels" value="$(var selected_input_channels)"/>
-    <remap from="output" to="$(var output)"/>
-    <param from="$(var tracker_setting_path)"/>
-    <param from="$(var data_association_matrix_path)"/>
-    <param from="$(var input_channels_path)"/>
+    <remap from="~/input/detection01/objects" to="/perception/object_recognition/detection/objects"/>
+    <remap from="~/input/detection02/objects" to="/perception/object_recognition/detection/detection_by_tracker/objects"/>
+    <remap from="~/input/odometry" to="/localization/kinematic_state"/>
+    <remap from="~/output/objects" to="$(var output)"/>
+    <param name="input/detection01/channel" value="$(var ch01)"/>
+    <param name="input/detection02/channel" value="$(var ch02)"/>
+    <param name="input/detection03/channel" value="none"/>
+    <param name="input/detection04/channel" value="none"/>
+    <param name="input/detection05/channel" value="none"/>
+    <param name="input/detection06/channel" value="none"/>
+    <param name="input/detection07/channel" value="none"/>
+    <param name="input/detection08/channel" value="none"/>
+    <param name="input/detection09/channel" value="none"/>
+    <param name="input/detection10/channel" value="none"/>
+    <param name="input/detection11/channel" value="none"/>
+    <param name="input/detection12/channel" value="none"/>
+    <param name="publish_merged_objects" value="false"/>
+    <param from="$(var p_tracker)"/>
+    <param from="$(var p_assoc)"/>
+    <param from="$(var p_channels)"/>
   </node>
 </launch>

@@ -6,10 +6,11 @@
     "input_channel": {
       "type": "object",
       "properties": {
-        "topic": {
+        "associator_type": {
           "type": "string",
-          "description": "The ROS topic name for the input channel.",
-          "default": "/perception/object_recognition/detection/objects"
+          "enum": ["bev", "polar"],
+          "description": "Association algorithm for this channel. 'bev': bird's-eye-view area scoring with GNN assignment. 'polar': polar-coordinate (range-bearing) scoring.",
+          "default": "bev"
         },
         "flags": {
           "type": "object",
@@ -57,7 +58,7 @@
           }
         }
       },
-      "required": ["topic"]
+      "required": []
     }
   },
   "properties": {
@@ -73,14 +74,7 @@
                 "detected_objects": {
                   "$ref": "#/definitions/input_channel",
                   "default": {
-                    "topic": "/perception/object_recognition/detection/objects",
-                    "flags": {
-                      "can_spawn_new_tracker": true,
-                      "can_trust_existence_probability": true,
-                      "can_trust_extension": true,
-                      "can_trust_classification": true,
-                      "can_trust_orientation": true
-                    },
+                    "associator_type": "bev",
                     "optional": {
                       "name": "detected_objects",
                       "short_name": "all"
@@ -90,7 +84,7 @@
                 "lidar_clustering": {
                   "$ref": "#/definitions/input_channel",
                   "default": {
-                    "topic": "/perception/object_recognition/detection/clustering/objects",
+                    "associator_type": "polar",
                     "flags": {
                       "can_spawn_new_tracker": true,
                       "can_trust_existence_probability": false,
@@ -107,7 +101,7 @@
                 "lidar_centerpoint": {
                   "$ref": "#/definitions/input_channel",
                   "default": {
-                    "topic": "/perception/object_recognition/detection/centerpoint/objects",
+                    "associator_type": "bev",
                     "flags": {
                       "can_spawn_new_tracker": true,
                       "can_trust_existence_probability": true,
@@ -121,10 +115,10 @@
                     }
                   }
                 },
-                "lidar_centerpoint_validated": {
+                "lidar_centerpoint_short_range": {
                   "$ref": "#/definitions/input_channel",
                   "default": {
-                    "topic": "/perception/object_recognition/detection/centerpoint/validation/objects",
+                    "associator_type": "bev",
                     "flags": {
                       "can_spawn_new_tracker": true,
                       "can_trust_existence_probability": true,
@@ -133,32 +127,15 @@
                       "can_trust_orientation": true
                     },
                     "optional": {
-                      "name": "centerpoint",
-                      "short_name": "Lcp"
+                      "name": "centerpoint_short_range",
+                      "short_name": "LcpS"
                     }
                   }
                 },
                 "lidar_apollo": {
                   "$ref": "#/definitions/input_channel",
                   "default": {
-                    "topic": "/perception/object_recognition/detection/apollo/objects",
-                    "flags": {
-                      "can_spawn_new_tracker": true,
-                      "can_trust_existence_probability": true,
-                      "can_trust_extension": true,
-                      "can_trust_classification": true,
-                      "can_trust_orientation": true
-                    },
-                    "optional": {
-                      "name": "apollo",
-                      "short_name": "Lap"
-                    }
-                  }
-                },
-                "lidar_apollo_validated": {
-                  "$ref": "#/definitions/input_channel",
-                  "default": {
-                    "topic": "/perception/object_recognition/detection/apollo/validation/objects",
+                    "associator_type": "bev",
                     "flags": {
                       "can_spawn_new_tracker": true,
                       "can_trust_existence_probability": true,
@@ -175,7 +152,7 @@
                 "lidar_pointpainting": {
                   "$ref": "#/definitions/input_channel",
                   "default": {
-                    "topic": "/perception/object_recognition/detection/pointpainting/objects",
+                    "associator_type": "bev",
                     "flags": {
                       "can_spawn_new_tracker": true,
                       "can_trust_existence_probability": true,
@@ -189,10 +166,10 @@
                     }
                   }
                 },
-                "lidar_pointpainting_validated": {
+                "camera_streampetr": {
                   "$ref": "#/definitions/input_channel",
                   "default": {
-                    "topic": "/perception/object_recognition/detection/pointpainting/validation/objects",
+                    "associator_type": "bev",
                     "flags": {
                       "can_spawn_new_tracker": true,
                       "can_trust_existence_probability": true,
@@ -201,15 +178,15 @@
                       "can_trust_orientation": true
                     },
                     "optional": {
-                      "name": "pointpainting",
-                      "short_name": "Lpp"
+                      "name": "camera_streampetr",
+                      "short_name": "Csp"
                     }
                   }
                 },
                 "camera_lidar_fusion": {
                   "$ref": "#/definitions/input_channel",
                   "default": {
-                    "topic": "/perception/object_recognition/detection/clustering/camera_lidar_fusion/objects",
+                    "associator_type": "polar",
                     "flags": {
                       "can_spawn_new_tracker": true,
                       "can_trust_existence_probability": false,
@@ -223,10 +200,27 @@
                     }
                   }
                 },
+                "camera_lidar_fusion_irregular": {
+                  "$ref": "#/definitions/input_channel",
+                  "default": {
+                    "associator_type": "polar",
+                    "flags": {
+                      "can_spawn_new_tracker": true,
+                      "can_trust_existence_probability": false,
+                      "can_trust_extension": false,
+                      "can_trust_classification": true,
+                      "can_trust_orientation": false
+                    },
+                    "optional": {
+                      "name": "camera_lidar_fusion_irregular",
+                      "short_name": "Irreg"
+                    }
+                  }
+                },
                 "detection_by_tracker": {
                   "$ref": "#/definitions/input_channel",
                   "default": {
-                    "topic": "/perception/object_recognition/detection/detection_by_tracker/objects",
+                    "associator_type": "bev",
                     "flags": {
                       "can_spawn_new_tracker": false,
                       "can_trust_existence_probability": false,
@@ -243,7 +237,7 @@
                 "radar": {
                   "$ref": "#/definitions/input_channel",
                   "default": {
-                    "topic": "/sensing/radar/detected_objects",
+                    "associator_type": "bev",
                     "flags": {
                       "can_spawn_new_tracker": true,
                       "can_trust_existence_probability": true,
@@ -253,14 +247,14 @@
                     },
                     "optional": {
                       "name": "radar",
-                      "short_name": "R"
+                      "short_name": "Rad"
                     }
                   }
                 },
-                "radar_far": {
+                "camera_vru": {
                   "$ref": "#/definitions/input_channel",
                   "default": {
-                    "topic": "/perception/object_recognition/detection/radar/far_objects",
+                    "associator_type": "polar",
                     "flags": {
                       "can_spawn_new_tracker": true,
                       "can_trust_existence_probability": true,
@@ -269,8 +263,8 @@
                       "can_trust_orientation": false
                     },
                     "optional": {
-                      "name": "radar_far",
-                      "short_name": "Rf"
+                      "name": "camera_vru",
+                      "short_name": "CamVRU"
                     }
                   }
                 }
@@ -279,15 +273,13 @@
                 "detected_objects",
                 "lidar_clustering",
                 "lidar_centerpoint",
-                "lidar_centerpoint_validated",
+                "lidar_centerpoint_short_range",
                 "lidar_apollo",
-                "lidar_apollo_validated",
                 "lidar_pointpainting",
-                "lidar_pointpainting_validated",
                 "camera_lidar_fusion",
+                "camera_lidar_fusion_irregular",
                 "detection_by_tracker",
-                "radar",
-                "radar_far"
+                "radar"
               ]
             }
           },

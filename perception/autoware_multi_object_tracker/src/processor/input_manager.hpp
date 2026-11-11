@@ -15,43 +15,48 @@
 #ifndef PROCESSOR__INPUT_MANAGER_HPP_
 #define PROCESSOR__INPUT_MANAGER_HPP_
 
-#include "autoware/multi_object_tracker/object_model/types.hpp"
 #include "autoware/multi_object_tracker/odometry.hpp"
+#include "autoware/multi_object_tracker/types.hpp"
 #include "rclcpp/rclcpp.hpp"
+
+#include <autoware/agnocast_wrapper/node.hpp>
 
 #include <autoware_perception_msgs/msg/detected_objects.hpp>
 
 #include <deque>
 #include <functional>
 #include <memory>
-#include <string>
-#include <utility>
+#include <optional>
 #include <vector>
 
 namespace autoware::multi_object_tracker
 {
-using ObjectsList = std::vector<types::DynamicObjectList>;
 
 class InputStream
 {
 public:
   InputStream(
-    rclcpp::Node & node, const types::InputChannel & input_channel,
-    std::shared_ptr<Odometry> odometry);
+    const types::InputChannel & input_channel, std::shared_ptr<Odometry> odometry,
+    rclcpp::Logger logger, rclcpp::Clock::SharedPtr clock);
 
-  void setTriggerFunction(std::function<void(const uint &)> func_trigger)
+  void setTriggerFunction(std::function<void(const size_t)> func_trigger)
   {
     func_trigger_ = func_trigger;
   }
 
-  void onMessage(const autoware_perception_msgs::msg::DetectedObjects::ConstSharedPtr msg);
+  std::optional<types::DynamicObjectList> processMessage(
+    AUTOWARE_MESSAGE_CONST_SHARED_PTR(autoware_perception_msgs::msg::DetectedObjects) msg);
+  void push(const types::DynamicObjectList & objects, const types::AssociationResult & association);
+  void push(
+    const types::DynamicObjectList & objects, const types::AssociationResult & association,
+    const rclcpp::Time & now);
   void updateTimingStatus(const rclcpp::Time & now, const rclcpp::Time & objects_time);
 
   bool isTimeInitialized() const { return initial_count_ > 0; }
   uint getIndex() const { return channel_.index; }
   void getObjectsOlderThan(
     const rclcpp::Time & object_latest_time, const rclcpp::Time & object_earliest_time,
-    ObjectsList & objects_list);
+    types::ObjectsWithAssociationList & objects_with_associations);
   bool isSpawnEnabled() const { return channel_.is_spawn_enabled; }
 
   void getTimeStatistics(
@@ -64,16 +69,18 @@ public:
     interval_var = interval_var_;
   }
   rclcpp::Time getLatestMeasurementTime() const { return latest_measurement_time_; }
+  rclcpp::Time getLatestMessageTime() const { return latest_message_time_; }
 
 private:
-  rclcpp::Node & node_;
   const types::InputChannel channel_;
   std::shared_ptr<Odometry> odometry_;
+  rclcpp::Logger logger_;
+  rclcpp::Clock::SharedPtr clock_;
 
   size_t que_size_{30};
-  std::deque<types::DynamicObjectList> objects_que_;
+  std::deque<types::ObjectsWithAssociation> objects_que_;
 
-  std::function<void(const uint &)> func_trigger_;
+  std::function<void(const size_t)> func_trigger_;
 
   int initial_count_{0};
   double latency_mean_{};
@@ -82,31 +89,39 @@ private:
   double interval_var_{};
 
   rclcpp::Time latest_measurement_time_;
+  // [nero trkup] NERO_MOT_DEDUP_EXPORT: newest stamp this stream has already exported (QUEUE MOTDUP)
+  std::optional<rclcpp::Time> nero_last_exported_time_;
   rclcpp::Time latest_message_time_;
 };
 
 class InputManager
 {
 public:
-  InputManager(rclcpp::Node & node, std::shared_ptr<Odometry> odometry);
+  InputManager(
+    std::shared_ptr<Odometry> odometry, rclcpp::Logger logger, rclcpp::Clock::SharedPtr clock);
   void init(const std::vector<types::InputChannel> & input_channels);
 
-  void setTriggerFunction(std::function<void()> func_trigger) { func_trigger_ = func_trigger; }
-  void onTrigger(const uint & index) const;
+  void setTriggerFunction(std::function<void(size_t)> func_trigger);
+  size_t getTargetChannelIdx() const { return target_stream_idx_; }
+  double getTargetStreamLatency() const { return target_stream_latency_; }
+  std::optional<types::DynamicObjectList> processMessage(
+    const size_t channel_index,
+    AUTOWARE_MESSAGE_CONST_SHARED_PTR(autoware_perception_msgs::msg::DetectedObjects) msg);
+  void push(
+    const size_t channel_index, const types::DynamicObjectList & objects,
+    const types::AssociationResult & association);
+  void push(
+    const size_t channel_index, const types::DynamicObjectList & objects,
+    const types::AssociationResult & association, const rclcpp::Time & now);
+  void optimizeChannelTimings(const rclcpp::Time & now);
 
-  bool getObjects(const rclcpp::Time & now, ObjectsList & objects_list);
-
-  bool isChannelSpawnEnabled(const uint & index) const
-  {
-    return input_streams_[index]->isSpawnEnabled();
-  }
+  bool getObjects(
+    const rclcpp::Time & now, types::ObjectsWithAssociationList & objects_with_associations);
 
 private:
-  rclcpp::Node & node_;
   std::shared_ptr<Odometry> odometry_;
-
-  std::vector<rclcpp::Subscription<autoware_perception_msgs::msg::DetectedObjects>::SharedPtr>
-    sub_objects_array_{};
+  rclcpp::Logger logger_;
+  rclcpp::Clock::SharedPtr clock_;
 
   bool is_initialized_{false};
   rclcpp::Time latest_exported_object_time_;
@@ -114,18 +129,19 @@ private:
   size_t input_size_{};
   std::vector<std::shared_ptr<InputStream>> input_streams_;
 
-  std::function<void()> func_trigger_;
+  std::function<void(size_t)> func_trigger_;
   uint target_stream_idx_{0};
   double target_stream_latency_{0.2};        // [s]
   double target_stream_latency_std_{0.04};   // [s]
   double target_stream_interval_{0.1};       // [s]
   double target_stream_interval_std_{0.02};  // [s]
+  std::optional<rclcpp::Time> last_optimization_time_;
 
 private:
   void getObjectTimeInterval(
     const rclcpp::Time & now, rclcpp::Time & object_latest_time,
     rclcpp::Time & object_earliest_time) const;
-  void optimizeTimings();
+  bool isStreamFresh(const InputStream & input_stream, const rclcpp::Time & now) const;
 };
 
 }  // namespace autoware::multi_object_tracker

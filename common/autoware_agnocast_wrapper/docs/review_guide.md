@@ -1,0 +1,894 @@
+This document serves as a guide for reviewing PRs that apply [autoware_agnocast_wrapper](https://github.com/autowarefoundation/autoware_core/tree/main/common/autoware_agnocast_wrapper).
+
+**Part 1** provides a step-by-step walkthrough of what to check during review.
+
+**Part 2** compiles background knowledge referenced by each review step — refer to it as needed.
+
+&nbsp;
+
+## Related Links
+
+| Resource                                            | URL                                                                                                                                                              |
+| --------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| autoware_agnocast_wrapper (source code)             | [autowarefoundation/autoware_core/.../autoware_agnocast_wrapper](https://github.com/autowarefoundation/autoware_core/tree/main/common/autoware_agnocast_wrapper) |
+| Agnocast repository                                 | [autowarefoundation/agnocast](https://github.com/autowarefoundation/agnocast)                                                                                    |
+| Agnocast documentation                              | [Agnocast Documentation](https://autowarefoundation.github.io/agnocast_doc/main/)                                                                                |
+| Autoware Discussion: Agnocast introduction proposal | [Discussion #5835 - Introduce True Zero-Copy Publish/Subscribe IPC to Autoware](https://github.com/orgs/autowarefoundation/discussions/5835)                     |
+| Agnocast ROS 2 rosdistro support                    | [Issue #5968 - Use ROS 2 packages in Agnocast released via rosdistro](https://github.com/autowarefoundation/autoware/issues/5968)                                |
+
+&nbsp;
+
+## Table of Contents
+
+### Part 1: Review Guide
+
+- Prerequisites for Review
+- Review Procedure Guide
+  - Common Prerequisites
+  - Method 1: Macro + Free Function API Review Procedure
+  - Method 2: `agnocast_wrapper::Node` Inheritance Review Procedure
+
+### Part 2: Background Knowledge Reference
+
+- What is autoware_agnocast_wrapper?
+- Behavior Changes via ENABLE_AGNOCAST Environment Variable
+- Key Macros
+  - Polling Subscribers (`polling::` free functions)
+- Two Integration Methods: Free Functions vs `agnocast_wrapper::Node`
+- component_container and `autoware_agnocast_wrapper_register_node`
+- Executor Types and Selection
+- component_container Selection (`agnocast_env.launch.xml`)
+- Build and Execution Procedures
+- References
+
+&nbsp;
+
+---
+
+&nbsp;
+
+# Part 1: Review Guide
+
+&nbsp;
+
+## 1. Prerequisites for Review
+
+&nbsp;
+
+### Overview of autoware_agnocast_wrapper
+
+[autoware_agnocast_wrapper](https://github.com/autowarefoundation/autoware_core/tree/main/common/autoware_agnocast_wrapper) is a wrapper package for applying the zero-copy middleware [Agnocast](https://autowarefoundation.github.io/agnocast_doc/main/) to Autoware nodes.
+
+Build-time and runtime behavior is controlled by the `ENABLE_AGNOCAST` environment variable:
+
+- **Built with `ENABLE_AGNOCAST=0` (or unset)**: Standard ROS 2 build. Macros expand directly to rclcpp APIs, and no Agnocast-related code is included
+
+- **Built with `ENABLE_AGNOCAST=1`**: Agnocast-enabled build. At runtime, communication switches between Agnocast and ROS 2 depending on the `ENABLE_AGNOCAST` value
+
+In other words, users who build with `ENABLE_AGNOCAST=0` are not affected at all, and backward compatibility is maintained (see Part 2 Section 2 for details).
+
+&nbsp;
+
+### Agnocast Bridge: Why Other Nodes Are Not Affected
+
+Another important prerequisite when reviewing Agnocast-related PRs is the existence of the **Agnocast Bridge**.
+
+The [Agnocast Bridge](https://autowarefoundation.github.io/agnocast_doc/main/migration-guide/bridge/) automatically forwards messages bidirectionally between Agnocast nodes and standard ROS 2 nodes:
+
+- **R2A (ROS 2 → Agnocast)**: Forwards messages from ROS 2 publishers to Agnocast subscribers
+
+- **A2R (Agnocast → ROS 2)**: Forwards messages from Agnocast publishers to ROS 2 subscribers
+
+Message circulation (echo-back) is automatically prevented by the Bridge's internal logic.
+
+&nbsp;
+
+**This means:**
+
+- Even if Agnocast is applied to a node, communication with neighboring nodes that still use standard ROS 2 will not be disrupted, as the Bridge automatically mediates
+
+- **During review, there is no need to check whether connected nodes have been adapted for Agnocast**
+
+- Each node can be independently adapted for Agnocast
+
+&nbsp;
+
+---
+
+&nbsp;
+
+## 2. Review Procedure Guide
+
+This section provides a step-by-step review procedure for PRs that apply autoware_agnocast_wrapper.
+
+The checklist differs depending on the integration method (Method 1: Macro + Free Function API / Method 2: `agnocast_wrapper::Node` Inheritance), so each is documented separately.
+
+Background knowledge referenced by each step is compiled in Part 2: Background Knowledge Reference. When you need to check details such as macro expansion results or executor types during review, follow the links annotated on each step to the relevant Part 2 section.
+
+&nbsp;
+
+### Common Prerequisites
+
+#### Step 0: Identify the Integration Method (see Part 2 Section 4)
+
+autoware_agnocast_wrapper has two integration patterns: applying Agnocast to specific topics while keeping the existing node as-is (Method 1), or replacing the node's base class entirely (Method 2).
+
+You can distinguish them by checking the node's base class.
+
+- Base class remains **`rclcpp::Node`** → **Method 1: Macro + Free Function API**
+
+- Base class changed to **`autoware::agnocast_wrapper::Node`** → **Method 2: agnocast_wrapper::Node Inheritance**
+
+```cpp
+// Method 1
+class MyNode : public rclcpp::Node
+
+// Method 2
+class MyNode : public autoware::agnocast_wrapper::Node
+```
+
+Once identified, proceed to the corresponding review procedure below.
+
+&nbsp;
+
+---
+
+&nbsp;
+
+### Method 1: Macro + Free Function API Review Procedure
+
+&nbsp;
+
+#### Step 1: Code Changes (see Part 2 Section 3)
+
+- [ ] `#include <autoware/agnocast_wrapper/autoware_agnocast_wrapper.hpp>` has been added
+
+- [ ] **Base class remains `rclcpp::Node`**
+
+- [ ] Member variable types: `rclcpp::Publisher<M>::SharedPtr` → `AUTOWARE_PUBLISHER_PTR(M)` etc.
+
+- [ ] Creation: `this->create_publisher` → `AUTOWARE_CREATE_PUBLISHER2` / `AUTOWARE_CREATE_PUBLISHER3` etc. (a type-erased topic uses `AUTOWARE_CREATE_GENERIC_PUBLISHER3/4` / `AUTOWARE_CREATE_GENERIC_SUBSCRIPTION` instead — see Part 2 Section 3)
+
+- [ ] Callback arguments: `const SharedPtr` / `UniquePtr` → `AUTOWARE_MESSAGE_CONST_SHARED_PTR` / `AUTOWARE_MESSAGE_UNIQUE_PTR` (callbacks taking `const MessageT &` can keep their signature unchanged, and so can `Message::ConstSharedPtr`)
+
+- [ ] Message allocation (if publisher exists): `std::make_unique<M>()` → `ALLOCATE_OUTPUT_MESSAGE_UNIQUE(pub_)`
+
+- [ ] Options type: `rclcpp::SubscriptionOptions` → `AUTOWARE_SUBSCRIPTION_OPTIONS` (and `rclcpp::PublisherOptions` → `AUTOWARE_PUBLISHER_OPTIONS`)
+
+&nbsp;
+
+#### Step 2: Verification (see Part 2 Section 2, Part 2 Section 8)
+
+Items 1 and 2 are **recommended**, item 3 is **if possible** (requires Agnocast environment).
+
+&nbsp;
+
+**1. Build and run with `ENABLE_AGNOCAST=0` (or unset) (recommended)**
+
+The most important test: verify that the build does not break in environments without Agnocast.
+
+```bash
+unset ENABLE_AGNOCAST  # or export ENABLE_AGNOCAST=0
+colcon build --symlink-install --packages-select <target_package>
+# Run and verify that standard ROS 2 behavior works correctly
+```
+
+- [ ] Build succeeds
+
+- [ ] `ros2 topic echo` etc. confirms that topic pub/sub works as expected
+
+&nbsp;
+
+**2. Build with `ENABLE_AGNOCAST=1`, run with `ENABLE_AGNOCAST=0` (recommended)**
+
+Verify that the Agnocast-enabled build works correctly in ROS 2 fallback mode.
+
+> **Note:** When switching the `ENABLE_AGNOCAST` value and rebuilding, delete the `build/` and `install/` directories of both the target package and `autoware_agnocast_wrapper` before building. Since `ENABLE_AGNOCAST` is an environment variable (not a CMake variable), the previous setting may remain in the build cache, causing inconsistencies.
+
+```bash
+export ENABLE_AGNOCAST=1
+
+rm -rf build/autoware_agnocast_wrapper install/autoware_agnocast_wrapper
+rm -rf build/<target_package> install/<target_package>
+
+# For Agnocast/ROS2 bridge setup
+sudo sysctl -w fs.mqueue.msg_max=256
+sudo sysctl -w fs.mqueue.queues_max=1024
+
+colcon build --symlink-install --packages-select autoware_agnocast_wrapper <target_package>
+
+export ENABLE_AGNOCAST=0  # Fall back to ROS 2 at runtime
+# Run and verify behavior
+```
+
+- [ ] Build succeeds
+
+- [ ] `ros2 topic echo` etc. confirms that topic pub/sub works as expected
+
+&nbsp;
+
+**3. Build and run with `ENABLE_AGNOCAST=1` (if possible)**
+
+Verify that Agnocast communication works correctly. Requires Agnocast environment setup (see below).
+
+```bash
+export ENABLE_AGNOCAST=1
+
+# You can skip this if you have already done these above.
+sudo sysctl -w fs.mqueue.msg_max=256
+sudo sysctl -w fs.mqueue.queues_max=1024
+
+colcon build --symlink-install --packages-select <target_package>
+# Run with ENABLE_AGNOCAST=1
+```
+
+- [ ] `ros2 topic list_agnocast` shows `(Agnocast enabled)` for the target topic
+
+- [ ] `ros2 topic info_agnocast /target_topic` shows expected Agnocast Publisher/Subscriber counts
+
+- [ ] Subscriber-side callbacks are working correctly
+
+&nbsp;
+
+> **Regarding `ros2 topic echo` / `ros2 topic hz`:**
+>
+> These commands are generally usable for Agnocast topics thanks to the Bridge feature.
+>
+> However, when all subscribers for a topic have been converted to Agnocast, the Bridge may not yet have been created when `ros2 topic echo` connects, causing it to time out before being recognized as a ROS 2 subscriber.
+>
+> In such cases, use the `ros2 topic list_agnocast` / `ros2 topic info_agnocast` commands, or directly verify subscriber-side callback behavior.
+>
+> Native commands such as `ros2 topic echo_agnocast` are planned for future release.
+
+&nbsp;
+
+#### Agnocast Environment Prerequisites
+
+To perform verification item 3, the following Agnocast environment is required:
+
+&nbsp;
+
+**Agnocast kernel module check:**
+
+```bash
+$ lsmod | grep agnocast
+agnocast              835584  0
+```
+
+If not shown:
+
+```bash
+sudo add-apt-repository ppa:t4-system-software/agnocast
+sudo apt update
+sudo apt install agnocast-kmod-v2.3  # Match the version in autoware.repos
+sudo modprobe agnocast
+```
+
+&nbsp;
+
+**Agnocast heaphook check:**
+
+```bash
+ls /opt/ros/humble/lib/libagnocast_heaphook.so
+```
+
+If not found:
+
+```bash
+sudo apt install agnocast-heaphook-v2.3  # Match the version in autoware.repos
+```
+
+&nbsp;
+
+> The version can be found in the `middleware/external/agnocast` section of [`autoware.repos`](https://github.com/autowarefoundation/autoware/blob/main/repositories/autoware.repos). For instructions on building and installing from source, see the [Agnocast Environment Setup guide](https://autowarefoundation.github.io/agnocast_doc/main/environment-setup/).
+
+&nbsp;
+
+---
+
+&nbsp;
+
+### Method 2: agnocast_wrapper::Node Inheritance Review Procedure
+
+Node-wide migration to `agnocast_wrapper::Node` (see Part 2 Section 4 Method 2).
+
+&nbsp;
+
+#### Step 1: Code Changes (see Part 2 Section 3, Part 2 Section 4 Method 2)
+
+- [ ] `#include <autoware/agnocast_wrapper/node.hpp>` has been added
+
+- [ ] Base class has been changed to `autoware::agnocast_wrapper::Node`
+
+- [ ] Member variable types: `AUTOWARE_*_PTR` macros (e.g. `AUTOWARE_PUBLISHER_PTR(M)`)
+
+- [ ] Creation: Use `agnocast_wrapper::Node` member functions `create_publisher` / `create_subscription` (and, for a type-erased topic, `create_generic_publisher` / `create_generic_subscription`) directly (**`AUTOWARE_CREATE_*` macros are not needed**)
+
+- [ ] Callback arguments: `const SharedPtr` / `UniquePtr` → `AUTOWARE_MESSAGE_CONST_SHARED_PTR` / `AUTOWARE_MESSAGE_UNIQUE_PTR` (callbacks taking `const MessageT &` can keep their signature unchanged, and so can `Message::ConstSharedPtr`)
+
+- [ ] Message allocation (if publisher exists): `std::make_unique<M>()` → `ALLOCATE_OUTPUT_MESSAGE_UNIQUE(pub_)`
+
+- [ ] Polling subscribers use the `polling::` free-function API (see Part 2 Section 3.1)
+
+- [ ] If the node also uses message_filters, timers, tf2, diagnostic_updater, or an async parameters client, they have been migrated to the corresponding `autoware::agnocast_wrapper::*` wrappers (see the [README](../README.md) for usage and current limitations)
+
+- [ ] If the original CMakeLists.txt used `rclcpp_components_register_node()`, it has been replaced with `autoware_agnocast_wrapper_register_node()` (see Part 2 Section 5)
+
+&nbsp;
+
+#### Step 2: Verification (see Part 2 Section 2, Part 2 Section 8)
+
+- [ ] **Build and run with `ENABLE_AGNOCAST=0` (recommended)**: Build succeeds and standard ROS 2 behavior works
+
+- [ ] **Build with `ENABLE_AGNOCAST=1`, run with `ENABLE_AGNOCAST=0` (recommended)**: Build succeeds and ROS 2 fallback works
+
+- [ ] **Build and run with `ENABLE_AGNOCAST=1` (if possible)**: Agnocast communication works via `ros2 topic list_agnocast` / `ros2 topic info_agnocast` (environment setup required)
+
+&nbsp;
+
+---
+
+&nbsp;
+
+# Part 2: Background Knowledge Reference
+
+> The following sections compile the background knowledge referenced by the review guide steps above.
+
+&nbsp;
+
+---
+
+&nbsp;
+
+## 1. What is autoware_agnocast_wrapper?
+
+[autoware_agnocast_wrapper](https://github.com/autowarefoundation/autoware_core/tree/main/common/autoware_agnocast_wrapper) is a package for integrating [Agnocast](https://autowarefoundation.github.io/agnocast_doc/main/), a zero-copy middleware, into each Autoware topic with minimal impact.
+
+Agnocast is an rclcpp-compatible zero-copy IPC middleware that enables true zero-copy Publish/Subscribe communication for all ROS 2 message types, including variable-length message types already generated by rosidl (see: [Autoware Discussion #5835](https://github.com/orgs/autowarefoundation/discussions/5835)).
+
+**Key features:**
+
+- Agnocast can be enabled/disabled at both build time and runtime
+
+- Can be applied to existing `rclcpp::Node`-based code with minimal changes
+
+- Maintains backward compatibility for users unfamiliar with Agnocast
+
+&nbsp;
+
+## 2. Behavior Changes via ENABLE_AGNOCAST Environment Variable
+
+autoware_agnocast_wrapper behaves differently depending on the `ENABLE_AGNOCAST` environment variable.
+
+&nbsp;
+
+### Build Time
+
+| ENABLE_AGNOCAST | Behavior                                                                                                                                     |
+| --------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| Unset or `0`    | Standard ROS 2 build. `USE_AGNOCAST_ENABLED` is not defined. Macros expand directly to rclcpp APIs.                                          |
+| `1`             | Agnocast-enabled build. `USE_AGNOCAST_ENABLED` is defined. Macros expand to wrapper classes, and runtime-switchable templates are generated. |
+
+&nbsp;
+
+### Runtime (when built with ENABLE_AGNOCAST=1)
+
+| ENABLE_AGNOCAST | Behavior                        |
+| --------------- | ------------------------------- |
+| Unset or `0`    | Communicates via ROS 2 (rclcpp) |
+| `1`             | Communicates via Agnocast       |
+
+&nbsp;
+
+**Notes:**
+
+- If built with `ENABLE_AGNOCAST=0`, setting `ENABLE_AGNOCAST=1` at runtime will NOT enable Agnocast (switching code is not generated at build time)
+
+- After building with `ENABLE_AGNOCAST=1`, you can fall back to ROS 2 by running with `ENABLE_AGNOCAST=0`
+
+&nbsp;
+
+## 3. Key Macros
+
+All macros below are defined in [`macros.hpp`](../include/autoware/agnocast_wrapper/macros.hpp).
+
+&nbsp;
+
+### Message Pointer Types
+
+| Macro                                     | ENABLE_AGNOCAST=1 (Agnocast)      | ENABLE_AGNOCAST=0 (ROS 2)     |
+| ----------------------------------------- | --------------------------------- | ----------------------------- |
+| `AUTOWARE_MESSAGE_UNIQUE_PTR(MsgT)`       | `message_ptr<MsgT, Unique>`       | `std::unique_ptr<MsgT>`       |
+| `AUTOWARE_MESSAGE_SHARED_PTR(MsgT)`       | `message_ptr<MsgT, Shared>`       | `std::shared_ptr<MsgT>`       |
+| `AUTOWARE_MESSAGE_CONST_SHARED_PTR(MsgT)` | `message_ptr<const MsgT, Shared>` | `std::shared_ptr<const MsgT>` |
+
+> `AUTOWARE_MESSAGE_SHARED_PTR` is for publishers (mutable messages), while `AUTOWARE_MESSAGE_CONST_SHARED_PTR` is for subscriptions (read-only messages).
+
+&nbsp;
+
+### Publisher/Subscriber Types
+
+| Macro                               | ENABLE_AGNOCAST=1 (Agnocast)     | ENABLE_AGNOCAST=0 (ROS 2)                |
+| ----------------------------------- | -------------------------------- | ---------------------------------------- |
+| `AUTOWARE_PUBLISHER_PTR(MsgT)`      | `Publisher<MsgT>::SharedPtr`     | `rclcpp::Publisher<MsgT>::SharedPtr`     |
+| `AUTOWARE_SUBSCRIPTION_PTR(MsgT)`   | `Subscription<MsgT>::SharedPtr`  | `rclcpp::Subscription<MsgT>::SharedPtr`  |
+| `AUTOWARE_TIMER_PTR`                | `Timer::SharedPtr`               | `rclcpp::TimerBase::SharedPtr`           |
+| `AUTOWARE_GENERIC_PUBLISHER_PTR`    | `GenericPublisher::SharedPtr`    | `rclcpp::GenericPublisher::SharedPtr`    |
+| `AUTOWARE_GENERIC_SUBSCRIPTION_PTR` | `GenericSubscription::SharedPtr` | `rclcpp::GenericSubscription::SharedPtr` |
+
+&nbsp;
+
+### Client / Service Types
+
+These resolve to the wrapper's **own** types in both builds (the wrapper unifies the Client/Service
+surface), so client and service code needs no per-build spelling:
+
+| Macro                                                | Both builds                              |
+| ---------------------------------------------------- | ---------------------------------------- |
+| `AUTOWARE_CLIENT_PTR(SrvT)`                          | `Client<SrvT>::SharedPtr`                |
+| `AUTOWARE_SERVICE_PTR(SrvT)`                         | `Service<SrvT>::SharedPtr`               |
+| `AUTOWARE_CLIENT_FUTURE(SrvT)`                       | `Client<SrvT>::Future`                   |
+| `AUTOWARE_CLIENT_SHARED_FUTURE(SrvT)`                | `Client<SrvT>::SharedFuture`             |
+| `AUTOWARE_CLIENT_FUTURE_AND_REQUEST_ID(SrvT)`        | `Client<SrvT>::FutureAndRequestId`       |
+| `AUTOWARE_CLIENT_SHARED_FUTURE_AND_REQUEST_ID(SrvT)` | `Client<SrvT>::SharedFutureAndRequestId` |
+| `AUTOWARE_CLIENT_RESPONSE_PTR(SrvT)`                 | `std::shared_ptr<const SrvT::Response>`  |
+
+Request/response pointer types **do** differ per build:
+
+| Macro                                | ENABLE_AGNOCAST=1               | ENABLE_AGNOCAST=0                      |
+| ------------------------------------ | ------------------------------- | -------------------------------------- |
+| `AUTOWARE_SERVER_REQUEST_PTR(SrvT)`  | `message_ptr<const Request, …>` | `std::shared_ptr<const SrvT::Request>` |
+| `AUTOWARE_SERVER_RESPONSE_PTR(SrvT)` | `message_ptr<Response, …>`      | `std::shared_ptr<SrvT::Response>`      |
+| `AUTOWARE_CLIENT_REQUEST_PTR(SrvT)`  | `message_ptr<Request, …>`       | `std::shared_ptr<SrvT::Request>`       |
+
+The client response is a plain `std::shared_ptr<const Response>` in both builds — the agnocast
+backend aliases the received handle, so nothing is copied. Review point: **the response must not
+outlive the client that produced it**, because that client owns the kernel-side reference.
+
+&nbsp;
+
+### Publisher/Subscriber Creation
+
+| Macro                                                                   | ENABLE_AGNOCAST=1 (Agnocast)                           | ENABLE_AGNOCAST=0 (ROS 2)                  |
+| ----------------------------------------------------------------------- | ------------------------------------------------------ | ------------------------------------------ |
+| `AUTOWARE_CREATE_SUBSCRIPTION(msg_type, topic, qos, callback, options)` | `agnocast_wrapper::create_subscription<msg_type>(...)` | `this->create_subscription<msg_type>(...)` |
+| `AUTOWARE_CREATE_PUBLISHER2(msg_type, topic, qos)`                      | `agnocast_wrapper::create_publisher<msg_type>(...)`    | `this->create_publisher<msg_type>(...)`    |
+| `AUTOWARE_CREATE_PUBLISHER3(msg_type, topic, qos, options)`             | `agnocast_wrapper::create_publisher<msg_type>(...)`    | `this->create_publisher<msg_type>(...)`    |
+
+The macros above implicitly use `this` as the node. Each has an `_ON_NODE` variant that takes the node
+explicitly as the first argument after the message type — use these when the publisher/subscriber is
+created outside the node class (helper classes, free functions, member objects that only hold a node
+pointer):
+
+- `AUTOWARE_CREATE_SUBSCRIPTION_ON_NODE(msg_type, node, topic, qos, callback, options)`
+- `AUTOWARE_CREATE_PUBLISHER2_ON_NODE(msg_type, node, topic, qos)` / `AUTOWARE_CREATE_PUBLISHER3_ON_NODE(msg_type, node, topic, qos, options)`
+
+Clients and services follow the same pattern, with the numeric suffix selecting the arity:
+
+- `AUTOWARE_CREATE_CLIENT1/2/3(service_type, service_name[, qos[, group]])` (+ `_ON_NODE` variants)
+- `AUTOWARE_CREATE_SERVICE2/3/4(service_type, service_name, callback[, qos[, group]])` (+ `_ON_NODE` variants)
+
+&nbsp;
+
+### Generic (type-erased) Publisher/Subscriber Creation
+
+There is no `MessageT` to pass as a macro argument here — the topic type is a runtime string
+instead — so these have their own macros rather than reusing `AUTOWARE_CREATE_PUBLISHER*`/
+`AUTOWARE_CREATE_SUBSCRIPTION`:
+
+| Macro                                                                             | ENABLE_AGNOCAST=1 (Agnocast)                         | ENABLE_AGNOCAST=0 (ROS 2)                |
+| --------------------------------------------------------------------------------- | ---------------------------------------------------- | ---------------------------------------- |
+| `AUTOWARE_CREATE_GENERIC_PUBLISHER3(topic, topic_type, qos)`                      | `agnocast_wrapper::create_generic_publisher(...)`    | `this->create_generic_publisher(...)`    |
+| `AUTOWARE_CREATE_GENERIC_PUBLISHER4(topic, topic_type, qos, options)`             | `agnocast_wrapper::create_generic_publisher(...)`    | `this->create_generic_publisher(...)`    |
+| `AUTOWARE_CREATE_GENERIC_SUBSCRIPTION(topic, topic_type, qos, callback, options)` | `agnocast_wrapper::create_generic_subscription(...)` | `this->create_generic_subscription(...)` |
+
+Each has an `_ON_NODE` variant taking the node explicitly as the first argument, same as the typed
+publisher/subscription macros above.
+
+Review points specific to the generic surface:
+
+- [ ] The subscription callback takes exactly `std::shared_ptr<const rclcpp::SerializedMessage>` —
+      there is no `message_ptr` or zero-copy overload, since a type-erased message has no
+      compile-time type to allocate in place.
+- [ ] `options.qos_overriding_options` is left default, on both the publisher and the
+      subscription. A non-empty value throws `std::invalid_argument` at construction: rclcpp's
+      generic publisher/subscription silently ignore it while Agnocast's apply it, so honoring it
+      would behave differently per backend.
+
+&nbsp;
+
+### 3.1 Polling Subscribers (`polling::` free functions)
+
+Polling subscribers are **not** created via a macro or a `Node` member. Use the free function:
+
+```cpp
+#include <autoware/agnocast_wrapper/polling_subscriber.hpp>
+
+namespace polling = autoware::agnocast_wrapper::polling;
+
+polling::PollingSubscriber<nav_msgs::msg::Odometry>::SharedPtr sub_ =
+  polling::create_polling_subscriber<nav_msgs::msg::Odometry>(this, "~/input/odometry", 1);
+
+// take_data() returns a plain std::shared_ptr<const MessageT> in BOTH builds.
+const std::shared_ptr<const nav_msgs::msg::Odometry> msg = sub_->take_data();
+```
+
+Review points:
+
+- [ ] The receiving variable is `std::shared_ptr<const MessageT>`, not a `message_ptr` or `AUTOWARE_MESSAGE_CONST_SHARED_PTR`. With `polling_policy::All` it is a `std::vector` of them.
+- [ ] The **policy tag** is preserved from the original code. `polling_policy::Latest` (the default) re-delivers the cached message every call; `polling_policy::Newest` returns `nullptr` until a new message arrives; `polling_policy::All` returns every pending message, oldest first.
+- [ ] The QoS history depth is 1 for `polling_policy::Latest` and `polling_policy::Newest` — any other depth throws `std::invalid_argument` at construction. `polling_policy::All` accepts any depth except 0 and `KeepAll`.
+- [ ] `take_data()` is called from a single thread, or from callbacks in one mutually exclusive callback group — it is not synchronized, the same as `autoware_utils_rclcpp`.
+
+&nbsp;
+
+### Message Allocation
+
+| Macro                                       | ENABLE_AGNOCAST=1 (Agnocast)                                               | ENABLE_AGNOCAST=0 (ROS 2)            |
+| ------------------------------------------- | -------------------------------------------------------------------------- | ------------------------------------ |
+| `ALLOCATE_OUTPUT_MESSAGE_UNIQUE(publisher)` | `publisher->allocate_output_message_unique()` (allocates in shared memory) | `std::make_unique<ROSMessageType>()` |
+| `ALLOCATE_OUTPUT_MESSAGE_SHARED(publisher)` | `publisher->allocate_output_message_shared()` (allocates in shared memory) | `std::make_shared<ROSMessageType>()` |
+
+&nbsp;
+
+### Options Types
+
+| Macro                           | ENABLE_AGNOCAST=1 (Agnocast)    | ENABLE_AGNOCAST=0 (ROS 2)     |
+| ------------------------------- | ------------------------------- | ----------------------------- |
+| `AUTOWARE_SUBSCRIPTION_OPTIONS` | `agnocast::SubscriptionOptions` | `rclcpp::SubscriptionOptions` |
+| `AUTOWARE_PUBLISHER_OPTIONS`    | `agnocast::PublisherOptions`    | `rclcpp::PublisherOptions`    |
+
+&nbsp;
+
+## 4. Two Integration Methods: Free Functions vs agnocast_wrapper::Node
+
+autoware_agnocast_wrapper provides two integration approaches.
+
+&nbsp;
+
+### Method 1: Macro + Free Function API
+
+Used to apply Agnocast to specific topics only on an existing `rclcpp::Node`. Wraps individual Publishers/Subscribers without changing the entire node.
+
+**Usage example:**
+
+```cpp
+#include <autoware/agnocast_wrapper/autoware_agnocast_wrapper.hpp>
+
+class MyNode : public rclcpp::Node  // Remains rclcpp::Node
+{
+  AUTOWARE_PUBLISHER_PTR(PointCloud2) pub_;
+
+  void setup() {
+    pub_ = AUTOWARE_CREATE_PUBLISHER3(PointCloud2, "output", qos, options);
+  }
+
+  void callback(AUTOWARE_MESSAGE_UNIQUE_PTR(const PointCloud2) && msg) {
+    auto output = ALLOCATE_OUTPUT_MESSAGE_UNIQUE(pub_);
+    // ... processing ...
+    pub_->publish(std::move(output));
+  }
+};
+```
+
+**CMakeLists.txt:**
+
+```cmake
+find_package(autoware_agnocast_wrapper REQUIRED)
+ament_target_dependencies(target autoware_agnocast_wrapper)
+autoware_agnocast_wrapper_setup(target)
+```
+
+&nbsp;
+
+### Method 2: agnocast_wrapper::Node Inheritance
+
+Used to transparently switch the entire node between `rclcpp::Node` and [`agnocast::Node`](https://github.com/autowarefoundation/agnocast/blob/main/docs/agnocast_node_interface_comparison.md). The node wrapper automatically selects the appropriate implementation based on the `ENABLE_AGNOCAST` environment variable at runtime.
+
+**Usage example:**
+
+```cpp
+#include <autoware/agnocast_wrapper/node.hpp>
+
+class MyNode : public autoware::agnocast_wrapper::Node  // Inherits Node wrapper
+{
+public:
+  explicit MyNode(const rclcpp::NodeOptions & options)
+  : Node("my_node", options)
+  {
+    pub_ = create_publisher<std_msgs::msg::String>("output", 10);
+    sub_ = create_subscription<std_msgs::msg::String>(
+      "input", 10,
+      [this](AUTOWARE_MESSAGE_CONST_SHARED_PTR(std_msgs::msg::String) && msg) { /* ... */ });
+  }
+
+private:
+  AUTOWARE_PUBLISHER_PTR(std_msgs::msg::String) pub_;
+  AUTOWARE_SUBSCRIPTION_PTR(std_msgs::msg::String) sub_;
+};
+```
+
+&nbsp;
+
+### Comparison Table
+
+|                        | Macro + Free Function | agnocast_wrapper::Node   |
+| ---------------------- | --------------------- | ------------------------ |
+| Base class             | `rclcpp::Node`        | `agnocast_wrapper::Node` |
+| Scope of changes       | Specific topics only  | Entire node              |
+| Amount of code changes | Small                 | Medium                   |
+| AgnocastOnly Executor  | Not available         | Available                |
+
+&nbsp;
+
+### Method 2 Behavior with ENABLE_AGNOCAST=0
+
+When built with `ENABLE_AGNOCAST=0` (or unset), [`node.hpp`](https://github.com/autowarefoundation/autoware_core/blob/main/common/autoware_agnocast_wrapper/include/autoware/agnocast_wrapper/node.hpp) defines `autoware::agnocast_wrapper::Node` as a **real class that owns an internal `rclcpp::Node` and forwards a curated set of members to it**. It is _not_ a typedef for `rclcpp::Node`, and it does not derive from `rclcpp::Node` in either build:
+
+```cpp
+// node.hpp when ENABLE_AGNOCAST=0 (simplified)
+class Node
+{
+public:
+  explicit Node(const std::string & node_name, const rclcpp::NodeOptions & options = {});
+  // ... the same curated member set as the ENABLE_AGNOCAST=1 Node ...
+  std::shared_ptr<rclcpp::Node> get_rclcpp_node() const { return node_; }
+
+private:
+  std::shared_ptr<rclcpp::Node> node_;
+};
+```
+
+This is deliberate: if the `=0` build aliased or derived from `rclcpp::Node`, the full `rclcpp::Node` API would leak into it, and a node could compile under `=0` while using members that do not exist under `=1`.
+
+Two consequences to keep in mind while reviewing:
+
+- The node **cannot be passed where an `rclcpp::Node *` / `rclcpp::Node &` is expected.** Hand it to executors and utilities via `get_node_base_interface()`.
+- Any `rclcpp::Node` member not in the curated surface (see the [README](../README.md#supported-api-surface)) will not compile.
+
+Code using Method 2 still compiles and runs as a plain ROS 2 node when built with `ENABLE_AGNOCAST=0`, so backward compatibility for users without Agnocast is maintained.
+
+&nbsp;
+
+## 5. component_container and autoware_agnocast_wrapper_register_node
+
+&nbsp;
+
+### autoware_agnocast_wrapper_register_node Macro
+
+A CMake macro used in place of `rclcpp_components_register_node`. It generates different targets depending on the `ENABLE_AGNOCAST` setting at build time.
+
+&nbsp;
+
+**ENABLE_AGNOCAST=0 (or unset):**
+
+- Delegates to `rclcpp_components_register_node` (standard behavior)
+- Generated target: `<EXECUTABLE>` only
+
+&nbsp;
+
+**ENABLE_AGNOCAST=1:**
+
+- `<EXECUTABLE>`: a runtime-switchable standalone executable, generated from the package's
+  `node_main_switchable.cpp.in` template
+- Component registration: `rclcpp_components_register_nodes` (plural) is called, which populates the
+  ament resource index **only** — so the component can still be loaded into a container, but no extra
+  standalone executable is generated for it
+
+> There is no `<EXECUTABLE>_component` target. Launch files should always reference `<EXECUTABLE>`, which
+> is the same name in both modes.
+
+In both modes the macro also registers an `autoware_node_plugins` resource mapping `<EXECUTABLE>` to
+its component class and to the `ENABLE_AGNOCAST` it was built with, which `<autoware_node>` reads.
+
+Note that the macro applies `autoware_agnocast_wrapper_setup()` to **both** the component library and the
+generated executable. Both need `USE_AGNOCAST_ENABLED` defined for ABI consistency, and
+`ament_target_dependencies()` does not propagate the wrapper's `PUBLIC` compile definitions.
+
+&nbsp;
+
+**Usage example:**
+
+```cmake
+autoware_agnocast_wrapper_register_node(my_node_component
+  PLUGIN "my_package::MyNode"
+  EXECUTABLE my_node
+  ROS2_EXECUTOR SingleThreadedExecutor
+  AGNOCAST_EXECUTOR SingleThreadedAgnocastExecutor
+)
+```
+
+&nbsp;
+
+### Parameters
+
+| Parameter           | Required | Description                                                                              |
+| ------------------- | -------- | ---------------------------------------------------------------------------------------- |
+| `PLUGIN`            | Yes      | Fully qualified class name of the component                                              |
+| `EXECUTABLE`        | Yes      | Executable name for the node                                                             |
+| `ROS2_EXECUTOR`     | No       | Executor when `ENABLE_AGNOCAST=0` at runtime (default: `SingleThreadedExecutor`)         |
+| `AGNOCAST_EXECUTOR` | No       | Executor when `ENABLE_AGNOCAST=1` at runtime (default: `SingleThreadedAgnocastExecutor`) |
+
+&nbsp;
+
+## 6. Executor Types and Selection
+
+&nbsp;
+
+### ROS2_EXECUTOR (when ENABLE_AGNOCAST=0 at runtime)
+
+| Executor                 | Description                                      |
+| ------------------------ | ------------------------------------------------ |
+| `SingleThreadedExecutor` | Single-threaded, executes callbacks sequentially |
+| `MultiThreadedExecutor`  | Multi-threaded, executes callbacks in parallel   |
+
+&nbsp;
+
+### AGNOCAST_EXECUTOR (when ENABLE_AGNOCAST=1 at runtime)
+
+| Executor                               | Description                                                                                                |
+| -------------------------------------- | ---------------------------------------------------------------------------------------------------------- |
+| `SingleThreadedAgnocastExecutor`       | Single-threaded. Processes both ROS 2 and Agnocast callbacks                                               |
+| `MultiThreadedAgnocastExecutor`        | Multi-threaded. Processes both ROS 2 and Agnocast callbacks                                                |
+| `CallbackIsolatedAgnocastExecutor`     | Multi-threaded (callback isolated). Processes both ROS 2 and Agnocast callbacks                            |
+| `AgnocastOnlySingleThreadedExecutor`   | Single-threaded. Processes Agnocast callbacks only. **Requires agnocast_wrapper::Node**                    |
+| `AgnocastOnlyMultiThreadedExecutor`    | Multi-threaded. Processes Agnocast callbacks only. **Requires agnocast_wrapper::Node**                     |
+| `AgnocastOnlyCallbackIsolatedExecutor` | Multi-threaded (callback isolated). Processes Agnocast callbacks only. **Requires agnocast_wrapper::Node** |
+
+> **About AgnocastOnly executors:** The PLUGIN must inherit from `autoware::agnocast_wrapper::Node`. The `get_agnocast_node()` method is used to add the node to the executor.
+
+&nbsp;
+
+## 7. component_container Selection (agnocast_env.launch.xml)
+
+By including `agnocast_env.launch.xml`, the appropriate component container is automatically selected based on the `ENABLE_AGNOCAST` environment variable.
+
+An `agnocast_wrapper::Node` node cannot be loaded into a container on Agnocast. For such a node,
+the `<autoware_node>` launch action writes the container form and the standalone form at once; see
+[Switching One Node Between Standalone and a Component Container](../README.md#switching-one-node-between-standalone-and-a-component-container).
+
+&nbsp;
+
+### Provided Variables
+
+| Variable               | Description                                  |
+| ---------------------- | -------------------------------------------- |
+| `ld_preload_value`     | `LD_PRELOAD` value with heaphook prepended   |
+| `container_package`    | `rclcpp_components` or `agnocast_components` |
+| `container_executable` | Container executable name to use             |
+
+&nbsp;
+
+### container_executable Resolution
+
+| use_multithread | ENABLE_AGNOCAST=0        | ENABLE_AGNOCAST=1                  |
+| --------------- | ------------------------ | ---------------------------------- |
+| `false`         | `component_container`    | `agnocast_component_container`     |
+| `true`          | `component_container_mt` | `agnocast_component_container_cie` |
+
+&nbsp;
+
+### Usage Examples
+
+Both an XML launch file (`agnocast_env.launch.xml`) and a Python launch file (`agnocast_env.launch.py`) are provided. Choose whichever matches the format of your existing launch files. Both provide the same variables (`ld_preload_value` / `container_package` / `container_executable`).
+
+&nbsp;
+
+**XML launch file:**
+
+```xml
+<include file="$(find-pkg-share autoware_agnocast_wrapper)/launch/agnocast_env.launch.xml">
+  <arg name="use_multithread" value="true"/>
+</include>
+
+<node_container pkg="$(var container_package)" exec="$(var container_executable)" name="my_container">
+  <env name="LD_PRELOAD" value="$(var ld_preload_value)"/>
+</node_container>
+```
+
+&nbsp;
+
+**Python launch file:**
+
+```python
+from launch.actions import IncludeLaunchDescription
+from launch.launch_description_sources import PythonLaunchDescriptionSource
+from launch.substitutions import LaunchConfiguration
+from ament_index_python.packages import get_package_share_directory
+
+# Include agnocast_env.launch.py
+agnocast_env = IncludeLaunchDescription(
+    PythonLaunchDescriptionSource(
+        os.path.join(
+            get_package_share_directory('autoware_agnocast_wrapper'),
+            'launch', 'agnocast_env.launch.py'
+        )
+    ),
+    launch_arguments={'use_multithread': 'true'}.items(),
+)
+
+# Use the provided variables
+container = ComposableNodeContainer(
+    name='my_container',
+    package=LaunchConfiguration('container_package'),
+    executable=LaunchConfiguration('container_executable'),
+    additional_env={'LD_PRELOAD': LaunchConfiguration('ld_preload_value')},
+    # ...
+)
+```
+
+&nbsp;
+
+### Parameters
+
+| Parameter                | Default                                            | Description                                                                                                 |
+| ------------------------ | -------------------------------------------------- | ----------------------------------------------------------------------------------------------------------- |
+| `agnocast_heaphook_path` | `/opt/ros/$ROS_DISTRO/lib/libagnocast_heaphook.so` | Path to the heaphook library. `$ROS_DISTRO` is read from the environment and falls back to `humble`         |
+| `use_multithread`        | `false`                                            | Whether to use a multi-threaded container                                                                   |
+| `use_agnocast`           | `$(env ENABLE_AGNOCAST 0)`                         | Per-include override (`1`/`0`). Usually left unset; forces one node/container back to the plain rclcpp path |
+
+&nbsp;
+
+## 8. Build and Execution Procedures
+
+&nbsp;
+
+### Build with Agnocast Disabled (default)
+
+```bash
+unset ENABLE_AGNOCAST  # or export ENABLE_AGNOCAST=0
+colcon build --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release
+```
+
+&nbsp;
+
+### Build with Agnocast Enabled
+
+```bash
+export ENABLE_AGNOCAST=1
+colcon build --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release
+```
+
+&nbsp;
+
+### Run with Agnocast Enabled
+
+```bash
+export ENABLE_AGNOCAST=1
+source ~/autoware/install/setup.bash
+ros2 launch autoware_launch ...
+```
+
+&nbsp;
+
+### Run with Agnocast Disabled (after building with ENABLE_AGNOCAST=1)
+
+```bash
+export ENABLE_AGNOCAST=0  # or unset ENABLE_AGNOCAST
+source ~/autoware/install/setup.bash
+ros2 launch autoware_launch ...
+```
+
+&nbsp;
+
+## 9. References
+
+- [autoware_agnocast_wrapper Source Code & README](https://github.com/autowarefoundation/autoware_core/tree/main/common/autoware_agnocast_wrapper) - The package itself. The official README contains detailed build/execution procedures and executor configuration
+
+- [Agnocast Repository](https://github.com/autowarefoundation/agnocast) - Agnocast source code including kernel module, heaphook, bridge, etc.
+
+- [Agnocast Documentation](https://autowarefoundation.github.io/agnocast_doc/main/) - Agnocast architecture, supported environments, installation procedures
+
+- [agnocast::Node and rclcpp::Node Interface Comparison](https://github.com/autowarefoundation/agnocast/blob/main/docs/agnocast_node_interface_comparison.md) - API differences between `agnocast::Node` and `rclcpp::Node`
+
+- [Agnocast Migration Guide](https://autowarefoundation.github.io/agnocast_doc/main/migration-guide/) - Step-by-step guide for migrating ROS 2 nodes to Agnocast
+
+- [Agnocast message_filters Migration Guide](https://autowarefoundation.github.io/agnocast_doc/main/migration-guide/message-filters/) - How to use Agnocast's message_filters
+
+- [Agnocast ROS 2 Bridge](https://autowarefoundation.github.io/agnocast_doc/main/migration-guide/bridge/) - Bridge communication between Agnocast nodes and standard ROS 2 nodes
+
+- [CallbackIsolatedExecutor](https://autowarefoundation.github.io/agnocast_doc/main/callback-isolated-executor/) - Design and setup of CallbackIsolatedAgnocastExecutor
+
+- [Autoware Discussion #5835: Introduce True Zero-Copy Publish/Subscribe IPC to Autoware](https://github.com/orgs/autowarefoundation/discussions/5835) - Agnocast introduction proposal for Autoware. Design philosophy, performance comparison, Agnocast Bridge mechanics, etc.
+
+- [Issue #5968: Use ROS 2 packages in Agnocast released via rosdistro](https://github.com/autowarefoundation/autoware/issues/5968) - Tracking issue for Agnocast package rosdistro release support

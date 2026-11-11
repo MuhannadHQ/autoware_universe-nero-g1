@@ -15,106 +15,98 @@
 #ifndef PROCESSOR__PROCESSOR_HPP_
 #define PROCESSOR__PROCESSOR_HPP_
 
-#include "autoware/multi_object_tracker/association/association.hpp"
-#include "autoware/multi_object_tracker/object_model/types.hpp"
-#include "autoware/multi_object_tracker/tracker/model/tracker_base.hpp"
+#include "autoware/multi_object_tracker/association/adaptive_threshold_cache.hpp"
+#include "autoware/multi_object_tracker/association/association_manager.hpp"
+#include "autoware/multi_object_tracker/merger/tracker_overlap_manager.hpp"
+#include "autoware/multi_object_tracker/tracker/trackers/polygon_tracker.hpp"
+#include "autoware/multi_object_tracker/tracker/trackers/tracker_base.hpp"
+#include "autoware/multi_object_tracker/types.hpp"
 
-#include <autoware_utils/system/time_keeper.hpp>
+#include <autoware_utils_debug/time_keeper.hpp>
 #include <rclcpp/rclcpp.hpp>
-#include <tf2/utils.h>
 
 #include "autoware_perception_msgs/msg/detected_objects.hpp"
 #include "autoware_perception_msgs/msg/tracked_objects.hpp"
+#include <geometry_msgs/msg/pose_stamped.hpp>
 
-#include <algorithm>
-#include <cmath>
 #include <list>
-#include <map>
 #include <memory>
+#include <optional>
 #include <string>
-#include <unordered_map>
 #include <vector>
 
 namespace autoware::multi_object_tracker
 {
-class UnknownTracker;  // NERO_MOT_UNKNOWN_MOVER
-using LabelType = autoware_perception_msgs::msg::ObjectClassification::_label_type;
-
-struct TrackerProcessorConfig
-{
-  std::map<LabelType, std::string> tracker_map;
-  float tracker_lifetime;                              // [s]
-  float min_known_object_removal_iou;                  // ratio [0, 1]
-  float min_unknown_object_removal_iou;                // ratio [0, 1]
-  std::map<LabelType, int> confident_count_threshold;  // [count]
-  Eigen::MatrixXd max_dist_matrix;
-};
-
 class TrackerProcessor
 {
 public:
   TrackerProcessor(
-    const TrackerProcessorConfig & config, const AssociatorConfig & associator_config,
-    const std::vector<types::InputChannel> & channels_config);
+    const TrackerConfigs & tracker_configs, const TrackerCreationConfig & creation_config,
+    const TrackerAssociationConfig & association_config,
+    const TrackerOverlapManagerConfig & tracker_overlap_manager_config,
+    const std::vector<types::InputChannel> & channels_config, const rclcpp::Logger & logger,
+    rclcpp::Clock::SharedPtr clock);
 
   const std::list<std::shared_ptr<Tracker>> & getListTracker() const { return list_tracker_; }
-  // tracker processes
-  void predict(const rclcpp::Time & time);
-  void associate(
-    const types::DynamicObjectList & detected_objects,
-    std::unordered_map<int, int> & direct_assignment,
-    std::unordered_map<int, int> & reverse_assignment) const;
-  void update(
-    const types::DynamicObjectList & detected_objects,
-    const std::unordered_map<int, int> & direct_assignment);
-  void spawn(
-    const types::DynamicObjectList & detected_objects,
-    const std::unordered_map<int, int> & reverse_assignment);
-  void prune(const rclcpp::Time & time);
-  // NERO flatos (NERO_MOT_SPAWN_PRUNE): an UNKNOWN tracker just spawned from a measurement whose centre lies inside a
-  // live (measured within max_age) MOVING (>= min_vehicle_speed) vehicle track's box at that measurement's time is a
-  // piece of that vehicle and is removed. Returns the removed trackers.
-  std::vector<std::shared_ptr<Tracker>> removeSpawnedUnknownOverlapped(
-    const rclcpp::Time & time, const std::vector<std::shared_ptr<Tracker>> & spawned, const double max_age,
-    const double min_vehicle_speed);
 
-  // output
-  bool isConfidentTracker(const std::shared_ptr<Tracker> & tracker) const;
+  // Tracker processes
+  void updateEgoPose(const std::optional<geometry_msgs::msg::PoseStamped> & ego_pose_stamped);
+  void predictTrackers(const rclcpp::Time & time);
+  types::AssociationResult associate(const types::DynamicObjectList & detected_objects) const;
+  void update(const types::AssociatedObjects & associated_objects);
+  void spawn(const types::AssociatedObjects & associated_objects);
+  void prune(const rclcpp::Time & time);
+
+  // Output processes
   void getTrackedObjects(
     const rclcpp::Time & time,
     autoware_perception_msgs::msg::TrackedObjects & tracked_objects) const;
   void getTentativeObjects(
     const rclcpp::Time & time,
     autoware_perception_msgs::msg::TrackedObjects & tentative_objects) const;
+  void getMergedObjects(
+    const rclcpp::Time & time, const geometry_msgs::msg::Transform & tf_base_to_world,
+    autoware_perception_msgs::msg::DetectedObjects & merged_objects) const;
 
-  void getExistenceProbabilities(std::vector<std::vector<float>> & existence_vectors) const;
-
-  void setTimeKeeper(std::shared_ptr<autoware_utils::TimeKeeper> time_keeper_ptr);
+  void setTimeKeeper(std::shared_ptr<autoware_utils_debug::TimeKeeper> time_keeper_ptr);
 
 private:
-  const TrackerProcessorConfig config_;
+  const TrackerConfigs tracker_configs_;
+  const TrackerCreationConfig creation_config_;
   const std::vector<types::InputChannel> & channels_config_;
 
-  std::unique_ptr<DataAssociation> association_;
+  std::optional<geometry_msgs::msg::PoseStamped> ego_pose_;
+
+  std::unique_ptr<AssociationManager> association_manager_;
+  std::unique_ptr<TrackerOverlapManager> tracker_overlap_manager_;
+
+  mutable rclcpp::Time last_prune_time_;
 
   std::list<std::shared_ptr<Tracker>> list_tracker_;
+  std::optional<geometry_msgs::msg::Pose> getEgoPose() const;
+  // NERO_MOT_STILL_BOX (boxyaw, ported): re-align a still vehicle's PUBLISHED box with its measured points
+  void neroStillBox(
+    const std::shared_ptr<Tracker> & tracker, const rclcpp::Time & time, types::DynamicObject & object) const;
+  void neroStillBoxBirth(
+    const std::shared_ptr<Tracker> & tracker, const types::DynamicObject & object, const rclcpp::Time & time) const;
   void removeOldTracker(const rclcpp::Time & time);
-  void removeOverlappedTracker(const rclcpp::Time & time);
   std::shared_ptr<Tracker> createNewTracker(
     const types::DynamicObject & object, const rclcpp::Time & time) const;
 
-  std::shared_ptr<autoware_utils::TimeKeeper> time_keeper_;
+  std::shared_ptr<autoware_utils_debug::TimeKeeper> time_keeper_;
+  AdaptiveThresholdCache adaptive_threshold_cache_;
 
-  // NERO_MOT_REBIRTH=<min_count>,<margin m>,<max_dist m>,<max_pred_speed m/s> (tbx, 2026-10-28; unset = stock): a
-  // vehicle measurement that starts a new track on an UNKNOWN track's object (the UNKNOWN track's centre inside its
-  // box + margin, standing or slower than max_pred_speed) continues that object: its motion starts from the UNKNOWN
-  // track's velocity, the object's measurements of both classes count for confident_count_threshold (with at least
-  // <min_count> vehicle measurements), and when published it takes the UNKNOWN track's uuid (the UNKNOWN track takes
-  // the vehicle track's unpublished one). The UNKNOWN track stays (updated by the object's clusters) while the vehicle
-  // track lives: hidden where the stock overlap rule would have removed it and until it has had as many measurements
-  // since as a stock track needs to be published again (confident_count_threshold), a separate object otherwise; it takes the object's uuid back if the vehicle track dies (never a gap, no uuid churn). The link ends
-  // when the UNKNOWN track's centre leaves the vehicle box (+ margin): two objects from then on (before the hand-over
-  // the vehicle track goes on as a stock one)
+  rclcpp::Logger logger_;
+  rclcpp::Clock::SharedPtr clock_;
+
+  // [nero trkup] NERO_MOT_REBIRTH=<min_count>,<margin m>,<max_dist m>,<max_pred_speed m/s> (tbx_1029, ported from our
+  // 0.44 TrackerProcessor; unset = upstream): a vehicle measurement that starts a new track on an UNKNOWN track's
+  // object (the UNKNOWN's published centre inside its box + margin, standing or slower than max_pred_speed; with
+  // NERO_MOT_UNKNOWN_MOVER also a mover along the box) continues that object: its motion starts from the UNKNOWN's
+  // published one (a mover's: its line), it is confident with >= <min_count> measurements of its own once the UNKNOWN
+  // is, and when published it takes the UNKNOWN's published uuid; the UNKNOWN goes on (hidden where the stock prune
+  // would absorb it) and takes the uuid back if the vehicle track dies. The link ends when the UNKNOWN's centre leaves
+  // the vehicle box (+ margin).
   struct NeroRebirth
   {
     bool enabled{false};
@@ -124,78 +116,26 @@ private:
     double max_pred_speed{1.0};
   };
   NeroRebirth nero_rebirth_;
+  TrackerOverlapManagerConfig nero_overlap_config_;
   std::shared_ptr<Tracker> neroFindPredecessor(
     const types::DynamicObject & measurement, const types::InputChannel & channel,
     const rclcpp::Time & time, types::DynamicObject & seeded_measurement) const;
   bool neroCovers(const types::DynamicObject & vehicle, const types::DynamicObject & unknown) const;
-  // NERO_MOT_FLIP_DEFER (flipspeed): a published vehicle track at a judged track's place and its velocity
-  bool neroFindPartner(
-    const std::shared_ptr<Tracker> & tracker, const rclcpp::Time & time, double & vx, double & vy) const;
   bool neroStockRemoves(
     const std::shared_ptr<Tracker> & vehicle, const std::shared_ptr<Tracker> & unknown,
     const rclcpp::Time & time) const;
   void neroHandOver(const rclcpp::Time & time);
-  // NERO_MOT_STILL_BOX (boxyaw): the published box of a still vehicle track re-aligned with its points
-  void neroStillBox(
-    const std::shared_ptr<Tracker> & tracker, const rclcpp::Time & time, types::DynamicObject & object) const;
-  bool neroHidden(const std::shared_ptr<Tracker> & tracker, const rclcpp::Time & time) const;
-
-  // NERO_MOT_DUP_FRESH=<fresh s> (tbx, 2026-10-28; unset = stock; upstream's freshness tier, autoware_universe #12996 /
-  // merger/survival_ranking.cpp, full_measure_stale_threshold 0.35 s): removeOverlappedTracker deletes a vehicle track
-  // overlapping a prioritized vehicle track (IoU > min_known_object_removal_iou) also when the prioritized one is
-  // confident and had a FULL measurement (a channel that trusts the box extent: not detection_by_tracker, which only
-  // re-measures the track's own shape) within <fresh> s, not only when its last measurement is the newer one. With two input
-  // channels a duplicate born from the other channel's detection otherwise survives every prune, gets published with
-  // the speed of its first boxes' motion and nearer the path (10-26e #59: 279a07 on the parked 41db95, -2.82)
-  double nero_dup_fresh_{0.0};
-  // NERO_MOT_FAST_BIRTH=<frames>,<max_gap_s>,<min_prob> (realize-3): a VEHICLE track (highest label car / truck / bus /
-  // trailer) measured at >= <frames> distinct detection stamps, the last within <max_gap_s>, every measurement's existence
-  // probability >= <min_prob>, is published before the stock count; until the stock count it is published only while its
-  // measurements keep coming (a 2-frame box that stops is withdrawn at once instead of coasting).
-  struct NeroFastBirth
-  {
-    bool on{false};
-    int frames{2};
-    double max_gap{0.15};
-    double min_prob{0.0};
-    double vmin{0.0};      // the measured boxes move >= vmin m/s ...
-    double yaw_deg{180.0};  // ... along the box's own heading (either sign) within yaw_deg
-    double iso_m{-1.0};     // no published vehicle within (l1 + l2) / 2 + iso_m (a second box of a known car); < 0 off
-    double far_m{1e9};      // from this range to the robot ...
-    int far_frames{2};      // ... this many distinct frames
-  };
-  double nero_ego_x_{0.0}, nero_ego_y_{0.0};
-  bool nero_ego_ok_{false};
-
-public:
-  bool neroFastBirthOn() const { return nero_fast_birth_.on; }
-  void neroSetEgo(const double x, const double y)
-  {
-    nero_ego_x_ = x;
-    nero_ego_y_ = y;
-    nero_ego_ok_ = true;
-  }
-
-private:
-  NeroFastBirth nero_fast_birth_;
-  bool neroFastBirthPublish(const std::shared_ptr<Tracker> & tracker, const rclcpp::Time & time) const;
-
-  // NERO_MOT_UNKNOWN_MOVER (oncomingtrack, 2026-10-31; unset = stock; UnknownTracker holds the rule): an UNKNOWN
-  // measurement that no track took but that continues a recently measured UNKNOWN track's straight mover line updates
-  // that track instead of starting one at speed 0; with NERO_MOT_REBIRTH, a vehicle measurement on a mover whose motion
-  // runs along the vehicle box (within 30 deg, either way) continues it like a standing one, heading the way it moves
+  // [nero trkup] NERO_MOT_UNKNOWN_MOVER (oncomingtrack / crossmover; PolygonTracker holds the rule): an UNKNOWN
+  // measurement no track took that continues a recently measured UNKNOWN track's mover line updates that track; a new
+  // UNKNOWN track continuing a young track the gates lost takes over its positions; with NERO_MOT_REBIRTH a vehicle
+  // measurement on a mover whose motion runs along the box continues it, heading the way it moves
   bool neroMoverLink(
     const types::DynamicObject & measurement, const types::InputChannel & channel, const rclcpp::Time & time);
   void neroMoverInherit(
-    const std::shared_ptr<UnknownTracker> & newborn, const types::DynamicObject & measurement,
+    const std::shared_ptr<PolygonTracker> & newborn, const types::DynamicObject & measurement,
     const rclcpp::Time & time);
   bool neroMoverAlong(
     const std::shared_ptr<Tracker> & tracker, const rclcpp::Time & time, const double box_yaw) const;
-  // crossmover c3 (NERO_MOT_UNKNOWN_MOVER with the crossing fields): an UNKNOWN published fast because of a crossing
-  // mover line within the last mover hold (a young mover, or one whose line just ended) is continued by a vehicle box
-  // its motion runs along (within 30 deg, either way) like a slow one, and no vehicle track that is not published yet
-  // removes it (else the object vanishes until that track is confident: 10-27 20:45:11.3, 13 m in the path).
-  // Oncoming movers keep oncomingtrack's rules (a 0.1 s fragment line at a standing vehicle: 20:28:47.9)
   bool neroMoverMadeAlong(
     const std::shared_ptr<Tracker> & tracker, const types::DynamicObject & object, const rclcpp::Time & time,
     const double box_yaw) const;

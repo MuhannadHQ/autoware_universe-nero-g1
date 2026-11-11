@@ -1,4 +1,4 @@
-// Copyright 2024 Tier IV, Inc.
+// Copyright 2024 TIER IV, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -11,32 +11,23 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-//
-//
-// Author: v1.0 Taekjin Lee
-//
 
 #ifndef AUTOWARE__MULTI_OBJECT_TRACKER__TRACKER__MOTION_MODEL__CTRV_MOTION_MODEL_HPP_
 #define AUTOWARE__MULTI_OBJECT_TRACKER__TRACKER__MOTION_MODEL__CTRV_MOTION_MODEL_HPP_
 
-#include "autoware/kalman_filter/kalman_filter.hpp"
 #include "autoware/multi_object_tracker/tracker/motion_model/motion_model_base.hpp"
 
 #include <Eigen/Core>
 #include <rclcpp/rclcpp.hpp>
 
-#ifdef ROS_DISTRO_GALACTIC
-#include <tf2_geometry_msgs/tf2_geometry_msgs.h>
-#else
-#include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
-#endif
 #include <geometry_msgs/msg/twist.hpp>
+#include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 
 namespace autoware::multi_object_tracker
 {
 
 // cspell: ignore CTRV
-class CTRVMotionModel : public MotionModel
+class CTRVMotionModel : public MotionModel<5>
 {
 private:
   // attributes
@@ -59,7 +50,6 @@ public:
   CTRVMotionModel();
 
   enum IDX { X = 0, Y = 1, YAW = 2, VEL = 3, WZ = 4 };
-  const char DIM = 5;
 
   bool initialize(
     const rclcpp::Time & time, const double & x, const double & y, const double & yaw,
@@ -84,11 +74,12 @@ public:
 
   bool adjustPosition(const double & x, const double & y);
 
+  // 180° heading flip of the raw state: rotate yaw by pi and negate the velocity.
+  bool flipOrientation();
+
   bool limitStates();
 
-  // NERO_MOT_SIGN_BELIEF (signbelief, upstream #13050): the exact 180 deg turn: yaw + pi, speed negated, the speed's
-  // cross-covariances negated
-  bool flipOrientation();
+  double getYawState() const noexcept { return getStateElement(IDX::YAW); }
 
   bool predictStateStep(const double dt, KalmanFilter & ekf) const override;
 

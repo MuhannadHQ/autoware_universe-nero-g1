@@ -14,19 +14,18 @@
 
 #include "input_manager.hpp"
 
-#include "autoware/multi_object_tracker/tracker/model/nero_still_box.hpp"
+#include <string>
 
-#include <cmath>
+#include <cstdlib>
 
-#include "autoware/multi_object_tracker/object_model/shapes.hpp"
-#include "autoware/multi_object_tracker/object_model/types.hpp"
+#include "autoware/multi_object_tracker/object_model/classes.hpp"
+#include "autoware/multi_object_tracker/types.hpp"
 #include "autoware/multi_object_tracker/uncertainty/uncertainty_processor.hpp"
 
-#include <autoware/object_recognition_utils/object_recognition_utils.hpp>
-
-#include <cassert>
+#include <algorithm>
+#include <cmath>
 #include <memory>
-#include <utility>
+#include <optional>
 #include <vector>
 
 namespace autoware::multi_object_tracker
@@ -35,9 +34,9 @@ namespace autoware::multi_object_tracker
 /////// InputStream ///////
 ///////////////////////////
 InputStream::InputStream(
-  rclcpp::Node & node, const types::InputChannel & input_channel,
-  std::shared_ptr<Odometry> odometry)
-: node_(node), channel_(input_channel), odometry_(odometry)
+  const types::InputChannel & input_channel, std::shared_ptr<Odometry> odometry,
+  rclcpp::Logger logger, rclcpp::Clock::SharedPtr clock)
+: channel_(input_channel), odometry_(odometry), logger_(logger), clock_(clock)
 {
   // Initialize queue
   objects_que_.clear();
@@ -48,17 +47,48 @@ InputStream::InputStream(
   interval_mean_ = 0.0;  // [s] (initial value)
   interval_var_ = 0.0;
 
-  latest_measurement_time_ = node_.now();
-  latest_message_time_ = node_.now();
+  latest_measurement_time_ = clock_->now();
+  latest_message_time_ = clock_->now();
 }
 
-void InputStream::onMessage(
-  const autoware_perception_msgs::msg::DetectedObjects::ConstSharedPtr msg)
+void InputStream::push(
+  const types::DynamicObjectList & objects, const types::AssociationResult & association)
+{
+  push(objects, association, clock_->now());
+}
+
+void InputStream::push(
+  const types::DynamicObjectList & objects, const types::AssociationResult & association,
+  const rclcpp::Time & now)
+{
+  // Move the objects_with_uncertainty to the objects queue
+  objects_que_.push_back(types::ObjectsWithAssociation{objects, association});
+  while (objects_que_.size() > que_size_) {
+    objects_que_.pop_front();
+  }
+
+  // update the timing statistics
+  rclcpp::Time objects_time(objects.header.stamp);
+  updateTimingStatus(now, objects_time);
+
+  // trigger the function if it is set
+  if (func_trigger_) {
+    func_trigger_(channel_.index);
+  }
+}
+
+std::optional<types::DynamicObjectList> InputStream::processMessage(
+  AUTOWARE_MESSAGE_CONST_SHARED_PTR(autoware_perception_msgs::msg::DetectedObjects) msg)
 {
   const autoware_perception_msgs::msg::DetectedObjects & objects = *msg;
   const rclcpp::Time timestamp = objects.header.stamp;
 
   types::DynamicObjectList dynamic_objects = types::toDynamicObjectList(objects, channel_.index);
+
+  // Set trust_extension information from channel configuration
+  for (auto & object : dynamic_objects.objects) {
+    object.trust_extension = channel_.trust_extension;
+  }
 
   // Model the object uncertainty only if it is not available
   types::DynamicObjectList objects_with_uncertainty =
@@ -67,77 +97,34 @@ void InputStream::onMessage(
   // Transform the objects to the world frame
   auto transformed_objects = odometry_->transformObjects(objects_with_uncertainty);
   if (!transformed_objects) {
-    RCLCPP_WARN(
-      node_.get_logger(), "InputManager::onMessage %s: Failed to transform objects.",
+    RCLCPP_WARN_THROTTLE(
+      logger_, *clock_, 1000, "InputManager::onMessage %s: Failed to transform objects.",
       channel_.long_name.c_str());
-    return;
+    return std::nullopt;
   }
   dynamic_objects = transformed_objects.value();
 
   // object shape processing
   for (auto & object : dynamic_objects.objects) {
-    const auto label =
-      autoware::object_recognition_utils::getHighestProbLabel(object.classification);
-    if (label == autoware_perception_msgs::msg::ObjectClassification::UNKNOWN) {
-      continue;
-    }
-
     // check object shape type, bounding box, cylinder, polygon
     const auto object_type = object.shape.type;
-    if (object_type == autoware_perception_msgs::msg::Shape::POLYGON) {
-      // convert convex hull to bounding box
-      if (!shapes::convertConvexHullToBoundingBox(object, object)) {
-        RCLCPP_WARN(
-          node_.get_logger(),
-          "InputManager::onMessage %s: Failed to convert convex hull to bounding box.",
-          channel_.long_name.c_str());
-        continue;
-      }
-    } else if (object_type == autoware_perception_msgs::msg::Shape::CYLINDER) {
+    if (object_type == autoware_perception_msgs::msg::Shape::CYLINDER) {
       // convert cylinder dimension to bounding box dimension
       object.shape.dimensions.y = object.shape.dimensions.x;
     }
-    // else, it is bounding box and nothing to do
-
-    // calculate nearest point
-    const auto self_transform = odometry_->getTransform(timestamp);
-    if (!self_transform) {
-      return;
-    }
-    shapes::getNearestCornerOrSurface(*self_transform, object);
-    // NERO_MOT_SIGN_BELIEF: the box's range from the robot (the belief's range-weighted votes)
-    object.nero_range = std::hypot(
-      object.pose.position.x - self_transform->translation.x,
-      object.pose.position.y - self_transform->translation.y);
-    if (neroStillBoxParams().enabled) {
-      const auto & q = self_transform->rotation;
-      object.nero_has_ego = true;
-      object.nero_ego_x = self_transform->translation.x;
-      object.nero_ego_y = self_transform->translation.y;
-      object.nero_ego_yaw = std::atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z));
-    }
-
-    // if object extension is not reliable, enlarge covariance of position and extend shape
   }
 
   // Normalize the object uncertainty
   uncertainty::normalizeUncertainty(dynamic_objects);
 
-  // Move the objects_with_uncertainty to the objects queue
-  objects_que_.push_back(std::move(dynamic_objects));
-  while (objects_que_.size() > que_size_) {
-    objects_que_.pop_front();
+  // If the channel does not trust existence probability, set it to default
+  if (!channel_.trust_existence_probability) {
+    for (auto & object : dynamic_objects.objects) {
+      object.existence_probability = types::default_existence_probability;
+    }
   }
 
-  // update the timing statistics
-  rclcpp::Time now = node_.now();
-  rclcpp::Time objects_time(objects.header.stamp);
-  updateTimingStatus(now, objects_time);
-
-  // trigger the function if it is set
-  if (func_trigger_) {
-    func_trigger_(channel_.index);
-  }
+  return dynamic_objects;
 }
 
 void InputStream::updateTimingStatus(const rclcpp::Time & now, const rclcpp::Time & objects_time)
@@ -167,7 +154,7 @@ void InputStream::updateTimingStatus(const rclcpp::Time & now, const rclcpp::Tim
     const double interval = (now - latest_message_time_).seconds();
     if (interval < 0.0) {
       RCLCPP_WARN(
-        node_.get_logger(),
+        logger_,
         "InputManager::updateTimingStatus %s: Negative interval detected, now: %f, "
         "latest_message_time_: %f",
         channel_.long_name.c_str(), now.seconds(), latest_message_time_.seconds());
@@ -195,8 +182,7 @@ void InputStream::updateTimingStatus(const rclcpp::Time & now, const rclcpp::Tim
     // threshold, the system time may have been reset. Reset the latest measurement time
     latest_measurement_time_ = objects_time;
     RCLCPP_WARN(
-      node_.get_logger(),
-      "InputManager::updateTimingStatus %s: Resetting the latest measurement time to %f",
+      logger_, "InputManager::updateTimingStatus %s: Resetting the latest measurement time to %f",
       channel_.long_name.c_str(), objects_time.seconds());
   } else {
     // Update only if the object time is newer than the latest measurement time
@@ -212,33 +198,46 @@ void InputStream::updateTimingStatus(const rclcpp::Time & now, const rclcpp::Tim
 
 void InputStream::getObjectsOlderThan(
   const rclcpp::Time & object_latest_time, const rclcpp::Time & object_earliest_time,
-  ObjectsList & objects_list)
+  types::ObjectsWithAssociationList & objects_with_associations)
 {
   if (object_latest_time < object_earliest_time) {
     RCLCPP_WARN(
-      node_.get_logger(),
+      logger_,
       "InputManager::getObjectsOlderThan %s: Invalid object time interval, object_latest_time: %f, "
       "object_earliest_time: %f",
       channel_.long_name.c_str(), object_latest_time.seconds(), object_earliest_time.seconds());
     return;
   }
 
-  for (const auto & objects : objects_que_) {
-    const rclcpp::Time object_time = rclcpp::Time(objects.header.stamp);
+  // [nero trkup] NERO_MOT_DEDUP_EXPORT=1 (QUEUE MOTDUP): the window starts AT the last exported stamp and a message whose
+  // stamp equals the previous window end stays queued, so it was exported (applied to the trackers) a second time in the
+  // next batch. With the switch a stream never exports a stamp it has already exported. Unset = upstream.
+  static const bool nero_dedup = [] {
+    const char * e = std::getenv("NERO_MOT_DEDUP_EXPORT");
+    return e && std::string(e) != "0";
+  }();
+  for (const auto & objects_pair : objects_que_) {
+    const rclcpp::Time object_time = objects_pair.getTimestamp();
     // ignore objects older than the specified duration
     if (object_time < object_earliest_time) {
+      continue;
+    }
+    if (nero_dedup && nero_last_exported_time_ && object_time <= *nero_last_exported_time_) {
       continue;
     }
 
     // Add the object if the object is older than the specified latest time
     if (object_time <= object_latest_time) {
-      objects_list.push_back(objects);
+      objects_with_associations.push_back(objects_pair);
+      if (nero_dedup && (!nero_last_exported_time_ || object_time > *nero_last_exported_time_)) {
+        nero_last_exported_time_ = object_time;
+      }
     }
   }
 
   // remove objects older than 'object_latest_time'
   while (!objects_que_.empty()) {
-    const rclcpp::Time object_time = rclcpp::Time(objects_que_.front().header.stamp);
+    const rclcpp::Time object_time = objects_que_.front().getTimestamp();
     if (object_time < object_latest_time) {
       objects_que_.pop_front();
     } else {
@@ -250,10 +249,11 @@ void InputStream::getObjectsOlderThan(
 ////////////////////////////
 /////// InputManager ///////
 ////////////////////////////
-InputManager::InputManager(rclcpp::Node & node, std::shared_ptr<Odometry> odometry)
-: node_(node), odometry_(odometry)
+InputManager::InputManager(
+  std::shared_ptr<Odometry> odometry, rclcpp::Logger logger, rclcpp::Clock::SharedPtr clock)
+: odometry_(odometry), logger_(logger), clock_(clock)
 {
-  latest_exported_object_time_ = node_.now() - rclcpp::Duration::from_seconds(3.0);
+  latest_exported_object_time_ = clock_->now() - rclcpp::Duration::from_seconds(3.0);
 }
 
 void InputManager::init(const std::vector<types::InputChannel> & input_channels)
@@ -261,44 +261,68 @@ void InputManager::init(const std::vector<types::InputChannel> & input_channels)
   // Check input sizes
   input_size_ = input_channels.size();
   if (input_size_ == 0) {
-    RCLCPP_ERROR(node_.get_logger(), "InputManager::init No input streams");
+    RCLCPP_ERROR(logger_, "InputManager::init No input streams");
     return;
   }
 
   // Initialize input streams
-  sub_objects_array_.resize(input_size_);
   bool is_any_spawn_enabled = false;
   for (size_t i = 0; i < input_size_; i++) {
-    InputStream input_stream(node_, input_channels[i], odometry_);
-    input_stream.setTriggerFunction(
-      std::bind(&InputManager::onTrigger, this, std::placeholders::_1));
+    InputStream input_stream(input_channels[i], odometry_, logger_, clock_);
     input_streams_.push_back(std::make_shared<InputStream>(input_stream));
     is_any_spawn_enabled |= input_streams_.at(i)->isSpawnEnabled();
 
-    // Set subscription
     RCLCPP_INFO(
-      node_.get_logger(), "InputManager::init Initializing %s input stream from %s",
-      input_channels[i].long_name.c_str(), input_channels[i].input_topic.c_str());
-    std::function<void(const autoware_perception_msgs::msg::DetectedObjects::ConstSharedPtr msg)>
-      func = std::bind(&InputStream::onMessage, input_streams_.at(i), std::placeholders::_1);
-    sub_objects_array_.at(i) =
-      node_.create_subscription<autoware_perception_msgs::msg::DetectedObjects>(
-        input_channels[i].input_topic, rclcpp::QoS{1}, func);
+      logger_, "InputManager::init Initializing %s input stream index %lu",
+      input_channels[i].long_name.c_str(), i);
   }
 
   // Check if any spawn enabled input streams
   if (!is_any_spawn_enabled) {
-    RCLCPP_ERROR(node_.get_logger(), "InputManager::init No spawn enabled input streams");
+    RCLCPP_ERROR(logger_, "InputManager::init No spawn enabled input streams");
     return;
   }
   is_initialized_ = true;
 }
 
-void InputManager::onTrigger(const uint & index) const
+void InputManager::push(
+  const size_t channel_index, const types::DynamicObjectList & objects,
+  const types::AssociationResult & association)
 {
-  // when the target stream triggers, call the trigger function
-  if (index == target_stream_idx_ && func_trigger_) {
-    func_trigger_();
+  push(channel_index, objects, association, clock_->now());
+}
+
+void InputManager::push(
+  const size_t channel_index, const types::DynamicObjectList & objects,
+  const types::AssociationResult & association, const rclcpp::Time & now)
+{
+  if (channel_index >= input_streams_.size()) {
+    RCLCPP_WARN(
+      logger_, "InputManager::push Invalid channel index: %lu, input_streams_ size: %lu",
+      channel_index, input_streams_.size());
+    return;
+  }
+  input_streams_.at(channel_index)->push(objects, association, now);
+}
+
+std::optional<types::DynamicObjectList> InputManager::processMessage(
+  const size_t channel_index,
+  AUTOWARE_MESSAGE_CONST_SHARED_PTR(autoware_perception_msgs::msg::DetectedObjects) msg)
+{
+  if (channel_index >= input_streams_.size()) {
+    RCLCPP_WARN(
+      logger_, "InputManager::processMessage Invalid channel index: %lu, input_streams_ size: %lu",
+      channel_index, input_streams_.size());
+    return std::nullopt;
+  }
+  return input_streams_.at(channel_index)->processMessage(msg);
+}
+
+void InputManager::setTriggerFunction(std::function<void(size_t)> func_trigger)
+{
+  func_trigger_ = func_trigger;
+  for (const auto & input_stream : input_streams_) {
+    input_stream->setTriggerFunction(func_trigger);
   }
 }
 
@@ -306,116 +330,165 @@ void InputManager::getObjectTimeInterval(
   const rclcpp::Time & now, rclcpp::Time & object_latest_time,
   rclcpp::Time & object_earliest_time) const
 {
-  // Set the object time interval
+  // The newest measurement of the target stream, once its time statistics are initialized
+  const auto & target_stream = input_streams_.at(target_stream_idx_);
+  const std::optional<rclcpp::Time> target_latest_measurement =
+    target_stream->isTimeInitialized()
+      ? std::make_optional(target_stream->getLatestMeasurementTime())
+      : std::nullopt;
 
   // 1. object_latest_time
-  // The object_latest_time is the current time minus the target stream latency
-  object_latest_time =
+  // The current time minus the target stream latency, kept at or above the target stream's
+  // newest measurement
+  const rclcpp::Time latency_based_latest_time =
     now - rclcpp::Duration::from_seconds(target_stream_latency_ - 0.1 * target_stream_latency_std_);
-
-  // check the target stream can be included in the object time interval
-  if (input_streams_.at(target_stream_idx_)->isTimeInitialized()) {
-    const rclcpp::Time latest_measurement_time =
-      input_streams_.at(target_stream_idx_)->getLatestMeasurementTime();
-    // if the object_latest_time is older than the latest measurement time, set it to the latest
-    // object time
-    object_latest_time =
-      object_latest_time < latest_measurement_time ? latest_measurement_time : object_latest_time;
-  }
+  object_latest_time = target_latest_measurement
+                         ? std::max(latency_based_latest_time, *target_latest_measurement)
+                         : latency_based_latest_time;
 
   // 2. object_earliest_time
-  // The default object_earliest_time is to have a 1-second time interval
-  const rclcpp::Time object_earliest_time_default =
+  // The window start resumes from the export watermark; a watermark ahead of the window end
+  // falls back to the default 1-second interval
+  const rclcpp::Time earliest_time_default =
     object_latest_time - rclcpp::Duration::from_seconds(1.0);
-  if (
-    latest_exported_object_time_ < object_earliest_time_default ||
-    latest_exported_object_time_ > object_latest_time) {
-    // if the latest exported object time is too old or newer than the object_latest_time,
-    // set to the default
-    object_earliest_time = object_earliest_time_default;
-  } else {
-    // The object_earliest_time is the latest exported object time
-    object_earliest_time = latest_exported_object_time_;
-  }
+  const rclcpp::Time export_resume_time = latest_exported_object_time_ > object_latest_time
+                                            ? earliest_time_default
+                                            : latest_exported_object_time_;
+
+  // The window start stays at or below the target stream's newest measurement: objects below the
+  // window start are dropped by getObjectsOlderThan(), so the target's backlog is exported while
+  // the latency estimate converges
+  const rclcpp::Time target_covered_time =
+    target_latest_measurement ? std::min(export_resume_time, *target_latest_measurement)
+                              : export_resume_time;
+
+  // Bounded to the 1-second interval
+  object_earliest_time = std::max(target_covered_time, earliest_time_default);
 }
 
-void InputManager::optimizeTimings()
+bool InputManager::isStreamFresh(const InputStream & input_stream, const rclcpp::Time & now) const
 {
-  double max_latency_mean = 0.0;
-  uint selected_stream_idx = 0;
-  double selected_stream_latency_std = 0.1;
-  double selected_stream_interval = 0.1;
-  double selected_stream_interval_std = 0.01;
+  if (!input_stream.isTimeInitialized()) {
+    return false;
+  }
 
-  {
-    // ANALYSIS: Get the streams statistics
-    // select the stream that has the maximum latency
-    double latency_mean, latency_var, interval_mean, interval_var;
-    for (const auto & input_stream : input_streams_) {
-      if (!input_stream->isTimeInitialized()) continue;
-      input_stream->getTimeStatistics(latency_mean, latency_var, interval_mean, interval_var);
-      if (latency_mean > max_latency_mean) {
-        max_latency_mean = latency_mean;
-        selected_stream_idx = input_stream->getIndex();
-        selected_stream_latency_std = std::sqrt(latency_var);
-        selected_stream_interval = interval_mean;
-        selected_stream_interval_std = std::sqrt(interval_var);
-      }
+  double latency_mean, latency_var, interval_mean, interval_var;
+  input_stream.getTimeStatistics(latency_mean, latency_var, interval_mean, interval_var);
+
+  // The timeout is capped by the margin, so that a rate-dropped channel, which has a gradually
+  // increasing interval, is not relaxed into the 'fresh' condition by its own statistics.
+  // A channel slower than 'freshness_margin * 2.0' interval is always treated as not fresh.
+  constexpr double freshness_margin = 0.2;  // [s]
+  const double expected_interval = interval_mean > 1e-3 ? interval_mean : target_stream_interval_;
+  const double freshness_timeout = std::min(expected_interval, freshness_margin) + freshness_margin;
+
+  const double elapsed = (now - input_stream.getLatestMessageTime()).seconds();
+  return 0.0 <= elapsed && elapsed <= freshness_timeout;
+}
+
+void InputManager::optimizeChannelTimings(const rclcpp::Time & now)
+{
+  // ANALYSIS: Get the streams statistics
+  // select the fresh stream that has the maximum latency
+  double latency_mean, latency_var, interval_mean, interval_var;
+  bool is_candidate_found = false;
+  uint candidate_stream_idx = target_stream_idx_;
+  double candidate_latency_mean = -1.0;
+  for (const auto & input_stream : input_streams_) {
+    if (!isStreamFresh(*input_stream, now)) continue;
+    input_stream->getTimeStatistics(latency_mean, latency_var, interval_mean, interval_var);
+    if (!is_candidate_found || latency_mean > candidate_latency_mean) {
+      is_candidate_found = true;
+      candidate_stream_idx = input_stream->getIndex();
+      candidate_latency_mean = latency_mean;
     }
   }
 
-  // Set the target stream index, which has the maximum latency
+  if (!is_candidate_found) {
+    // no fresh stream is available, keep the current target stream
+    return;
+  }
+
+  // DECISION: Set the target stream index, which has the maximum latency
   // trigger will be called next time
-  // if no stream is initialized, the target stream index will be 0 and wait for the initialization
-  target_stream_idx_ = selected_stream_idx;
-  target_stream_latency_ = max_latency_mean;
-  target_stream_latency_std_ = selected_stream_latency_std;
-  target_stream_interval_ = selected_stream_interval;
-  target_stream_interval_std_ = selected_stream_interval_std;
+  const auto & current_target_stream = input_streams_.at(target_stream_idx_);
+  if (!isStreamFresh(*current_target_stream, now)) {
+    // the current target stream is stale, fail over to the fresh candidate immediately
+    target_stream_idx_ = candidate_stream_idx;
+  } else if (candidate_stream_idx != target_stream_idx_) {
+    // both streams are fresh: switch only if the candidate is clearly slower than the current
+    // target, to avoid frequent flipping between streams of similar latency
+    constexpr double latency_hysteresis = 0.03;  // [s]
+    double target_latency_mean, target_latency_var, target_interval_mean, target_interval_var;
+    current_target_stream->getTimeStatistics(
+      target_latency_mean, target_latency_var, target_interval_mean, target_interval_var);
+    if (candidate_latency_mean > target_latency_mean + latency_hysteresis) {
+      target_stream_idx_ = candidate_stream_idx;
+    }
+  }
+
+  // UPDATE: Refresh the timing statistics of the target stream
+  input_streams_.at(target_stream_idx_)
+    ->getTimeStatistics(latency_mean, latency_var, interval_mean, interval_var);
+
+  // Shift the target latency gradually when it increases, because an increase moves the batch
+  // window backward in time. A backward jump exports objects older than the tracker time, which
+  // makes the trackers stale. The increase rate is much slower than the elapsed time, so the
+  // batch window end (now - target_stream_latency_) keeps moving forward.
+  constexpr double max_latency_increase_rate = 0.2;  // [s/s]
+  const double elapsed = last_optimization_time_
+                           ? std::clamp((now - *last_optimization_time_).seconds(), 0.0, 1.0)
+                           : 0.0;
+  target_stream_latency_ =
+    latency_mean > target_stream_latency_
+      ? std::min(latency_mean, target_stream_latency_ + max_latency_increase_rate * elapsed)
+      : latency_mean;  // a decrease is applied immediately, it moves the window forward
+  last_optimization_time_ = now;
+
+  target_stream_latency_std_ = std::sqrt(latency_var);
+  target_stream_interval_ = interval_mean;
+  target_stream_interval_std_ = std::sqrt(interval_var);
 }
 
-bool InputManager::getObjects(const rclcpp::Time & now, ObjectsList & objects_list)
+bool InputManager::getObjects(
+  const rclcpp::Time & now, types::ObjectsWithAssociationList & objects_with_associations)
 {
   if (!is_initialized_) {
-    RCLCPP_INFO(node_.get_logger(), "InputManager::getObjects Input manager is not initialized");
+    RCLCPP_INFO(logger_, "InputManager::getObjects Input manager is not initialized");
     return false;
   }
 
   // Clear the objects
-  objects_list.clear();
+  objects_with_associations.clear();
 
   // Get the time interval for the objects
   rclcpp::Time object_latest_time;
   rclcpp::Time object_earliest_time;
   getObjectTimeInterval(now, object_latest_time, object_earliest_time);
 
-  // Optimize the target stream, latency, and its band
-  // The result will be used for the next time, so the optimization is after getting the time
-  // interval
-  optimizeTimings();
-
   // Get objects from all input streams
   // adds up to the objects vector for efficient processing
   for (const auto & input_stream : input_streams_) {
-    input_stream->getObjectsOlderThan(object_latest_time, object_earliest_time, objects_list);
+    input_stream->getObjectsOlderThan(
+      object_latest_time, object_earliest_time, objects_with_associations);
   }
 
   // Sort objects by timestamp
   std::sort(
-    objects_list.begin(), objects_list.end(),
-    [](const types::DynamicObjectList & a, const types::DynamicObjectList & b) {
-      return (rclcpp::Time(a.header.stamp) - rclcpp::Time(b.header.stamp)).seconds() < 0;
+    objects_with_associations.begin(), objects_with_associations.end(),
+    [](const auto & a, const auto & b) {
+      return (a.getTimestamp() - b.getTimestamp()).seconds() < 0;
     });
 
   // Update the latest exported object time
-  bool is_any_object = !objects_list.empty();
+  bool is_any_object = !objects_with_associations.empty();
   if (is_any_object) {
-    latest_exported_object_time_ = rclcpp::Time(objects_list.back().header.stamp);
+    latest_exported_object_time_ = objects_with_associations.back().getTimestamp();
   } else {
     // check time jump back
     if (now < latest_exported_object_time_) {
       RCLCPP_WARN(
-        node_.get_logger(),
+        logger_,
         "InputManager::getObjects Detected jump back in time, now: %f, "
         "latest_exported_object_time_: %f",
         now.seconds(), latest_exported_object_time_.seconds());
@@ -426,7 +499,7 @@ bool InputManager::getObjects(const rclcpp::Time & now, ObjectsList & objects_li
     } else {
       // No objects in the object list, no update for the latest exported object time
       RCLCPP_DEBUG(
-        node_.get_logger(),
+        logger_,
         "InputManager::getObjects No objects in the object list, object time band from %f to %f",
         (now - object_earliest_time).seconds(), (now - object_latest_time).seconds());
     }

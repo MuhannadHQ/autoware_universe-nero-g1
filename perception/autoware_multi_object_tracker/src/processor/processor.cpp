@@ -14,47 +14,72 @@
 
 #include "processor.hpp"
 
+#include "autoware/multi_object_tracker/merger/detail/redundancy_check.hpp"
 #include "autoware/multi_object_tracker/object_model/object_model.hpp"
-#include "autoware/multi_object_tracker/object_model/shapes.hpp"
-#include "autoware/multi_object_tracker/object_model/types.hpp"
-#include "autoware/multi_object_tracker/tracker/model/nero_still_box.hpp"
+#include "autoware/multi_object_tracker/tracker/nero/nero_unknown_mover.hpp"
 #include "autoware/multi_object_tracker/tracker/tracker.hpp"
+#include "autoware/multi_object_tracker/tracker/nero/nero_still_box.hpp"
+#include "autoware/multi_object_tracker/tracker/trackers/static_tracker.hpp"
+#include "autoware/multi_object_tracker/types.hpp"
 
-#include <autoware/object_recognition_utils/object_recognition_utils.hpp>
-#include <autoware_utils/geometry/geometry.hpp>
-#include <autoware_utils/math/normalization.hpp>
-#include <autoware_utils/ros/msg_covariance.hpp>
+#include <autoware_utils_geometry/msg/covariance.hpp>
+#include <autoware_utils_math/normalization.hpp>
+#include <tf2/LinearMath/Quaternion.hpp>
+#include <tf2/transform_datatypes.hpp>
+#include <tf2/utils.hpp>
 
 #include <autoware_perception_msgs/msg/tracked_objects.hpp>
+#include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 
-#include <tf2/utils.h>
-
+#include <autoware_utils_math/normalization.hpp>
+#include <limits>
+#include <tf2/utils.hpp>
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <functional>
 #include <iterator>
-#include <limits>
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
-#include <unordered_map>
 #include <utility>
 #include <vector>
 
 namespace autoware::multi_object_tracker
 {
-using autoware_utils::ScopedTimeTrack;
-using Label = autoware_perception_msgs::msg::ObjectClassification;
-using LabelType = autoware_perception_msgs::msg::ObjectClassification::_label_type;
+using autoware_utils_debug::ScopedTimeTrack;
+
+namespace
+{
+// [nero trkup] NERO_MOT_REBIRTH: the car's isCarLikeVehicle
+bool neroCarLike(const classes::Label label)
+{
+  return label == classes::Label::CAR || label == classes::Label::TRUCK || label == classes::Label::BUS ||
+         label == classes::Label::TRAILER;
+}
+}  // namespace
 
 TrackerProcessor::TrackerProcessor(
-  const TrackerProcessorConfig & config, const AssociatorConfig & associator_config,
-  const std::vector<types::InputChannel> & channels_config)
-: config_(config), channels_config_(channels_config)
+  const TrackerConfigs & tracker_configs, const TrackerCreationConfig & creation_config,
+  const TrackerAssociationConfig & association_config,
+  const TrackerOverlapManagerConfig & tracker_overlap_manager_config,
+  const std::vector<types::InputChannel> & channels_config, const rclcpp::Logger & logger,
+  rclcpp::Clock::SharedPtr clock)
+: tracker_configs_(tracker_configs),
+  creation_config_(creation_config),
+  channels_config_(channels_config),
+  logger_(logger),
+  clock_(std::move(clock))
 {
-  association_ = std::make_unique<DataAssociation>(associator_config);
+  association_manager_ = std::make_unique<AssociationManager>(association_config, channels_config);
+  tracker_overlap_manager_ =
+    std::make_unique<TrackerOverlapManager>(tracker_overlap_manager_config);
+  nero_overlap_config_ = tracker_overlap_manager_config;
 
+  // [nero trkup] NERO_MOT_REBIRTH (unset = upstream)
   if (const char * env = std::getenv("NERO_MOT_REBIRTH"); env != nullptr && env[0] != '\0') {
     double v[4] = {2.0, 0.5, 3.0, 1.0};
     std::sscanf(env, "%lf,%lf,%lf,%lf", &v[0], &v[1], &v[2], &v[3]);
@@ -64,41 +89,23 @@ TrackerProcessor::TrackerProcessor(
     nero_rebirth_.max_dist = v[2];
     nero_rebirth_.max_pred_speed = v[3];
     RCLCPP_INFO(
-      rclcpp::get_logger("multi_object_tracker"),
-      "[NERO_MOT_REBIRTH] min_count %d margin %.2f max_dist %.2f max_pred_speed %.2f",
-      nero_rebirth_.min_count, nero_rebirth_.margin, nero_rebirth_.max_dist,
-      nero_rebirth_.max_pred_speed);
-  }
-  if (const char * env = std::getenv("NERO_MOT_FAST_BIRTH"); env != nullptr && env[0] != '\0') {
-    double v[8] = {2.0, 0.15, 0.0, 0.0, 180.0, -1.0, 1e9, 2.0};
-    std::sscanf(
-      env, "%lf,%lf,%lf,%lf,%lf,%lf,%lf,%lf", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5], &v[6], &v[7]);
-    nero_fast_birth_.iso_m = v[5];
-    nero_fast_birth_.far_m = v[6];
-    nero_fast_birth_.far_frames = std::max(1, static_cast<int>(v[7]));
-    nero_fast_birth_.vmin = v[3];
-    nero_fast_birth_.yaw_deg = v[4];
-    nero_fast_birth_.on = true;
-    nero_fast_birth_.frames = std::max(1, static_cast<int>(v[0]));
-    nero_fast_birth_.max_gap = v[1];
-    nero_fast_birth_.min_prob = v[2];
-    RCLCPP_INFO(
-      rclcpp::get_logger("multi_object_tracker"),
-      "[NERO_MOT_FAST_BIRTH] vehicle tracks published from %d distinct detection frames (last within %.2f s, "
-      "existence >= %.2f, measured boxes moving >= %.1f m/s within %.0f deg of their heading, no published vehicle "
-      "within half lengths + %.1f m, %d frames from %.0f m) before the stock count",
-      nero_fast_birth_.frames, nero_fast_birth_.max_gap, nero_fast_birth_.min_prob, nero_fast_birth_.vmin,
-      nero_fast_birth_.yaw_deg, nero_fast_birth_.iso_m, nero_fast_birth_.far_frames, nero_fast_birth_.far_m);
-  }
-  if (const char * env = std::getenv("NERO_MOT_DUP_FRESH"); env != nullptr && env[0] != '\0') {
-    nero_dup_fresh_ = std::atof(env);
-    RCLCPP_INFO(
-      rclcpp::get_logger("multi_object_tracker"), "[NERO_MOT_DUP_FRESH] fresh %.2f s",
-      nero_dup_fresh_);
+      logger_, "[NERO_MOT_REBIRTH] min_count %d margin %.2f max_dist %.2f max_pred_speed %.2f",
+      nero_rebirth_.min_count, nero_rebirth_.margin, nero_rebirth_.max_dist, nero_rebirth_.max_pred_speed);
   }
 }
 
-void TrackerProcessor::predict(const rclcpp::Time & time)
+std::optional<geometry_msgs::msg::Pose> TrackerProcessor::getEgoPose() const
+{
+  return ego_pose_ ? std::make_optional(ego_pose_->pose) : std::nullopt;
+}
+
+void TrackerProcessor::updateEgoPose(
+  const std::optional<geometry_msgs::msg::PoseStamped> & ego_pose_stamped)
+{
+  ego_pose_ = ego_pose_stamped;
+}
+
+void TrackerProcessor::predictTrackers(const rclcpp::Time & time)
 {
   std::unique_ptr<ScopedTimeTrack> st_ptr;
   if (time_keeper_) st_ptr = std::make_unique<ScopedTimeTrack>(__func__, *time_keeper_);
@@ -108,195 +115,244 @@ void TrackerProcessor::predict(const rclcpp::Time & time)
   }
 }
 
-void TrackerProcessor::associate(
-  const types::DynamicObjectList & detected_objects,
-  std::unordered_map<int, int> & direct_assignment,
-  std::unordered_map<int, int> & reverse_assignment) const
+types::AssociationResult TrackerProcessor::associate(
+  const types::DynamicObjectList & detected_objects) const
 {
   std::unique_ptr<ScopedTimeTrack> st_ptr;
   if (time_keeper_) st_ptr = std::make_unique<ScopedTimeTrack>(__func__, *time_keeper_);
 
-  const auto & tracker_list = list_tracker_;
-  // global nearest neighbor
-  Eigen::MatrixXd score_matrix = association_->calcScoreMatrix(
-    detected_objects, tracker_list);  // row : tracker, col : measurement
-  association_->assign(score_matrix, direct_assignment, reverse_assignment);
+  return association_manager_->associate(detected_objects, list_tracker_, ego_pose_);
 }
 
-void TrackerProcessor::update(
-  const types::DynamicObjectList & detected_objects,
-  const std::unordered_map<int, int> & direct_assignment)
+void TrackerProcessor::update(const types::AssociatedObjects & associated_objects)
 {
   std::unique_ptr<ScopedTimeTrack> st_ptr;
   if (time_keeper_) st_ptr = std::make_unique<ScopedTimeTrack>(__func__, *time_keeper_);
+
+  const auto & detected_objects = associated_objects.objects;
+  const auto & association_result = associated_objects.association;
 
   int tracker_idx = 0;
   const auto & time = detected_objects.header.stamp;
+  // [nero trkup] crossmover: the robot's position at this measurement time (the crossing mover's log line only)
+  if (nero::unknownMoverParams().cross && ego_pose_) {
+    nero::setEgo(ego_pose_->pose.position.x, ego_pose_->pose.position.y);
+  }
   for (auto tracker_itr = list_tracker_.begin(); tracker_itr != list_tracker_.end();
        ++tracker_itr, ++tracker_idx) {
-    if (direct_assignment.find(tracker_idx) != direct_assignment.end()) {
-      // found
-      const auto & associated_object =
-        detected_objects.objects.at(direct_assignment.find(tracker_idx)->second);
-      const types::InputChannel channel_info = channels_config_[associated_object.channel_index];
-      (*(tracker_itr))->updateWithMeasurement(associated_object, time, channel_info);
+    bool found = false;
+    size_t measurement_idx = 0;
+    unique_identifier_msgs::msg::UUID tracker_uuid = (*tracker_itr)->getUUID();
 
+    if (association_result.tracker_to_measurement.count(tracker_uuid)) {
+      unique_identifier_msgs::msg::UUID measurement_uuid =
+        association_result.tracker_to_measurement.at(tracker_uuid);
+      const auto idx = detected_objects.getObjectIndexByUuid(measurement_uuid);
+      if (idx) {
+        measurement_idx = *idx;
+        found = true;
+      }
+    }
+
+    if (found) {
+      const auto & associated_object = detected_objects.objects.at(measurement_idx);
+      const types::InputChannel channel_info = channels_config_[associated_object.channel_index];
+      const bool has_significant_shape_change = association_result.wasShapeChanged(tracker_uuid);
+      (*tracker_itr)
+        ->setEgoPose(ego_pose_ ? std::make_optional(ego_pose_->pose.position) : std::nullopt);
+      if (neroStillBoxParams().enabled && ego_pose_) {
+        // NERO_MOT_STILL_BOX: the robot's pose at this measurement
+        (*tracker_itr)->nero_sb_has_ego = true;
+        (*tracker_itr)->nero_sb_ego = {
+          ego_pose_->pose.position.x, ego_pose_->pose.position.y, tf2::getYaw(ego_pose_->pose.orientation)};
+      }
+      (*(tracker_itr))
+        ->updateWithMeasurement(
+          associated_object, time, channel_info, has_significant_shape_change);
+      // [nero trkup] NERO_MOT_REBIRTH: a successor's <min_count> counts its classification-trusted vehicle measurements
+      // (on the car only those reach a vehicle track; upstream also lets clusters and detection_by_tracker boxes in)
+      if (
+        (*tracker_itr)->nero_is_successor && channel_info.trust_classification &&
+        neroCarLike(classes::getHighestProbLabel(associated_object.classification))) {
+        ++(*tracker_itr)->nero_vehicle_count;
+      }
     } else {
-      // not found
       (*(tracker_itr))->updateWithoutMeasurement(time);
     }
   }
-  if (VehicleTracker::neroFlipDeferEnabled()) {
-    // NERO_MOT_FLIP_DEFER: a vehicle track judging a turn that is published from now on is shown by what the vehicle
-    // track already at its place does
-    for (const auto & tracker : list_tracker_) {
-      if (!isConfidentTracker(tracker)) continue;
-      double partner_vx = 0.0;
-      double partner_vy = 0.0;
-      const bool has_partner = tracker->neroJudgedUnpublished() &&
-                               neroFindPartner(tracker, time, partner_vx, partner_vy);
-      tracker->neroOnPublished(has_partner, partner_vx, partner_vy);
-    }
-  }
 }
 
-bool TrackerProcessor::neroFindPartner(
-  const std::shared_ptr<Tracker> & tracker, const rclcpp::Time & time, double & vx, double & vy) const
-{
-  // NERO_MOT_FLIP_DEFER: the nearest published vehicle track whose centre lies in this track's box (+ 0.5 m)
-  types::DynamicObject object;
-  if (
-    !tracker->getTrackedObject(time, object) ||
-    object.shape.type != autoware_perception_msgs::msg::Shape::BOUNDING_BOX) {
-    return false;
-  }
-  const double yaw = tf2::getYaw(object.pose.orientation);
-  const double half_l = 0.5 * object.shape.dimensions.x + 0.5;
-  const double half_w = 0.5 * object.shape.dimensions.y + 0.5;
-  double best = std::numeric_limits<double>::max();
-  for (const auto & candidate : list_tracker_) {
-    if (
-      candidate == tracker ||
-      !autoware::object_recognition_utils::isCarLikeVehicle(candidate->getHighestProbLabel()) ||
-      candidate->neroJudgedUnpublished() || !isConfidentTracker(candidate)) {
-      continue;
-    }
-    types::DynamicObject other;
-    if (!candidate->getTrackedObject(time, other)) continue;
-    const double dx = other.pose.position.x - object.pose.position.x;
-    const double dy = other.pose.position.y - object.pose.position.y;
-    if (
-      std::abs(dx * std::cos(yaw) + dy * std::sin(yaw)) > half_l ||
-      std::abs(-dx * std::sin(yaw) + dy * std::cos(yaw)) > half_w) {
-      continue;
-    }
-    const double dist = std::hypot(dx, dy);
-    if (dist >= best) continue;
-    best = dist;
-    const double other_yaw = tf2::getYaw(other.pose.orientation);
-    vx = other.twist.linear.x * std::cos(other_yaw) - other.twist.linear.y * std::sin(other_yaw);
-    vy = other.twist.linear.x * std::sin(other_yaw) + other.twist.linear.y * std::cos(other_yaw);
-  }
-  return best < std::numeric_limits<double>::max();
-}
-
-void TrackerProcessor::spawn(
-  const types::DynamicObjectList & detected_objects,
-  const std::unordered_map<int, int> & reverse_assignment)
+void TrackerProcessor::spawn(const types::AssociatedObjects & associated_objects)
 {
   std::unique_ptr<ScopedTimeTrack> st_ptr;
   if (time_keeper_) st_ptr = std::make_unique<ScopedTimeTrack>(__func__, *time_keeper_);
 
+  const auto & detected_objects = associated_objects.objects;
+  const auto & association_result = associated_objects.association;
+
   const auto channel_config = channels_config_[detected_objects.channel_index];
-  // If spawn is disabled, return
   if (!channel_config.is_spawn_enabled) {
     return;
   }
 
-  // Spawn new trackers for the objects that are not associated
   const auto & time = detected_objects.header.stamp;
+  const bool nero_mover = nero::unknownMoverParams().enabled;
   for (size_t i = 0; i < detected_objects.objects.size(); ++i) {
-    if (reverse_assignment.find(i) != reverse_assignment.end()) {  // found
-      continue;
-    }
     const auto & new_object = detected_objects.objects.at(i);
-    // NERO_MOT_UNKNOWN_MOVER: the measurement continues a mover's line: that track takes it
-    if (
-      UnknownTracker::neroMoverEnabled() &&
-      neroMoverLink(new_object, channels_config_[new_object.channel_index], time)) {
+    if (association_result.measurement_to_tracker.count(new_object.uuid)) {
       continue;
     }
+    // [nero trkup] NERO_MOT_UNKNOWN_MOVER: the measurement continues a mover's line: that track takes it
+    if (nero_mover && neroMoverLink(new_object, channels_config_[new_object.channel_index], time)) {
+      continue;
+    }
+    // [nero trkup] NERO_MOT_REBIRTH: a vehicle measurement on an UNKNOWN track's object continues that object
     std::shared_ptr<Tracker> predecessor;
     types::DynamicObject seeded_object;
     if (nero_rebirth_.enabled) {
       predecessor = neroFindPredecessor(new_object, channel_config, time, seeded_object);
     }
-    std::shared_ptr<Tracker> tracker = createNewTracker(predecessor ? seeded_object : new_object, time);
-    if (predecessor && UnknownTracker::neroMoverEnabled()) {
+    std::shared_ptr<Tracker> tracker =
+      createNewTracker(predecessor ? seeded_object : new_object, time);
+    if (!tracker) continue;  // null combo: (shape, label) not accepted
+    if (predecessor && nero_mover) {
       types::DynamicObject unknown;
       if (
-        predecessor->getTrackedObject(time, unknown) &&
+        predecessor->getTrackedObject(time, unknown, true) &&
         std::hypot(unknown.twist.linear.x, unknown.twist.linear.y) > nero_rebirth_.max_pred_speed) {
-        const auto & u = tracker->getUUID().uuid;
-        const auto & p = predecessor->getUUID().uuid;
+        const auto u = tracker->getUUID().uuid;
+        const auto p = predecessor->neroPubUUID().uuid;
         RCLCPP_INFO(
-          rclcpp::get_logger("multi_object_tracker"),
+          logger_,
           "[NERO_MOT_UNKNOWN_MOVER] vehicle track %02x%02x%02x%02x continues moving UNKNOWN %02x%02x%02x%02x at "
           "(%.1f, %.1f), %.1f m/s",
           u[0], u[1], u[2], u[3], p[0], p[1], p[2], p[3], unknown.pose.position.x, unknown.pose.position.y,
           std::hypot(unknown.twist.linear.x, unknown.twist.linear.y));
       }
     }
-    if (!predecessor && UnknownTracker::neroMoverEnabled()) {
-      // NERO_MOT_UNKNOWN_MOVER: a new UNKNOWN track that continues a young track the gates lost takes over its
-      // measured positions
-      if (const auto unknown = std::dynamic_pointer_cast<UnknownTracker>(tracker)) {
-        neroMoverInherit(unknown, new_object, time);
+    if (!predecessor && nero_mover) {
+      // [nero trkup] NERO_MOT_UNKNOWN_MOVER: a new UNKNOWN track that continues a young track the gates lost takes over
+      // its measured positions
+      if (const auto polygon = std::dynamic_pointer_cast<PolygonTracker>(tracker)) {
+        if (polygon->neroOn() && polygon->getHighestProbLabel() == classes::Label::UNKNOWN) {
+          neroMoverInherit(polygon, new_object, time);
+        }
       }
     }
     if (predecessor) {
       predecessor->nero_successor = tracker;
       tracker->nero_is_successor = true;
+      tracker->nero_min_count = nero_rebirth_.min_count;
+      tracker->nero_vehicle_count = 1;  // the vehicle measurement that started it
       tracker->nero_predecessor = predecessor;
-      tracker->nero_predecessor_uuid = predecessor->getUUID();
-      tracker->nero_predecessor_count = predecessor->getTotalMeasurementCount();
+      tracker->nero_predecessor_uuid = predecessor->neroPubUUID();
+      tracker->nero_predecessor_confident =
+        predecessor->isConfident(adaptive_threshold_cache_, getEgoPose(), std::nullopt);
     }
 
-    // Initialize existence probabilities
     if (channel_config.trust_existence_probability) {
       tracker->initializeExistenceProbabilities(
         new_object.channel_index, new_object.existence_probability);
     } else {
-      tracker->initializeExistenceProbabilities(new_object.channel_index, 0.5);
+      tracker->initializeExistenceProbabilities(
+        new_object.channel_index, types::default_existence_probability);
     }
 
-    // Update the tracker with the new object
+    if (neroStillBoxParams().enabled) neroStillBoxBirth(tracker, new_object, time);
     list_tracker_.push_back(tracker);
+  }
+}
+
+void TrackerProcessor::neroStillBoxBirth(
+  const std::shared_ptr<Tracker> & tracker, const types::DynamicObject & object, const rclcpp::Time & time) const
+{
+  // NERO_MOT_STILL_BOX (birth branch on upstream): a new vehicle track whose box holds the last outline (measured within
+  // t_birth) of a standing UNKNOWN track (published speed <= v_birth) takes that outline as its predecessor's
+  const auto & p = neroStillBoxParams();
+  const auto label = tracker->getHighestProbLabel();
+  if (
+    label != classes::Label::CAR && label != classes::Label::TRUCK && label != classes::Label::BUS &&
+    label != classes::Label::TRAILER) {
+    return;
+  }
+  const double t = time.seconds();
+  const double psi = tf2::getYaw(object.pose.orientation);
+  const double L = object.shape.dimensions.x;
+  const double W = object.shape.dimensions.y;
+  tracker->nero_sb_birth_t = t;
+  double best = std::numeric_limits<double>::max();
+  for (const auto & other : list_tracker_) {
+    if (other->getHighestProbLabel() != classes::Label::UNKNOWN) continue;
+    if (other->nero_sb_outline_t < 0.0 || t - other->nero_sb_outline_t > p.t_birth) continue;
+    const auto & poly = other->nero_sb_outline;
+    double cx = 0.0, cy = 0.0;
+    for (const auto & q : poly) {
+      cx += q[0];
+      cy += q[1];
+    }
+    cx = cx / poly.size() - object.pose.position.x;
+    cy = cy / poly.size() - object.pose.position.y;
+    const double u = cx * std::cos(psi) + cy * std::sin(psi);
+    const double w = -cx * std::sin(psi) + cy * std::cos(psi);
+    if (std::fabs(u) > 0.5 * L + 0.5 || std::fabs(w) > 0.5 * W + 0.5) continue;
+    geometry_msgs::msg::Pose pose;
+    std::array<double, 36> cov{};
+    geometry_msgs::msg::Twist twist;
+    if (!other->getMotionState(time, pose, cov, twist, cov)) continue;
+    if (std::hypot(twist.linear.x, twist.linear.y) > p.v_birth) continue;
+    const double d = std::hypot(u, w);
+    if (d < best) {
+      best = d;
+      tracker->nero_sb_pred_outline = poly;
+      tracker->nero_sb_pred_outline_t = other->nero_sb_outline_t;
+    }
   }
 }
 
 std::shared_ptr<Tracker> TrackerProcessor::createNewTracker(
   const types::DynamicObject & object, const rclcpp::Time & time) const
 {
-  const LabelType label =
-    autoware::object_recognition_utils::getHighestProbLabel(object.classification);
-  if (config_.tracker_map.count(label) != 0) {
-    const auto tracker = config_.tracker_map.at(label);
-    if (tracker == "bicycle_tracker")
-      return std::make_shared<VehicleTracker>(object_model::bicycle, time, object);
-    if (tracker == "big_vehicle_tracker")
-      return std::make_shared<VehicleTracker>(object_model::big_vehicle, time, object);
-    if (tracker == "multi_vehicle_tracker")
-      return std::make_shared<MultipleVehicleTracker>(time, object);
-    if (tracker == "normal_vehicle_tracker")
-      return std::make_shared<VehicleTracker>(object_model::normal_vehicle, time, object);
-    if (tracker == "pass_through_tracker")
-      return std::make_shared<PassThroughTracker>(time, object);
-    if (tracker == "pedestrian_and_bicycle_tracker")
-      return std::make_shared<PedestrianAndBicycleTracker>(time, object);
-    if (tracker == "pedestrian_tracker") return std::make_shared<PedestrianTracker>(time, object);
+  const classes::Label label = classes::getHighestProbLabel(object.classification);
+  const ShapeLabelKey key{types::toShapeType(object.shape.type), label};
+
+  const auto tracker_type_opt = get_map_value_if_exists(creation_config_.shape_tracker_map, key);
+
+  if (tracker_type_opt) {
+    switch (tracker_type_opt->get()) {
+      case types::TrackerType::MULTIPLE_VEHICLE:
+        return std::make_shared<MultipleVehicleTracker>(time, object);
+      case types::TrackerType::GENERAL_VEHICLE:
+        return std::make_shared<VehicleTracker>(object_model::general_vehicle, time, object);
+      case types::TrackerType::PEDESTRIAN_AND_BICYCLE:
+        return std::make_shared<PedestrianAndBicycleTracker>(time, object);
+      case types::TrackerType::NORMAL_VEHICLE:
+        return std::make_shared<VehicleTracker>(object_model::normal_vehicle, time, object);
+      case types::TrackerType::PEDESTRIAN:
+        return std::make_shared<PedestrianTracker>(time, object);
+      case types::TrackerType::BICYCLE:
+        return std::make_shared<VehicleTracker>(object_model::bicycle, time, object);
+      case types::TrackerType::BIG_VEHICLE:
+        return std::make_shared<VehicleTracker>(object_model::big_vehicle, time, object);
+      case types::TrackerType::STATIC:
+        return std::make_shared<StaticTracker>(time, object, tracker_configs_.static_tracker);
+      case types::TrackerType::POLYGON:
+        return std::make_shared<PolygonTracker>(time, object, tracker_configs_.polygon_tracker);
+      default:
+        return std::make_shared<PolygonTracker>(time, object, tracker_configs_.polygon_tracker);
+    }
   }
-  return std::make_shared<UnknownTracker>(time, object);
+
+  if (creation_config_.explicit_null_combos.count(key)) {
+    return nullptr;  // create: "null" — explicitly not accepted, silently skip
+  }
+
+  // implicitly omitted — not listed in tracker_assignment; error periodically
+  RCLCPP_ERROR_THROTTLE(
+    logger_, *clock_, 1000,
+    "Received detection with unspecified tracker_assignment combination: shape=%s label=%s. "
+    "Add an explicit entry (or create: \"null\") to suppress this error.",
+    types::toString(key.first).c_str(), classes::toString(key.second).c_str());
+  return nullptr;
 }
 
 void TrackerProcessor::prune(const rclcpp::Time & time)
@@ -304,320 +360,23 @@ void TrackerProcessor::prune(const rclcpp::Time & time)
   std::unique_ptr<ScopedTimeTrack> st_ptr;
   if (time_keeper_) st_ptr = std::make_unique<ScopedTimeTrack>(__func__, *time_keeper_);
 
-  // Check tracker lifetime: if the tracker is old, delete it
+  // Minimum spacing between prune cycles; a call at an unchanged or earlier measurement time is
+  // skipped.
+  constexpr int64_t min_prune_interval_ns = 2 * 1000 * 1000;  // 2 ms
+  if (time.nanoseconds() - last_prune_time_.nanoseconds() < min_prune_interval_ns) {
+    // [nero trkup] NERO_MOT_REBIRTH: the hand-over runs after every message, as on the car (a frame's
+    // detection_by_tracker message shares its stamp and can confirm a successor)
+    if (nero_rebirth_.enabled) neroHandOver(time);
+    return;
+  }
+
   removeOldTracker(time);
-  // Check tracker overlap: if the tracker is overlapped, delete the one with lower IOU
-  removeOverlappedTracker(time);
+  tracker_overlap_manager_->merge(list_tracker_, time, adaptive_threshold_cache_, getEgoPose());
   if (nero_rebirth_.enabled) {
-    neroHandOver(time);
+    neroHandOver(time);  // [nero trkup] NERO_MOT_REBIRTH
   }
-}
 
-std::shared_ptr<Tracker> TrackerProcessor::neroFindPredecessor(
-  const types::DynamicObject & measurement, const types::InputChannel & channel,
-  const rclcpp::Time & time, types::DynamicObject & seeded_measurement) const
-{
-  // only a classification-trusted vehicle measurement continues an UNKNOWN track
-  const auto label = autoware::object_recognition_utils::getHighestProbLabel(measurement.classification);
-  if (
-    !channel.trust_classification ||
-    !autoware::object_recognition_utils::isCarLikeVehicle(label) ||
-    measurement.shape.type != autoware_perception_msgs::msg::Shape::BOUNDING_BOX) {
-    return nullptr;
-  }
-  const double myaw = tf2::getYaw(measurement.pose.orientation);
-  const double half_l = 0.5 * measurement.shape.dimensions.x + nero_rebirth_.margin;
-  const double half_w = 0.5 * measurement.shape.dimensions.y + nero_rebirth_.margin;
-  std::shared_ptr<Tracker> best;
-  types::DynamicObject best_object;
-  for (const auto & candidate : list_tracker_) {
-    if (!autoware::object_recognition_utils::isCarLikeVehicle(candidate->getHighestProbLabel())) {
-      continue;
-    }
-    // a vehicle track already covers the place: the UNKNOWN there is its fragment, not a new object
-    types::DynamicObject object;
-    if (!candidate->getTrackedObject(time, object)) continue;
-    const double dx = object.pose.position.x - measurement.pose.position.x;
-    const double dy = object.pose.position.y - measurement.pose.position.y;
-    if (
-      std::abs(dx * std::cos(myaw) + dy * std::sin(myaw)) <= half_l &&
-      std::abs(-dx * std::sin(myaw) + dy * std::cos(myaw)) <= half_w) {
-      return nullptr;
-    }
-  }
-  for (const auto & candidate : list_tracker_) {
-    if (
-      !candidate->nero_successor.expired() || candidate->getHighestProbLabel() != Label::UNKNOWN) {
-      continue;
-    }
-    types::DynamicObject object;
-    if (!candidate->getTrackedObject(time, object)) continue;
-    if (
-      std::hypot(object.twist.linear.x, object.twist.linear.y) > nero_rebirth_.max_pred_speed &&
-      !(UnknownTracker::neroMoverEnabled() && neroMoverAlong(candidate, time, myaw)) &&
-      !(UnknownTracker::neroCrossEnabled() && neroMoverMadeAlong(candidate, object, time, myaw))) {
-      // a moving UNKNOWN keeps today's handling (NERO_MOT_UNKNOWN_MOVER: unless a mover along the box; crossmover c3:
-      // or one the mover rule made fast along it)
-      continue;
-    }
-    // the UNKNOWN track's centre inside the vehicle box (+ margin): the same object
-    if (!neroCovers(measurement, object)) continue;
-    if (!best || candidate->getTotalMeasurementCount() > best->getTotalMeasurementCount()) {
-      best = candidate;
-      best_object = object;
-    }
-  }
-  if (!best) return nullptr;
-  // the vehicle track's motion starts from the UNKNOWN track's (what is published for the object today), not from
-  // the centre motion of its first boxes
-  using autoware_utils::xyzrpy_covariance_index::XYZRPY_COV_IDX;
-  const double uyaw = tf2::getYaw(best_object.pose.orientation);
-  double vx = std::cos(uyaw) * best_object.twist.linear.x - std::sin(uyaw) * best_object.twist.linear.y;
-  double vy = std::sin(uyaw) * best_object.twist.linear.x + std::cos(uyaw) * best_object.twist.linear.y;
-  // NERO_MOT_UNKNOWN_MOVER: a mover hands over the velocity its measured positions show (sigma 2 m/s: the vehicle
-  // track's own boxes take over quickly)
-  bool mover = false;
-  if (UnknownTracker::neroMoverEnabled() && std::hypot(vx, vy) > nero_rebirth_.max_pred_speed) {
-    const auto unknown = std::dynamic_pointer_cast<UnknownTracker>(best);
-    if (unknown) {
-      // crossmover c3: a crossing mover's line counts from the first of its consecutive start tests (as long as an
-      // oncoming mover's from its start: neroMoverAlong's 0.15 s)
-      if (
-        !UnknownTracker::neroCrossEnabled() || neroMoverAlong(best, time, myaw) ||
-        unknown->neroCrossHeld(time) >= 0.15) {
-        unknown->neroMoverLine(vx, vy);
-        mover = true;
-      } else {
-        // crossmover c3: a crossing mover too young for the hand-over, or one whose line just ended (it may have
-        // stopped): the vehicle track starts exactly as the stock rule starts it (from its own box); only the object's
-        // uuid and its publication until that track is confident come from the UNKNOWN
-        seeded_measurement = measurement;
-        return best;
-      }
-    }
-  }
-  seeded_measurement = measurement;
-  // NERO_MOT_UNKNOWN_MOVER: a mover's vehicle box heads the way it moves (the box's sign is not known)
-  double syaw = myaw;
-  if (mover && vx * std::cos(myaw) + vy * std::sin(myaw) < 0.0) {
-    syaw = autoware_utils::normalize_radian(myaw + M_PI);
-    seeded_measurement.pose.orientation = autoware_utils::create_quaternion_from_yaw(syaw);
-  }
-  seeded_measurement.kinematics.has_twist = true;
-  seeded_measurement.twist.linear.x = vx * std::cos(syaw) + vy * std::sin(syaw);
-  seeded_measurement.twist.linear.y = 0.0;
-  seeded_measurement.kinematics.has_twist_covariance = true;
-  seeded_measurement.twist_covariance[XYZRPY_COV_IDX::X_X] = std::max(
-    mover ? 4.0 : 0.25, best_object.twist_covariance[XYZRPY_COV_IDX::X_X] +
-                          best_object.twist_covariance[XYZRPY_COV_IDX::Y_Y]);
-  return best;
-}
-
-bool TrackerProcessor::neroMoverMadeFast(
-  const std::shared_ptr<Tracker> & tracker, const types::DynamicObject & object, const rclcpp::Time & time) const
-{
-  if (std::hypot(object.twist.linear.x, object.twist.linear.y) <= nero_rebirth_.max_pred_speed) return false;
-  const auto unknown = std::dynamic_pointer_cast<UnknownTracker>(tracker);
-  return unknown && unknown->neroMoverRecent(time);
-}
-
-bool TrackerProcessor::neroMoverMadeAlong(
-  const std::shared_ptr<Tracker> & tracker, const types::DynamicObject & object, const rclcpp::Time & time,
-  const double box_yaw) const
-{
-  if (!neroMoverMadeFast(tracker, object, time)) return false;
-  // the published motion (map frame) within 30 deg of the box's axis, either way (as neroMoverAlong)
-  const double uyaw = tf2::getYaw(object.pose.orientation);
-  const double vx = std::cos(uyaw) * object.twist.linear.x - std::sin(uyaw) * object.twist.linear.y;
-  const double vy = std::sin(uyaw) * object.twist.linear.x + std::cos(uyaw) * object.twist.linear.y;
-  constexpr double max_angle = 30.0 * M_PI / 180.0;
-  const double angle = std::abs(autoware_utils::normalize_radian(std::atan2(vy, vx) - box_yaw));
-  return angle <= max_angle || angle >= M_PI - max_angle;
-}
-
-bool TrackerProcessor::neroMoverLink(
-  const types::DynamicObject & measurement, const types::InputChannel & channel, const rclcpp::Time & time)
-{
-  if (
-    autoware::object_recognition_utils::getHighestProbLabel(measurement.classification) !=
-    Label::UNKNOWN) {
-    return false;
-  }
-  std::shared_ptr<Tracker> best;
-  for (const auto & candidate : list_tracker_) {
-    if (candidate->getHighestProbLabel() != Label::UNKNOWN) continue;
-    // a track that took a measurement this cycle has its object
-    const double elapsed = candidate->getElapsedTimeFromLastUpdate(time);
-    if (elapsed < 1e-3) continue;
-    const auto unknown = std::dynamic_pointer_cast<UnknownTracker>(candidate);
-    if (!unknown) continue;
-    if (!unknown->neroMoverContinues(time, measurement)) {
-      continue;
-    }
-    if (!best || candidate->getTotalMeasurementCount() > best->getTotalMeasurementCount()) {
-      best = candidate;
-    }
-  }
-  if (!best) return false;
-  best->updateWithMeasurement(measurement, time, channel);
-  return true;
-}
-
-void TrackerProcessor::neroMoverInherit(
-  const std::shared_ptr<UnknownTracker> & newborn, const types::DynamicObject & measurement,
-  const rclcpp::Time & time)
-{
-  std::shared_ptr<UnknownTracker> best;
-  int best_n = 0;
-  for (const auto & candidate : list_tracker_) {
-    if (candidate->getHighestProbLabel() != Label::UNKNOWN) continue;
-    if (candidate->getElapsedTimeFromLastUpdate(time) < 1e-3) continue;  // measured this cycle
-    const auto unknown = std::dynamic_pointer_cast<UnknownTracker>(candidate);
-    if (!unknown) continue;
-    const int n = unknown->neroInheritable(time, *newborn);
-    if (n > best_n) {
-      best = unknown;
-      best_n = n;
-    }
-  }
-  if (best) newborn->neroInheritFrom(*best, time, measurement);
-}
-
-bool TrackerProcessor::neroMoverAlong(
-  const std::shared_ptr<Tracker> & tracker, const rclcpp::Time & time, const double box_yaw) const
-{
-  const auto unknown = std::dynamic_pointer_cast<UnknownTracker>(tracker);
-  double vx = 0.0;
-  double vy = 0.0;
-  if (!unknown || !unknown->neroMover(time, vx, vy)) return false;
-  // only a mover that has held its line >= 0.15 s (two measurement times after its start): 10-27 20:28:48.9 a
-  // 0.1 s line made from a passing car's fragment gave its 7.4 m/s to a standing vehicle's new box; the 18 real
-  // hand-overs of the drive had held theirs 0.2-5.2 s
-  constexpr double min_age = 0.15;
-  if (unknown->neroMoverAge(time) < min_age) return false;
-  // within 30 deg of the box's axis, either way
-  constexpr double max_angle = 30.0 * M_PI / 180.0;
-  const double angle = std::abs(autoware_utils::normalize_radian(std::atan2(vy, vx) - box_yaw));
-  return angle <= max_angle || angle >= M_PI - max_angle;
-}
-
-bool TrackerProcessor::neroCovers(
-  const types::DynamicObject & vehicle, const types::DynamicObject & unknown) const
-{
-  const double dx = unknown.pose.position.x - vehicle.pose.position.x;
-  const double dy = unknown.pose.position.y - vehicle.pose.position.y;
-  if (std::hypot(dx, dy) > nero_rebirth_.max_dist) return false;
-  const double yaw = tf2::getYaw(vehicle.pose.orientation);
-  return std::abs(dx * std::cos(yaw) + dy * std::sin(yaw)) <=
-           0.5 * vehicle.shape.dimensions.x + nero_rebirth_.margin &&
-         std::abs(-dx * std::sin(yaw) + dy * std::cos(yaw)) <=
-           0.5 * vehicle.shape.dimensions.y + nero_rebirth_.margin;
-}
-
-bool TrackerProcessor::neroStockRemoves(
-  const std::shared_ptr<Tracker> & vehicle_tracker, const std::shared_ptr<Tracker> & unknown_tracker,
-  const rclcpp::Time & time) const
-{
-  // removeOverlappedTracker's rule for an UNKNOWN track overlapping a vehicle track
-  types::DynamicObject vehicle;
-  types::DynamicObject unknown;
-  if (
-    !vehicle_tracker->getTrackedObject(time, vehicle) ||
-    !unknown_tracker->getTrackedObject(time, unknown)) {
-    return false;
-  }
-  const double distance = std::hypot(
-    vehicle.pose.position.x - unknown.pose.position.x,
-    vehicle.pose.position.y - unknown.pose.position.y);
-  if (
-    distance > config_.max_dist_matrix(Label::UNKNOWN, vehicle_tracker->getHighestProbLabel())) {
-    return false;
-  }
-  constexpr double min_union_iou_area = 1e-2;
-  return shapes::get2dIoU(vehicle, unknown, min_union_iou_area) >
-           config_.min_unknown_object_removal_iou &&
-         vehicle_tracker->getElapsedTimeFromLastUpdate(time) <=
-           unknown_tracker->getElapsedTimeFromLastUpdate(time);
-}
-
-bool TrackerProcessor::neroHidden(
-  const std::shared_ptr<Tracker> & tracker, const rclcpp::Time & time) const
-{
-  (void)time;
-  const auto successor = tracker->nero_successor.lock();
-  if (!successor || !successor->nero_handed_over || tracker->nero_removed_at_count < 0) {
-    return false;
-  }
-  // a stock track removed there would be published again after confident_count_threshold new measurements
-  return tracker->getTotalMeasurementCount() - tracker->nero_removed_at_count <
-         config_.confident_count_threshold.at(Label::UNKNOWN);
-}
-
-void TrackerProcessor::neroHandOver(const rclcpp::Time & time)
-{
-  for (const auto & tracker : list_tracker_) {
-    // an UNKNOWN track whose vehicle successor died publishes the object under its uuid again
-    if (
-      tracker->nero_handed_over_to && tracker->nero_successor.expired() &&
-      tracker->getUUID() != tracker->nero_own_uuid) {
-      tracker->setUUID(tracker->nero_own_uuid);
-    }
-    if (!tracker->nero_is_successor) continue;
-    const auto predecessor = tracker->nero_predecessor.lock();
-    if (predecessor) {
-      types::DynamicObject vehicle;
-      types::DynamicObject unknown;
-      const bool unknown_ok =
-        tracker->getTrackedObject(time, vehicle) && predecessor->getTrackedObject(time, unknown);
-      bool covered = unknown_ok && neroCovers(vehicle, unknown);
-      // crossmover c3: an UNKNOWN that turned into a crossing mover after its vehicle successor took it over runs ahead
-      // of the successor's slower start on its line's velocity: the link also holds while the cluster MEASURED last is
-      // inside the vehicle box (10-27 20:32:58.8: a 6.6 m/s crosser left its truck box unpublished). c3e: ALSO, not
-      // instead: a crossing mover's last cluster stays behind while its vehicle box moves on (20:32:27.7 / 23.9: the
-      // link broke before the vehicle's 2nd box and the crosser was never published as a vehicle)
-      if (unknown_ok && !covered && UnknownTracker::neroCrossEnabled()) {
-        const auto u = std::dynamic_pointer_cast<UnknownTracker>(predecessor);
-        double mx = 0.0;
-        double my = 0.0;
-        if (u && u->neroMoverRecent(time) && u->neroLastMeasured(mx, my)) {
-          unknown.pose.position.x = mx;
-          unknown.pose.position.y = my;
-          covered = neroCovers(vehicle, unknown);
-        }
-      }
-      if (unknown_ok && !covered) {
-        // the vehicle track left the UNKNOWN track's object: two objects from now on
-        predecessor->nero_successor.reset();
-        predecessor->nero_handed_over_to = false;
-        predecessor->nero_removed_at_count = -1;
-        tracker->nero_predecessor.reset();
-        if (!tracker->nero_handed_over) tracker->nero_is_successor = false;
-        continue;
-      }
-    }
-    if (tracker->nero_handed_over) {
-      if (predecessor && neroStockRemoves(tracker, predecessor, time)) {
-        predecessor->nero_removed_at_count = predecessor->getTotalMeasurementCount();
-      }
-      continue;
-    }
-    if (predecessor) {
-      tracker->nero_predecessor_count = predecessor->getTotalMeasurementCount();
-    }
-    if (!isConfidentTracker(tracker)) continue;
-    // the vehicle track publishes the object under its uuid; the UNKNOWN track goes on under the vehicle track's
-    // (never published) uuid, hidden where the stock overlap rule would have removed it (neroHidden)
-    const auto vehicle_uuid = tracker->getUUID();
-    tracker->setUUID(tracker->nero_predecessor_uuid);
-    tracker->nero_handed_over = true;
-    if (predecessor) {
-      predecessor->nero_own_uuid = tracker->nero_predecessor_uuid;
-      predecessor->setUUID(vehicle_uuid);
-      predecessor->nero_handed_over_to = true;
-      predecessor->nero_removed_at_count =
-        neroStockRemoves(tracker, predecessor, time) ? predecessor->getTotalMeasurementCount() : -1;
-    }
-  }
+  last_prune_time_ = time;
 }
 
 void TrackerProcessor::neroStillBox(
@@ -625,17 +384,18 @@ void TrackerProcessor::neroStillBox(
 {
   // NERO_MOT_STILL_BOX (boxyaw): nero_still_box.hpp
   const auto & p = neroStillBoxParams();
-  const uint8_t label = tracker->getHighestProbLabel();
+  const auto label = tracker->getHighestProbLabel();
   if (
-    (label != Label::CAR && label != Label::TRUCK && label != Label::BUS && label != Label::TRAILER) ||
+    (label != classes::Label::CAR && label != classes::Label::TRUCK && label != classes::Label::BUS &&
+     label != classes::Label::TRAILER) ||
     object.shape.type != autoware_perception_msgs::msg::Shape::BOUNDING_BOX) {
     return;
   }
   const double t = time.seconds();
   const double v = std::hypot(object.twist.linear.x, object.twist.linear.y);
-  const auto predecessor = std::dynamic_pointer_cast<UnknownTracker>(tracker->nero_predecessor.lock());
-  const bool birth = tracker->nero_is_successor && predecessor && !predecessor->neroIsMover() &&
-                     t - tracker->nero_first_t.seconds() <= p.t_birth && v <= p.v_birth;
+  // the car's REBIRTH birth branch: on upstream the standing UNKNOWN track the vehicle track was born on (spawn: its last
+  // outline inside the new box) gives its outline for the birth window
+  const bool birth = tracker->nero_sb_pred_outline_t >= 0.0 && t - tracker->nero_sb_birth_t <= p.t_birth && v <= p.v_birth;
   if (v > p.v_still && !birth) return;  // a moving vehicle: as today
 
   const double psi = tf2::getYaw(object.pose.orientation);
@@ -644,7 +404,7 @@ void TrackerProcessor::neroStillBox(
   if (L < p.min_length) return;  // a box shorter than min_length: as today
   // the heading difference folded within +-90 deg (the box's sign is kept)
   const auto fold = [psi](const double a) {
-    double d = autoware_utils::normalize_radian(a - psi);
+    double d = autoware_utils_math::normalize_radian(a - psi);
     if (d > M_PI_2) d -= M_PI;
     if (d < -M_PI_2) d += M_PI;
     return d;
@@ -664,10 +424,10 @@ void TrackerProcessor::neroStillBox(
   const std::vector<std::array<double, 2>> * outline = nullptr;
   {
     // a measured outline: this track's own, else (birth) its standing predecessor's
-    const Tracker * owners[2] = {tracker.get(), birth ? predecessor.get() : nullptr};
-    for (const Tracker * owner : owners) {
-      if (owner == nullptr || owner->nero_sb_outline_t < 0.0 || t - owner->nero_sb_outline_t > p.t_fresh) continue;
-      const auto & poly = owner->nero_sb_outline;
+    for (int owner = 0; owner < 2; ++owner) {
+      const double poly_t = owner == 0 ? tracker->nero_sb_outline_t : (birth ? tracker->nero_sb_pred_outline_t : -1.0);
+      if (poly_t < 0.0 || t - poly_t > p.t_fresh) continue;
+      const auto & poly = owner == 0 ? tracker->nero_sb_outline : tracker->nero_sb_pred_outline;
       double best = p.min_edge_ratio * L;
       bool found = false;
       double d_best = 0.0;
@@ -795,8 +555,20 @@ void TrackerProcessor::neroStillBox(
       id[0], id[1], id[2], id[3], t, src, birth && v > p.v_still ? " (birth)" : "", v, psi * 180.0 / M_PI,
       phi * 180.0 / M_PI, L, W, new_l, new_w, um, vm);
   }
-  object.pose.position.x = x0 + um * c - vm * s;
-  object.pose.position.y = y0 + um * s + vm * c;
+  const double nx = x0 + um * c - vm * s;
+  const double ny = y0 + um * s + vm * c;
+  {
+    // a footprint the box carries (object frame) stays where it was in the map: re-expressed in the new box frame
+    const double c0 = std::cos(psi), s0 = std::sin(psi);
+    for (auto & q : object.shape.footprint.points) {
+      const double mx = x0 + q.x * c0 - q.y * s0 - nx;
+      const double my = y0 + q.x * s0 + q.y * c0 - ny;
+      q.x = static_cast<float>(mx * c + my * s);
+      q.y = static_cast<float>(-mx * s + my * c);
+    }
+  }
+  object.pose.position.x = nx;
+  object.pose.position.y = ny;
   // the vehicle models publish a yaw-only orientation (bicycle model)
   object.pose.orientation.x = 0.0;
   object.pose.orientation.y = 0.0;
@@ -811,233 +583,13 @@ void TrackerProcessor::removeOldTracker(const rclcpp::Time & time)
   std::unique_ptr<ScopedTimeTrack> st_ptr;
   if (time_keeper_) st_ptr = std::make_unique<ScopedTimeTrack>(__func__, *time_keeper_);
 
-  // Check elapsed time from last update
   for (auto itr = list_tracker_.begin(); itr != list_tracker_.end(); ++itr) {
-    const bool is_old = config_.tracker_lifetime < (*itr)->getElapsedTimeFromLastUpdate(time);
-    // If the tracker is old, delete it
-    if (is_old) {
+    if ((*itr)->isExpired(time, adaptive_threshold_cache_, getEgoPose())) {
       auto erase_itr = itr;
       --itr;
       list_tracker_.erase(erase_itr);
     }
   }
-}
-
-// NERO flatos (NERO_MOT_SPAWN_PRUNE): removes the UNKNOWN trackers just spawned from a measurement whose centre lies
-// inside a live moving vehicle track's box at that measurement's time (a piece of that vehicle)
-std::vector<std::shared_ptr<Tracker>> TrackerProcessor::removeSpawnedUnknownOverlapped(
-  const rclcpp::Time & time, const std::vector<std::shared_ptr<Tracker>> & spawned, const double max_age,
-  const double min_vehicle_speed)
-{
-  std::vector<std::shared_ptr<Tracker>> removed;
-  for (const auto & candidate : spawned) {
-    if (candidate->getHighestProbLabel() != Label::UNKNOWN) continue;  // new vehicles etc.: today's handling
-    types::DynamicObject object2;
-    if (!candidate->getTrackedObject(time, object2)) continue;
-    for (const auto & other : list_tracker_) {
-      if (std::find(spawned.begin(), spawned.end(), other) != spawned.end()) continue;
-      // a live vehicle track only (measured within max_age), not one coasting on its prediction
-      if (!autoware::object_recognition_utils::isCarLikeVehicle(other->getHighestProbLabel())) continue;
-      if (other->getElapsedTimeFromLastUpdate(time) > max_age) continue;
-      types::DynamicObject object1;
-      if (!other->getTrackedObject(time, object1)) continue;
-      if (object1.shape.type != autoware_perception_msgs::msg::Shape::BOUNDING_BOX) continue;
-      // a MOVING vehicle only: for a standing one the publish-time check sees the same geometry (no timing gap)
-      if (std::hypot(object1.twist.linear.x, object1.twist.linear.y) < min_vehicle_speed) continue;
-      // the new UNKNOWN's centre inside the vehicle's box at the same time = a piece of that vehicle (its rear band
-      // under the crop ceiling, left outside the car track because UNKNOWN measurements never update a vehicle track
-      // and prune()'s centre-distance gate (1 m) never reaches a vehicle's ends)
-      const double yaw = tf2::getYaw(object1.pose.orientation);
-      const double dx = object2.pose.position.x - object1.pose.position.x;
-      const double dy = object2.pose.position.y - object1.pose.position.y;
-      if (
-        std::abs(dx * std::cos(yaw) + dy * std::sin(yaw)) <= 0.5 * object1.shape.dimensions.x &&
-        std::abs(-dx * std::sin(yaw) + dy * std::cos(yaw)) <= 0.5 * object1.shape.dimensions.y) {
-        removed.push_back(candidate);
-        break;
-      }
-    }
-  }
-  for (const auto & tracker : removed) list_tracker_.remove(tracker);
-  return removed;
-}
-
-// This function removes overlapped trackers based on distance and IoU criteria
-void TrackerProcessor::removeOverlappedTracker(const rclcpp::Time & time)
-{
-  std::unique_ptr<ScopedTimeTrack> st_ptr;
-  if (time_keeper_) st_ptr = std::make_unique<ScopedTimeTrack>(__func__, *time_keeper_);
-
-  // Create sorted list with non-UNKNOWN objects first, then by measurement count
-  std::vector<std::shared_ptr<Tracker>> sorted_list_tracker(
-    list_tracker_.begin(), list_tracker_.end());
-  std::sort(
-    sorted_list_tracker.begin(), sorted_list_tracker.end(),
-    [&time](const std::shared_ptr<Tracker> & a, const std::shared_ptr<Tracker> & b) {
-      bool a_unknown = (a->getHighestProbLabel() == Label::UNKNOWN);
-      bool b_unknown = (b->getHighestProbLabel() == Label::UNKNOWN);
-      if (a_unknown != b_unknown) {
-        return b_unknown;  // Put non-UNKNOWN objects first
-      }
-      if (a->getTotalMeasurementCount() != b->getTotalMeasurementCount()) {
-        return a->getTotalMeasurementCount() >
-               b->getTotalMeasurementCount();  // Then sort by measurement count
-      }
-      return a->getElapsedTimeFromLastUpdate(time) <
-             b->getElapsedTimeFromLastUpdate(time);  // Finally sort by elapsed time (smaller first)
-    });
-
-  /* Iterate through the list of trackers */
-  for (size_t i = 0; i < sorted_list_tracker.size(); ++i) {
-    types::DynamicObject object1;
-    if (!sorted_list_tracker[i]->getTrackedObject(time, object1)) continue;
-    // NERO_MOT_REBIRTH: an UNKNOWN track hidden behind its vehicle successor removes no other track
-    if (nero_rebirth_.enabled && neroHidden(sorted_list_tracker[i], time)) continue;
-    // Compare the current tracker with the remaining trackers
-    for (size_t j = i + 1; j < sorted_list_tracker.size(); ++j) {
-      types::DynamicObject object2;
-      if (!sorted_list_tracker[j]->getTrackedObject(time, object2)) continue;
-
-      // Calculate the distance between the two objects
-      const double distance = std::hypot(
-        object1.pose.position.x - object2.pose.position.x,
-        object1.pose.position.y - object2.pose.position.y);
-      const auto & label1 = sorted_list_tracker[i]->getHighestProbLabel();
-      const auto & label2 = sorted_list_tracker[j]->getHighestProbLabel();
-      const double max_dist_matrix_value = config_.max_dist_matrix(
-        label2, label1);  // Get the maximum distance threshold for the labels
-
-      // If the distance is too large, skip
-      if (distance > max_dist_matrix_value) {
-        continue;
-      }
-
-      // Check the Intersection over Union (IoU) between the two objects
-      constexpr double min_union_iou_area = 1e-2;
-      const auto iou = shapes::get2dIoU(object1, object2, min_union_iou_area);
-      bool delete_candidate_tracker = false;
-
-      // NERO_MOT_REBIRTH: an UNKNOWN track continued by a vehicle track stays until the vehicle track is published
-      if (
-        nero_rebirth_.enabled &&
-        sorted_list_tracker[j]->nero_successor.lock() == sorted_list_tracker[i]) {
-        continue;
-      }
-
-      // If both trackers are UNKNOWN, delete the younger tracker
-      // If one side of the tracker is UNKNOWN, delete UNKNOWN objects
-      if (label1 == Label::UNKNOWN || label2 == Label::UNKNOWN) {
-        if (iou > config_.min_unknown_object_removal_iou) {
-          if (label2 == Label::UNKNOWN) {
-            delete_candidate_tracker = true;
-          }
-        }
-      } else {  // If neither object is UNKNOWN, delete the younger tracker
-        if (iou > config_.min_known_object_removal_iou) {
-          /* erase only when prioritized one has a measurement */
-          delete_candidate_tracker = true;
-        }
-      }
-
-      // crossmover c3: a published UNKNOWN the mover rule made fast stays while the vehicle track over it is not
-      // published yet (the stock rule removes it once that track is confident)
-      if (
-        delete_candidate_tracker && label2 == Label::UNKNOWN && label1 != Label::UNKNOWN &&
-        UnknownTracker::neroCrossEnabled() && !isConfidentTracker(sorted_list_tracker[i]) &&
-        isConfidentTracker(sorted_list_tracker[j]) &&
-        neroMoverMadeFast(sorted_list_tracker[j], object2, time)) {
-        delete_candidate_tracker = false;
-      }
-
-      if (delete_candidate_tracker) {
-        /* erase only when prioritized one has later(or equal time) meas than the other's */
-        // NERO_MOT_DUP_FRESH: or, for two vehicle tracks, when the prioritized one is confident and had a full (box)
-        // measurement within <fresh> s, whichever input channel measured the other one last
-        if (
-          sorted_list_tracker[i]->getElapsedTimeFromLastUpdate(time) <=
-            sorted_list_tracker[j]->getElapsedTimeFromLastUpdate(time) ||
-          (nero_dup_fresh_ > 0.0 && label1 != Label::UNKNOWN && label2 != Label::UNKNOWN &&
-           sorted_list_tracker[i]->neroElapsedFromFullUpdate(time) <= nero_dup_fresh_ &&
-           isConfidentTracker(sorted_list_tracker[i]))) {
-          // Remove from original list_tracker
-          list_tracker_.remove(sorted_list_tracker[j]);
-          // Remove from sorted list
-          sorted_list_tracker.erase(sorted_list_tracker.begin() + j);
-          --j;
-        }
-      }
-    }
-  }
-}
-
-bool TrackerProcessor::isConfidentTracker(const std::shared_ptr<Tracker> & tracker) const
-{
-  // Confidence is determined by counting the number of measurements.
-  // If the number of measurements is equal to or greater than the threshold, the tracker is
-  // considered confident.
-  auto label = tracker->getHighestProbLabel();
-  if (nero_rebirth_.enabled && tracker->nero_handed_over_to) {
-    return true;
-  }
-  if (nero_rebirth_.enabled && tracker->nero_is_successor) {
-    // NERO_MOT_REBIRTH: the object's measurements of both classes count
-    if (tracker->nero_handed_over) return true;
-    const auto predecessor = tracker->nero_predecessor.lock();
-    const int predecessor_count =
-      predecessor ? predecessor->getTotalMeasurementCount() : tracker->nero_predecessor_count;
-    return tracker->getTotalMeasurementCount() >= nero_rebirth_.min_count &&
-           tracker->getTotalMeasurementCount() + predecessor_count >=
-             config_.confident_count_threshold.at(label);
-  }
-  return tracker->getTotalMeasurementCount() >= config_.confident_count_threshold.at(label);
-}
-
-// NERO_MOT_FAST_BIRTH: a not yet confident vehicle track measured at enough distinct detection frames, still measured
-bool TrackerProcessor::neroFastBirthPublish(
-  const std::shared_ptr<Tracker> & tracker, const rclcpp::Time & time) const
-{
-  const auto label = tracker->getHighestProbLabel();
-  if (
-    label != Label::CAR && label != Label::TRUCK && label != Label::BUS && label != Label::TRAILER) {
-    return false;
-  }
-  int need = nero_fast_birth_.frames;
-  if (
-    nero_ego_ok_ && std::hypot(tracker->nero_last_x - nero_ego_x_, tracker->nero_last_y - nero_ego_y_) >=
-                      nero_fast_birth_.far_m) {
-    need = std::max(need, nero_fast_birth_.far_frames);
-  }
-  if (tracker->nero_distinct_stamps < need) return false;
-  if (tracker->nero_min_meas_prob < nero_fast_birth_.min_prob) return false;
-  if (nero_fast_birth_.vmin > 0.0) {
-    const double dt = (tracker->nero_last_t - tracker->nero_first_t).seconds();
-    if (dt < 0.05) return false;
-    const double dx = tracker->nero_last_x - tracker->nero_first_x;
-    const double dy = tracker->nero_last_y - tracker->nero_first_y;
-    if (std::hypot(dx, dy) < nero_fast_birth_.vmin * dt) return false;
-    double da = std::fabs(std::remainder(std::atan2(dy, dx) - tracker->nero_last_yaw, M_PI));
-    if (da * 180.0 / M_PI > nero_fast_birth_.yaw_deg) return false;
-  }
-  if (tracker->getElapsedTimeFromLastUpdate(time) > nero_fast_birth_.max_gap + 0.2) return false;  // + latency
-  if (nero_fast_birth_.iso_m >= 0.0) {
-    // isolation: a second box of a vehicle the tracker already publishes is not a new vehicle
-    types::DynamicObject self;
-    if (!tracker->getTrackedObject(time, self)) return false;
-    for (const auto & other : list_tracker_) {
-      if (other == tracker || !isConfidentTracker(other)) continue;
-      const auto ol = other->getHighestProbLabel();
-      if (ol != Label::CAR && ol != Label::TRUCK && ol != Label::BUS && ol != Label::TRAILER) continue;
-      types::DynamicObject o;
-      if (!other->getTrackedObject(time, o)) continue;
-      const double gap = 0.5 * (self.shape.dimensions.x + o.shape.dimensions.x) + nero_fast_birth_.iso_m;
-      if (
-        std::hypot(
-          self.pose.position.x - o.pose.position.x, self.pose.position.y - o.pose.position.y) < gap) {
-        return false;
-      }
-    }
-  }
-  return true;
 }
 
 void TrackerProcessor::getTrackedObjects(
@@ -1049,15 +601,35 @@ void TrackerProcessor::getTrackedObjects(
   tracked_objects.header.stamp = time;
   types::DynamicObject tracked_object;
   for (const auto & tracker : list_tracker_) {
-    // Skip if the tracker is not confident
-    if (!isConfidentTracker(tracker) && !(nero_fast_birth_.on && neroFastBirthPublish(tracker, time))) continue;
-    // NERO_MOT_REBIRTH: the UNKNOWN track whose object its vehicle successor publishes
-    if (nero_rebirth_.enabled && neroHidden(tracker, time)) continue;
-    // Get the tracked object, extrapolated to the given time
-    if (tracker->getTrackedObject(time, tracked_object)) {
-      tracker->neroRefinePublished(tracked_object);  // NERO_MOT_STAND_SPEED (no-op unless set)
+    if (!tracker->isConfident(adaptive_threshold_cache_, getEgoPose(), std::nullopt)) continue;
+    // [nero trkup] NERO_MOT_UNKNOWN_CONFIRM=<n> (trkup-2 2026-11-10; unset = upstream): an UNKNOWN track is published only from its n-th
+    // measurement, the car's confident_count_threshold (5). Upstream confirms after ~2, so 1-4-measurement flat ground flickers in the
+    // robot's band were published (closed loop on the camera stack, 11-08 trips: obstacle_stop 33 -> 48 / 34 -> 51, every added stop a
+    // newborn UNKNOWN 0.01-0.09 m tall living 0.0-0.4 s). Vehicles keep upstream's confirmation (realize windows: = the car).
+    {
+      static const int nero_unknown_confirm = [] {
+        const char * e = std::getenv("NERO_MOT_UNKNOWN_CONFIRM");
+        return e != nullptr ? std::atoi(e) : 0;
+      }();
+      if (
+        nero_unknown_confirm > 0 && tracker->getHighestProbLabel() == classes::Label::UNKNOWN &&
+        tracker->getTotalMeasurementCount() < nero_unknown_confirm) {
+        // ... unless NERO_MOT_UNKNOWN_MOVER already measured it as a mover (>= 4 points on a straight line, both outline ends moving:
+        // evidence no ground flicker has; w31 0b8b would otherwise be published moving one message later than the car)
+        const auto poly = std::dynamic_pointer_cast<PolygonTracker>(tracker);
+        double mvx = 0.0, mvy = 0.0;
+        if (!(poly && poly->neroOn() && poly->neroMover(time, mvx, mvy))) continue;
+      }
+    }
+    // [nero trkup] NERO_MOT_REBIRTH: the UNKNOWN track whose object its vehicle successor publishes
+    if (nero_rebirth_.enabled && tracker->neroHidden()) continue;
+    constexpr bool to_publish = true;
+    if (tracker->getTrackedObject(time, tracked_object, to_publish)) {
       if (neroStillBoxParams().enabled) neroStillBox(tracker, time, tracked_object);
-      tracked_objects.objects.push_back(toTrackedObjectMsg(tracked_object));
+      tracked_object.existence_probability = tracker->getTotalExistenceProbability();
+      tracked_object.classification = tracker->getClassification();
+      if (tracker->neroHasPubUUID()) tracked_object.uuid = tracker->neroPubUUID();  // [nero trkup] REBIRTH
+      tracked_objects.objects.push_back(types::toTrackedObjectMsg(tracked_object));
     }
   }
 }
@@ -1072,17 +644,349 @@ void TrackerProcessor::getTentativeObjects(
   tentative_objects.header.stamp = time;
   types::DynamicObject tracked_object;
   for (const auto & tracker : list_tracker_) {
-    if (!isConfidentTracker(tracker)) {
-      if (tracker->getTrackedObject(time, tracked_object)) {
-        tentative_objects.objects.push_back(toTrackedObjectMsg(tracked_object));
-      }
+    if (tracker->isConfident(adaptive_threshold_cache_, getEgoPose(), std::nullopt)) continue;
+    constexpr bool to_publish = false;
+    if (tracker->getTrackedObject(time, tracked_object, to_publish)) {
+      tentative_objects.objects.push_back(types::toTrackedObjectMsg(tracked_object));
     }
   }
 }
 
-void TrackerProcessor::setTimeKeeper(std::shared_ptr<autoware_utils::TimeKeeper> time_keeper_ptr)
+void TrackerProcessor::getMergedObjects(
+  const rclcpp::Time & time, const geometry_msgs::msg::Transform & tf_base_to_world,
+  autoware_perception_msgs::msg::DetectedObjects & merged_objects) const
+{
+  std::unique_ptr<ScopedTimeTrack> st_ptr;
+  if (time_keeper_) st_ptr = std::make_unique<ScopedTimeTrack>(__func__, *time_keeper_);
+
+  merged_objects.header.stamp = time;
+  merged_objects.objects.clear();
+  merged_objects.objects.reserve(list_tracker_.size());
+  types::DynamicObject tracked_object;
+  for (const auto & tracker : list_tracker_) {
+    constexpr bool to_publish = false;
+    if (tracker->getTrackedObject(time, tracked_object, to_publish)) {
+      merged_objects.objects.push_back(types::toDetectedObjectMsg(tracked_object));
+    }
+  }
+
+  // Transform poses from world frame to ego frame using the inverse of tf_base_to_world
+  tf2::Transform tf2_base_to_world;
+  tf2::fromMsg(tf_base_to_world, tf2_base_to_world);
+  geometry_msgs::msg::TransformStamped ts;
+  ts.transform = tf2::toMsg(tf2_base_to_world.inverse());
+
+  for (auto & obj : merged_objects.objects) {
+    tf2::doTransform(
+      obj.kinematics.pose_with_covariance.pose, obj.kinematics.pose_with_covariance.pose, ts);
+  }
+}
+
+void TrackerProcessor::setTimeKeeper(
+  std::shared_ptr<autoware_utils_debug::TimeKeeper> time_keeper_ptr)
 {
   time_keeper_ = std::move(time_keeper_ptr);
+  association_manager_->setTimeKeeper(time_keeper_);
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// [nero trkup] NERO_MOT_REBIRTH + NERO_MOT_UNKNOWN_MOVER hand-over, ported from our 0.44 TrackerProcessor
+// (/work/ahmed-boxyaw/src/wt/perception/autoware_multi_object_tracker/src/processor/processor.cpp). An UNKNOWN track's
+// object is read as it is PUBLISHED (getTrackedObject(..., to_publish = true): what the car's UNKNOWN tracker returns);
+// vehicle tracks as upstream reads them internally.
+// ---------------------------------------------------------------------------------------------------------------------
+std::shared_ptr<Tracker> TrackerProcessor::neroFindPredecessor(
+  const types::DynamicObject & measurement, const types::InputChannel & channel,
+  const rclcpp::Time & time, types::DynamicObject & seeded_measurement) const
+{
+  // only a classification-trusted vehicle measurement continues an UNKNOWN track
+  const auto label = classes::getHighestProbLabel(measurement.classification);
+  if (
+    !channel.trust_classification || !neroCarLike(label) ||
+    measurement.shape.type != autoware_perception_msgs::msg::Shape::BOUNDING_BOX) {
+    return nullptr;
+  }
+  const double myaw = tf2::getYaw(measurement.pose.orientation);
+  const double half_l = 0.5 * measurement.shape.dimensions.x + nero_rebirth_.margin;
+  const double half_w = 0.5 * measurement.shape.dimensions.y + nero_rebirth_.margin;
+  for (const auto & candidate : list_tracker_) {
+    if (!neroCarLike(candidate->getHighestProbLabel())) continue;
+    // a vehicle track already covers the place: the UNKNOWN there is its fragment, not a new object
+    types::DynamicObject object;
+    if (!candidate->getTrackedObject(time, object)) continue;
+    const double dx = object.pose.position.x - measurement.pose.position.x;
+    const double dy = object.pose.position.y - measurement.pose.position.y;
+    if (
+      std::abs(dx * std::cos(myaw) + dy * std::sin(myaw)) <= half_l &&
+      std::abs(-dx * std::sin(myaw) + dy * std::cos(myaw)) <= half_w) {
+      return nullptr;
+    }
+  }
+  const bool mover_on = nero::unknownMoverParams().enabled;
+  const bool cross_on = nero::unknownMoverParams().cross;
+  std::shared_ptr<Tracker> best;
+  types::DynamicObject best_object;
+  for (const auto & candidate : list_tracker_) {
+    if (
+      !candidate->nero_successor.expired() ||
+      candidate->getHighestProbLabel() != classes::Label::UNKNOWN) {
+      continue;
+    }
+    types::DynamicObject object;
+    if (!candidate->getTrackedObject(time, object, true)) continue;
+    // the moving test reads the UNKNOWN's filter speed (what the car's test read: its UNKNOWN published its filter);
+    // with NERO_MOT_UNKNOWN_MOVER an UNKNOWN that is no mover is published at 0 m/s, which would make every real
+    // mover the rule does not catch look standing here (51377 j03_s5: the CAR seeded at 0 +- 0.5 m/s)
+    types::DynamicObject filter_object;
+    const double moving_speed =
+      candidate->getTrackedObject(time, filter_object)
+        ? std::hypot(filter_object.twist.linear.x, filter_object.twist.linear.y)
+        : std::hypot(object.twist.linear.x, object.twist.linear.y);
+    if (
+      moving_speed > nero_rebirth_.max_pred_speed &&
+      !(mover_on && neroMoverAlong(candidate, time, myaw)) &&
+      !(cross_on && neroMoverMadeAlong(candidate, object, time, myaw))) {
+      // a moving UNKNOWN keeps the stock handling (unless a mover along the box, or one the mover rule made fast along
+      // it)
+      continue;
+    }
+    // the UNKNOWN track's centre inside the vehicle box (+ margin): the same object
+    if (!neroCovers(measurement, object)) continue;
+    if (!best || candidate->getTotalMeasurementCount() > best->getTotalMeasurementCount()) {
+      best = candidate;
+      best_object = object;
+    }
+  }
+  if (!best) return nullptr;
+  // the vehicle track's motion starts from the UNKNOWN track's (what is published for the object), not from the centre
+  // motion of its first boxes
+  using autoware_utils_geometry::xyzrpy_covariance_index::XYZRPY_COV_IDX;
+  const double uyaw = tf2::getYaw(best_object.pose.orientation);
+  double vx = std::cos(uyaw) * best_object.twist.linear.x - std::sin(uyaw) * best_object.twist.linear.y;
+  double vy = std::sin(uyaw) * best_object.twist.linear.x + std::cos(uyaw) * best_object.twist.linear.y;
+  // a mover hands over the velocity its measured positions show (sigma 2 m/s: the vehicle track's own boxes take over
+  // quickly)
+  bool mover = false;
+  if (mover_on && std::hypot(vx, vy) > nero_rebirth_.max_pred_speed) {
+    const auto polygon = std::dynamic_pointer_cast<PolygonTracker>(best);
+    if (polygon) {
+      // crossmover c3: a crossing mover's line counts from the first of its consecutive start tests
+      if (!cross_on || neroMoverAlong(best, time, myaw) || polygon->neroCrossHeld(time) >= 0.15) {
+        polygon->neroMoverLine(vx, vy);
+        mover = true;
+      } else {
+        // a crossing mover too young for the hand-over, or one whose line just ended: the vehicle track starts exactly
+        // as the stock rule starts it (from its own box); only the object's uuid and its publication until that track
+        // is confident come from the UNKNOWN
+        seeded_measurement = measurement;
+        return best;
+      }
+    }
+  }
+  seeded_measurement = measurement;
+  // a mover's vehicle box heads the way it moves (the box's sign is not known)
+  double syaw = myaw;
+  if (mover && vx * std::cos(myaw) + vy * std::sin(myaw) < 0.0) {
+    syaw = autoware_utils_math::normalize_radian(myaw + M_PI);
+    tf2::Quaternion q;
+    q.setRPY(0.0, 0.0, syaw);
+    seeded_measurement.pose.orientation = tf2::toMsg(q);
+    for (auto & pt : seeded_measurement.shape.footprint.points) {
+      pt.x = -pt.x;
+      pt.y = -pt.y;
+    }
+  }
+  seeded_measurement.kinematics.has_twist = true;
+  seeded_measurement.twist.linear.x = vx * std::cos(syaw) + vy * std::sin(syaw);
+  seeded_measurement.twist.linear.y = 0.0;
+  seeded_measurement.kinematics.has_twist_covariance = true;
+  seeded_measurement.twist_covariance[XYZRPY_COV_IDX::X_X] = std::max(
+    mover ? 4.0 : 0.25, best_object.twist_covariance[XYZRPY_COV_IDX::X_X] +
+                          best_object.twist_covariance[XYZRPY_COV_IDX::Y_Y]);
+  // upstream's VehicleTracker reads the lateral (slip) velocity variance from Y_Y when a twist covariance is given:
+  // keep its own default there
+  seeded_measurement.twist_covariance[XYZRPY_COV_IDX::Y_Y] =
+    object_model::general_vehicle.bicycle_state.init_slip_angle_cov;
+  return best;
+}
+
+bool TrackerProcessor::neroMoverMadeFast(
+  const std::shared_ptr<Tracker> & tracker, const types::DynamicObject & object, const rclcpp::Time & time) const
+{
+  if (std::hypot(object.twist.linear.x, object.twist.linear.y) <= nero_rebirth_.max_pred_speed) return false;
+  const auto polygon = std::dynamic_pointer_cast<PolygonTracker>(tracker);
+  return polygon && polygon->neroMoverRecent(time);
+}
+
+bool TrackerProcessor::neroMoverMadeAlong(
+  const std::shared_ptr<Tracker> & tracker, const types::DynamicObject & object, const rclcpp::Time & time,
+  const double box_yaw) const
+{
+  if (!neroMoverMadeFast(tracker, object, time)) return false;
+  // the published motion (map frame) within 30 deg of the box's axis, either way (as neroMoverAlong)
+  const double uyaw = tf2::getYaw(object.pose.orientation);
+  const double vx = std::cos(uyaw) * object.twist.linear.x - std::sin(uyaw) * object.twist.linear.y;
+  const double vy = std::sin(uyaw) * object.twist.linear.x + std::cos(uyaw) * object.twist.linear.y;
+  constexpr double max_angle = 30.0 * M_PI / 180.0;
+  const double angle = std::abs(autoware_utils_math::normalize_radian(std::atan2(vy, vx) - box_yaw));
+  return angle <= max_angle || angle >= M_PI - max_angle;
+}
+
+bool TrackerProcessor::neroMoverLink(
+  const types::DynamicObject & measurement, const types::InputChannel & channel, const rclcpp::Time & time)
+{
+  if (classes::getHighestProbLabel(measurement.classification) != classes::Label::UNKNOWN) {
+    return false;
+  }
+  std::shared_ptr<Tracker> best;
+  for (const auto & candidate : list_tracker_) {
+    if (candidate->getHighestProbLabel() != classes::Label::UNKNOWN) continue;
+    // a track that took a measurement this cycle has its object
+    if (candidate->getElapsedTimeFromLastUpdate(time) < 1e-3) continue;
+    const auto polygon = std::dynamic_pointer_cast<PolygonTracker>(candidate);
+    if (!polygon || !polygon->neroMoverContinues(time, measurement)) continue;
+    if (!best || candidate->getTotalMeasurementCount() > best->getTotalMeasurementCount()) {
+      best = candidate;
+    }
+  }
+  if (!best) return false;
+  best->setEgoPose(ego_pose_ ? std::make_optional(ego_pose_->pose.position) : std::nullopt);
+  best->updateWithMeasurement(measurement, time, channel, false);
+  return true;
+}
+
+void TrackerProcessor::neroMoverInherit(
+  const std::shared_ptr<PolygonTracker> & newborn, const types::DynamicObject & measurement,
+  const rclcpp::Time & time)
+{
+  std::shared_ptr<PolygonTracker> best;
+  int best_n = 0;
+  for (const auto & candidate : list_tracker_) {
+    if (candidate->getHighestProbLabel() != classes::Label::UNKNOWN) continue;
+    if (candidate->getElapsedTimeFromLastUpdate(time) < 1e-3) continue;  // measured this cycle
+    const auto polygon = std::dynamic_pointer_cast<PolygonTracker>(candidate);
+    if (!polygon) continue;
+    const int n = polygon->neroInheritable(time, *newborn);
+    if (n > best_n) {
+      best = polygon;
+      best_n = n;
+    }
+  }
+  if (best) newborn->neroInheritFrom(*best, time, measurement);
+}
+
+bool TrackerProcessor::neroMoverAlong(
+  const std::shared_ptr<Tracker> & tracker, const rclcpp::Time & time, const double box_yaw) const
+{
+  const auto polygon = std::dynamic_pointer_cast<PolygonTracker>(tracker);
+  double vx = 0.0;
+  double vy = 0.0;
+  if (!polygon || !polygon->neroMover(time, vx, vy)) return false;
+  // only a mover that has held its line >= 0.15 s (two measurement times after its start)
+  constexpr double min_age = 0.15;
+  if (polygon->neroMoverAge(time) < min_age) return false;
+  // within 30 deg of the box's axis, either way
+  constexpr double max_angle = 30.0 * M_PI / 180.0;
+  const double angle = std::abs(autoware_utils_math::normalize_radian(std::atan2(vy, vx) - box_yaw));
+  return angle <= max_angle || angle >= M_PI - max_angle;
+}
+
+bool TrackerProcessor::neroCovers(
+  const types::DynamicObject & vehicle, const types::DynamicObject & unknown) const
+{
+  const double dx = unknown.pose.position.x - vehicle.pose.position.x;
+  const double dy = unknown.pose.position.y - vehicle.pose.position.y;
+  if (std::hypot(dx, dy) > nero_rebirth_.max_dist) return false;
+  const double yaw = tf2::getYaw(vehicle.pose.orientation);
+  return std::abs(dx * std::cos(yaw) + dy * std::sin(yaw)) <=
+           0.5 * vehicle.shape.dimensions.x + nero_rebirth_.margin &&
+         std::abs(-dx * std::sin(yaw) + dy * std::cos(yaw)) <=
+           0.5 * vehicle.shape.dimensions.y + nero_rebirth_.margin;
+}
+
+bool TrackerProcessor::neroStockRemoves(
+  const std::shared_ptr<Tracker> & vehicle_tracker, const std::shared_ptr<Tracker> & unknown_tracker,
+  const rclcpp::Time & time) const
+{
+  // the stock prune's rule for an UNKNOWN track overlapping a vehicle track (upstream's merger: a confident,
+  // non-polygon vehicle absorbs a redundant UNKNOWN)
+  types::DynamicObject vehicle;
+  types::DynamicObject unknown;
+  if (
+    !vehicle_tracker->getTrackedObject(time, vehicle) ||
+    !unknown_tracker->getTrackedObject(time, unknown)) {
+    return false;
+  }
+  if (vehicle.shape.type == autoware_perception_msgs::msg::Shape::POLYGON) return false;
+  if (!vehicle_tracker->isConfident(adaptive_threshold_cache_, getEgoPose(), time)) return false;
+  return detail::isRedundant(
+    vehicle, unknown, vehicle_tracker->getHighestProbLabel(), unknown_tracker->getHighestProbLabel(),
+    vehicle_tracker->getKnownObjectProbability(), unknown_tracker->getKnownObjectProbability(),
+    nero_overlap_config_);
+}
+
+void TrackerProcessor::neroHandOver(const rclcpp::Time & time)
+{
+  for (const auto & tracker : list_tracker_) {
+    // an UNKNOWN track whose vehicle successor died publishes the object under its uuid again
+    if (
+      tracker->nero_handed_over_to && tracker->nero_successor.expired() &&
+      tracker->neroPubUUID() != tracker->nero_own_uuid) {
+      tracker->neroSetPubUUID(tracker->nero_own_uuid);
+    }
+    if (!tracker->nero_is_successor) continue;
+    const auto predecessor = tracker->nero_predecessor.lock();
+    if (predecessor) {
+      types::DynamicObject vehicle;
+      types::DynamicObject unknown;
+      const bool unknown_ok =
+        tracker->getTrackedObject(time, vehicle) && predecessor->getTrackedObject(time, unknown, true);
+      bool covered = unknown_ok && neroCovers(vehicle, unknown);
+      // crossmover c3: the link also holds while the cluster MEASURED last is inside the vehicle box
+      if (unknown_ok && !covered && nero::unknownMoverParams().cross) {
+        const auto polygon = std::dynamic_pointer_cast<PolygonTracker>(predecessor);
+        double mx = 0.0;
+        double my = 0.0;
+        if (polygon && polygon->neroMoverRecent(time) && polygon->neroLastMeasured(mx, my)) {
+          unknown.pose.position.x = mx;
+          unknown.pose.position.y = my;
+          covered = neroCovers(vehicle, unknown);
+        }
+      }
+      if (unknown_ok && !covered) {
+        // the vehicle track left the UNKNOWN track's object: two objects from now on
+        predecessor->nero_successor.reset();
+        predecessor->nero_handed_over_to = false;
+        predecessor->nero_removed_at_count = -1;
+        tracker->nero_predecessor.reset();
+        if (!tracker->nero_handed_over) tracker->nero_is_successor = false;
+        continue;
+      }
+    }
+    if (tracker->nero_handed_over) {
+      if (predecessor && neroStockRemoves(tracker, predecessor, time)) {
+        predecessor->nero_removed_at_count = predecessor->getTotalMeasurementCount();
+      }
+      continue;
+    }
+    if (predecessor && !tracker->nero_predecessor_confident) {
+      tracker->nero_predecessor_confident =
+        predecessor->isConfident(adaptive_threshold_cache_, getEgoPose(), std::nullopt);
+    }
+    if (!tracker->isConfident(adaptive_threshold_cache_, getEgoPose(), std::nullopt)) continue;
+    // the vehicle track publishes the object under its uuid; the UNKNOWN track goes on under the vehicle track's
+    // (never published) uuid, hidden where the stock prune would have absorbed it (neroHidden)
+    const auto vehicle_uuid = tracker->neroPubUUID();
+    tracker->neroSetPubUUID(tracker->nero_predecessor_uuid);
+    tracker->nero_handed_over = true;
+    if (predecessor) {
+      predecessor->nero_own_uuid = tracker->nero_predecessor_uuid;
+      predecessor->neroSetPubUUID(vehicle_uuid);
+      predecessor->nero_handed_over_to = true;
+      predecessor->nero_removed_at_count =
+        neroStockRemoves(tracker, predecessor, time) ? predecessor->getTotalMeasurementCount() : -1;
+    }
+  }
 }
 
 }  // namespace autoware::multi_object_tracker
