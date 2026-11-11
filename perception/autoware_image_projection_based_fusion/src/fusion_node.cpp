@@ -28,6 +28,7 @@
 #include <boost/optional.hpp>
 
 #include <cmath>
+#include <cstdlib>
 #include <limits>
 #include <list>
 #include <memory>
@@ -70,6 +71,18 @@ FusionNode<Msg3D, Msg2D, ExportObj>::FusionNode(
   // Set parameters
   msg3d_timeout_sec_ = declare_parameter<double>("msg3d_timeout_sec");
   rois_timeout_sec_ = declare_parameter<double>("rois_timeout_sec");
+
+  // [nero 2026-11-10 camstack] NERO_FUSION_CAMERA_GATE=<s> (see fusion_node.hpp)
+  if (const char * e = std::getenv("NERO_FUSION_CAMERA_GATE"); e != nullptr && *e != '\0') {
+    char * end = nullptr;
+    const double v = std::strtod(e, &end);
+    if (end != e && v > 0.0) {
+      nero_cam_gate_s_ = v;
+      RCLCPP_INFO(
+        get_logger(), "[NERO_FUSION_CAMERA_GATE] %.2f s: no wait for rois while the camera is dead / late",
+        nero_cam_gate_s_);
+    }
+  }
 
   auto rois_timestamp_offsets = declare_parameter<std::vector<double>>("rois_timestamp_offsets");
   if (rois_timestamp_offsets.size() != rois_number_) {
@@ -292,6 +305,13 @@ void FusionNode<Msg3D, Msg2D, ExportObj>::export_process(
   std::unordered_map<std::size_t, double> id_to_stamp_map,
   std::shared_ptr<FusionCollectorInfoBase> collector_info)
 {
+  // [nero 2026-11-10 camstack] NERO_FUSION_CAMERA_GATE: remember the newest 3D message fused with every camera's rois
+  if (nero_cam_gate_s_ > 0.0 && id_to_stamp_map.size() == rois_number_) {
+    const double st = rclcpp::Time(output_det3d_msg->header.stamp).seconds();
+    double prev = nero_last_fused_stamp_.load();
+    while (st > prev && !nero_last_fused_stamp_.compare_exchange_weak(prev, st)) {
+    }
+  }
   ExportObj output_msg;
   postprocess(*(output_det3d_msg), output_msg);
 
@@ -408,9 +428,22 @@ void FusionNode<Msg3D, Msg2D, ExportObj>::sub_callback(const typename Msg3D::Con
   }
 
   fusion_collectors_lock.unlock();
+  // [nero 2026-11-10 camstack] NERO_FUSION_CAMERA_GATE: camera dead / late -> no wait for rois
+  bool nero_fuse_now = false;
+  if (nero_cam_gate_s_ > 0.0) {
+    const double last = nero_last_fused_stamp_.load();
+    nero_fuse_now = last < 0.0 || msg3d_timestamp - last > nero_cam_gate_s_;
+    if (nero_fuse_now != nero_gate_closed_.exchange(nero_fuse_now)) {
+      RCLCPP_WARN(
+        get_logger(), "[NERO_FUSION_CAMERA_GATE] %s (last fused with rois %.3f, msg3d %.3f)",
+        nero_fuse_now ? "camera dead / late: publishing without waiting for rois"
+                      : "camera back: waiting for rois again",
+        last, msg3d_timestamp);
+    }
+  }
   if (selected_collector) {
     fusion_matching_strategy_->set_collector_info(selected_collector, matching_context);
-    selected_collector->process_msg3d(msg3d, msg3d_timeout_sec_);
+    selected_collector->process_msg3d(msg3d, msg3d_timeout_sec_, nero_fuse_now);
   } else {
     // Handle case where no suitable collector is found
     RCLCPP_WARN(get_logger(), "No available FusionCollector in IDLE state.");

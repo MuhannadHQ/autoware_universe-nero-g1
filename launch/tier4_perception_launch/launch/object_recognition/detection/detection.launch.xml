@@ -245,6 +245,20 @@
       <arg name="radar_object_clustering_param_path" value="$(var radar_object_clustering_param_path)"/>
     </include>
   </group>
+  <!-- [nero 2026-11-09 camfront] (QUEUE CAMFRONT) NERO_CAMERA0_INPUT=<raw|h265>:<topic>: the forward wide camera as camera0 (rectified
+       pinhole image, YOLOX rois0); NERO_ROI_OBJECT_CONFIRM=1 adds the confirm-only side node. Unset: nothing is launched. -->
+  <let name="nero_camera0_input" value="$(env NERO_CAMERA0_INPUT '')"/>
+  <let name="nero_roi_object_confirm" value="$(env NERO_ROI_OBJECT_CONFIRM '')"/>
+  <group if="$(eval '&quot;$(var nero_camera0_input)&quot; != &quot;&quot;')">
+    <include file="$(find-pkg-share tier4_perception_launch)/launch/object_recognition/detection/detector/nero_camera0_detector.launch.xml">
+      <arg name="ns" value="$(var ns)"/>
+      <arg name="input_mode" value="$(eval '&quot;$(var nero_camera0_input)&quot;.split(&quot;:&quot;, 1)[0]')"/>
+      <arg name="input_topic" value="$(eval '&quot;$(var nero_camera0_input)&quot;.split(&quot;:&quot;, 1)[1]')"/>
+      <arg name="object_confirm" value="$(eval '&quot;$(var nero_roi_object_confirm)&quot; in (&quot;1&quot;, &quot;true&quot;)')"/>
+      <arg name="input/objects" value="$(var lidar_object_filter/output/objects)"/>
+    </include>
+  </group>
+
   <!-- DetectionByTracker -->
   <group if="$(var switch/detector/tracker_based)">
     <include file="$(find-pkg-share tier4_perception_launch)/launch/object_recognition/detection/detector/tracker_based_detector.launch.xml">

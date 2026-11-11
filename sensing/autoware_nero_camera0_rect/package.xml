@@ -1,0 +1,24 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>autoware_nero_camera0_rect</name>
+  <version>0.44.2</version>
+  <description>[nero camstack 2026-11-10] camera0 (the forward wide camera) in C++: the driver's raw image or H.265 stream (libavcodec on a
+    worker thread) -> fisheye (Kannala-Brandt) rectified to a pinhole image + camera_info, one frame per lidar cycle at the lidar phase.
+    Same parameters and outputs as autoware_nero_camera0's Python camera0_node; composable (runs in the YOLOX container).</description>
+  <maintainer email="ahmed.q@usenero.com">Ahmed Alqurashi</maintainer>
+  <license>Apache License 2.0</license>
+  <buildtool_depend>ament_cmake_auto</buildtool_depend>
+  <buildtool_depend>autoware_cmake</buildtool_depend>
+  <buildtool_depend>pkg-config</buildtool_depend>
+  <depend>rclcpp</depend>
+  <depend>rclcpp_components</depend>
+  <depend>sensor_msgs</depend>
+  <depend>tier4_perception_msgs</depend>
+  <depend>autoware_internal_msgs</depend>
+  <depend>libopencv-dev</depend>
+  <depend>ffmpeg</depend>
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

@@ -46,6 +46,7 @@
 
 #include <cstddef>
 #include <list>
+#include <atomic>
 #include <memory>
 #include <optional>
 #include <string>
@@ -131,6 +132,13 @@ private:
   bool publish_output_msg_{false};
   bool msg3d_fused_{true};
   static constexpr const int num_of_collectors = 10;
+
+  // [nero 2026-11-10 camstack] NERO_FUSION_CAMERA_GATE=<s>: a dead / late camera = the car without the camera. When no 3D message
+  // was fused with every camera's rois within <s> of the newest one's stamp, a 3D message is published at once (fused with the rois
+  // already there, none when the camera is gone) instead of waiting msg3d_timeout_sec for rois. Unset: stock.
+  double nero_cam_gate_s_{-1.0};
+  std::atomic<double> nero_last_fused_stamp_{-1.0};
+  std::atomic<bool> nero_gate_closed_{false};
   bool init_collector_list_{false};
 
 protected:

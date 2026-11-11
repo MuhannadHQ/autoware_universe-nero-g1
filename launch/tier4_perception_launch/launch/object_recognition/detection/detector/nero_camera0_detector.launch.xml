@@ -1,0 +1,101 @@
+<?xml version="1.0"?>
+<!-- [nero 2026-11-09 camfront] (QUEUE CAMFRONT) the forward wide camera as camera0 for perception, loaded only when
+     NERO_CAMERA0_INPUT is set (detection.launch.xml):
+       camera0_node (autoware_nero_camera0_rect, C++; camstack 11-10): the driver's stream -> rectified pinhole image + camera_info, one frame per lidar cycle
+       tensorrt_yolox (yolox-sPlus detection-only, OpenMP passive) -> /perception/object_recognition/detection/rois0
+       NERO_ROI_OBJECT_CONFIRM=1: roi_detected_object_fusion as a SIDE node on the validated CenterPoint objects ->
+         .../detection/camera0/confirmed/objects (the objects a camera box confirms); its output is not used by the object chain.
+       roi_class_filter: the boxes allowed to label lidar clusters (pedestrians by default) -> .../detection/camera0/rois_label
+     The cluster labelling (NERO_ROI_CLUSTER_FUSION) is in lidar_rule_detector.launch.xml. -->
+<launch>
+  <arg name="ns"/>
+  <arg name="input_mode" description="raw: the driver's sensor_msgs/Image; h265: its H.265 CompressedImage"/>
+  <arg name="input_topic"/>
+  <arg name="object_confirm" default="false"/>
+  <arg name="input/objects" description="the validated CenterPoint objects (side input of the confirmation)"/>
+  <arg name="data_path" default="$(env HOME)/autoware_data"/>
+  <let name="camera0/image" value="/sensing/camera/camera0/image_rect_color"/>
+  <let name="camera0/info" value="/sensing/camera/camera0/camera_info"/>
+  <let name="camera0/rois" value="$(var ns)/rois0"/>
+
+  <!-- [nero 2026-11-10 camstack] (QUEUE CAMSTACK) the camera0 node in C++ (autoware_nero_camera0_rect: the same parameters / outputs as the
+       Python node, which stays as NERO_CAMERA0_NODE=py): in the logsim replays the Python node fell 0.7-1.0 s behind under load (CAMLAT).
+       NERO_CAMERA0_CONTAINER=<container> loads it into that existing container with intra-process comms (the car: the camera driver's
+       container of cross_left, so its raw frames arrive by pointer); unset: a node of its own. -->
+  <let name="cam0_node" value="$(env NERO_CAMERA0_NODE cpp)"/>
+  <let name="cam0_container" value="$(env NERO_CAMERA0_CONTAINER '')"/>
+  <group if="$(eval &quot;'$(var cam0_node)' == 'cpp' and '$(var cam0_container)' == ''&quot;)">
+    <include file="$(find-pkg-share autoware_nero_camera0_rect)/launch/camera0_rect.launch.xml">
+      <arg name="input_mode" value="$(var input_mode)"/>
+      <arg name="input_topic" value="$(var input_topic)"/>
+      <arg name="output/image" value="$(var camera0/image)"/>
+      <arg name="output/camera_info" value="$(var camera0/info)"/>
+    </include>
+  </group>
+  <group if="$(eval &quot;'$(var cam0_node)' == 'cpp' and '$(var cam0_container)' != ''&quot;)">
+    <include file="$(find-pkg-share autoware_nero_camera0_rect)/launch/camera0_rect_load.launch.xml">
+      <arg name="container" value="$(var cam0_container)"/>
+      <arg name="input_mode" value="$(var input_mode)"/>
+      <arg name="input_topic" value="$(var input_topic)"/>
+      <arg name="output/image" value="$(var camera0/image)"/>
+      <arg name="output/camera_info" value="$(var camera0/info)"/>
+    </include>
+  </group>
+  <group if="$(eval &quot;'$(var cam0_node)' == 'py'&quot;)">
+    <include file="$(find-pkg-share autoware_nero_camera0)/launch/camera0.launch.xml">
+      <arg name="input_mode" value="$(var input_mode)"/>
+      <arg name="input_topic" value="$(var input_topic)"/>
+      <arg name="output/image" value="$(var camera0/image)"/>
+      <arg name="output/camera_info" value="$(var camera0/info)"/>
+    </include>
+  </group>
+
+  <!-- YOLOX: the detection-only sPlus model by default; NERO_CAMERA0_MODEL=yolox-sPlus-opt-pseudoV2-T4-960x960-T4-seg16cls (camwall_1110)
+       runs the multitask model instead: the same boxes plus the 16-class mask on $(var ns)/mask0 that NERO_MOT_UNKNOWN_CAM_STILL reads. OpenMP threads limited and PASSIVE: with the
+       default (spinning) policy the node burnt 3.7 cores of NeroStation at 10 Hz (0.06 cores like this, the same boxes), and the
+       camera chain's load had made the lidar chain 9-26 ms later and the planner slower (camfront logsim CF5). -->
+  <group>
+    <push-ros-namespace namespace="camera0"/>
+    <set_env name="OMP_NUM_THREADS" value="2"/>
+    <set_env name="OMP_WAIT_POLICY" value="PASSIVE"/>
+    <include file="$(find-pkg-share autoware_tensorrt_yolox)/launch/yolox_s_plus_opt.launch.xml">
+      <arg name="yolox_node_name" value="tensorrt_yolox"/>
+      <arg name="data_path" value="$(var data_path)"/>
+      <arg name="model_path" value="$(var data_path)/tensorrt_yolox/$(env NERO_CAMERA0_MODEL yolox-sPlus-T4-960x960-pseudo-finetune).onnx"/>
+      <arg name="input/image" value="$(var camera0/image)"/>
+      <arg name="output/objects" value="$(var camera0/rois)"/>
+      <arg name="output/mask" value="$(var ns)/mask0"/>
+      <arg name="use_decompress" value="false"/>
+    </include>
+  </group>
+
+  <!-- the boxes allowed to LABEL lidar clusters (roi_cluster_fusion, lidar_rule_detector.launch.xml): pedestrians by default -->
+  <!-- [nero 2026-11-10 camstack] C++ (autoware_nero_camera0_rect roi_class_filter_node, same parameters / output) with the C++ camera0 node;
+       the Python filter with NERO_CAMERA0_NODE=py -->
+  <node pkg="autoware_nero_camera0_rect" exec="roi_class_filter_node" name="roi_class_filter" namespace="$(var ns)/camera0" output="screen"
+        if="$(eval &quot;'$(var cam0_node)' == 'cpp'&quot;)">
+    <param from="$(find-pkg-share autoware_nero_camera0)/config/nero_roi_class_filter.param.yaml"/>
+    <remap from="~/input/rois" to="$(var camera0/rois)"/>
+    <remap from="~/output/rois" to="$(var ns)/camera0/rois_label"/>
+  </node>
+  <node pkg="autoware_nero_camera0" exec="roi_class_filter" name="roi_class_filter" namespace="$(var ns)/camera0" output="screen"
+        if="$(eval &quot;'$(var cam0_node)' == 'py'&quot;)">
+    <param from="$(find-pkg-share autoware_nero_camera0)/config/nero_roi_class_filter.param.yaml"/>
+    <remap from="~/input/rois" to="$(var camera0/rois)"/>
+    <remap from="~/output/rois" to="$(var ns)/camera0/rois_label"/>
+  </node>
+
+  <group if="$(var object_confirm)">
+    <push-ros-namespace namespace="camera0"/>
+    <include file="$(find-pkg-share autoware_image_projection_based_fusion)/launch/roi_detected_object_fusion.launch.xml">
+      <arg name="input/rois_number" value="1"/>
+      <arg name="input/rois0" value="$(var camera0/rois)"/>
+      <arg name="input/camera_info0" value="$(var camera0/info)"/>
+      <arg name="input/image0" value="$(var camera0/image)"/>
+      <arg name="input/objects" value="$(var input/objects)"/>
+      <arg name="output/objects" value="$(var ns)/camera0/confirmed/objects"/>
+      <arg name="param_path" value="$(find-pkg-share autoware_nero_camera0)/config/nero_roi_detected_object_fusion.param.yaml"/>
+      <arg name="sync_param_path" value="$(find-pkg-share autoware_nero_camera0)/config/nero_fusion_common.param.yaml"/>
+    </include>
+  </group>
+</launch>

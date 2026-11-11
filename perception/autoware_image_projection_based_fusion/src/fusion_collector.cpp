@@ -66,7 +66,7 @@ std::shared_ptr<FusionCollectorInfoBase> FusionCollector<Msg3D, Msg2D, ExportObj
 
 template <class Msg3D, class Msg2D, class ExportObj>
 void FusionCollector<Msg3D, Msg2D, ExportObj>::process_msg3d(
-  const typename Msg3D::ConstSharedPtr msg3d, double msg3d_timeout)
+  const typename Msg3D::ConstSharedPtr msg3d, double msg3d_timeout, bool fuse_now)
 {
   std::lock_guard<std::mutex> fusion_lock(fusion_mutex_);
 
@@ -95,7 +95,8 @@ void FusionCollector<Msg3D, Msg2D, ExportObj>::process_msg3d(
   }
 
   msg3d_ = msg3d;
-  if (ready_to_fuse()) {
+  // [nero 2026-11-10 camstack] fuse_now (NERO_FUSION_CAMERA_GATE, camera dead / late): no wait for rois
+  if (ready_to_fuse() || fuse_now) {
     fusion_callback();
   }
 }

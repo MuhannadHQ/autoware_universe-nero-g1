@@ -1,0 +1,20 @@
+# [nero camfront 2026-11-09] roi_detected_object_fusion on camera0 as a SIDE node (CONFIRM ONLY): it reads the validated CenterPoint
+# objects but its output is NOT fed to the merger, so the car's object chain is unchanged (nothing removed, nothing delayed).
+# Every object is compared with the camera boxes (passthrough_lower_bound 1.0: in 0.44 a passed-through object is never compared);
+# its output = the objects a camera box of a compatible class confirms (IoU > 0.5); ~/debug/ignored_objects = in view, no box.
+/**:
+  ros__parameters:
+    passthrough_lower_bound_probability_thresholds: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+    trust_distances: [100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0]
+    min_iou_threshold: 0.5
+    use_roi_probability: false
+    roi_probability_threshold: 0.5
+    can_assign_matrix:
+      [1, 0, 0, 0, 0, 0, 0, 0,
+       0, 1, 1, 1, 1, 0, 0, 0,
+       0, 1, 1, 1, 1, 0, 0, 0,
+       0, 1, 1, 1, 1, 0, 0, 0,
+       0, 1, 1, 1, 1, 0, 0, 0,
+       0, 0, 0, 0, 0, 1, 1, 1,
+       0, 0, 0, 0, 0, 1, 1, 1,
+       0, 0, 0, 0, 0, 1, 1, 1]

@@ -1,0 +1,26 @@
+<?xml version="1.0"?>
+<!-- [nero camstack 2026-11-10] camera0 C++ node LOADED INTO AN EXISTING COMPONENT CONTAINER (the car: the camera driver's container that
+     hosts cross_left, e.g. /sensing/camera/camera_container_cross), with intra-process comms: the driver's raw frames reach the node by
+     pointer (no DDS copy of 5.9 MB UYVY frames at 30 Hz), and only the frame nearest the lidar phase is converted and rectified.
+     Same arguments / parameters / outputs as camera0_rect.launch.xml. -->
+<launch>
+  <arg name="container" description="the target container's full name"/>
+  <arg name="input_mode" default="raw"/>
+  <arg name="input_topic" default="/sensing/camera/camera0/image_raw"/>
+  <arg name="output/image" default="/sensing/camera/camera0/image_rect_color"/>
+  <arg name="output/camera_info" default="/sensing/camera/camera0/camera_info"/>
+  <arg name="param_path" default="$(find-pkg-share autoware_nero_camera0_rect)/config/camera0.param.yaml"/>
+  <arg name="decoder" default="$(env NERO_CAMERA0_DECODER hevc)"/>
+  <load_composable_node target="$(var container)">
+    <composable_node pkg="autoware_nero_camera0_rect" plugin="autoware::nero_camera0_rect::Camera0RectNode" name="camera0_node" namespace="/sensing/camera/camera0">
+      <param from="$(var param_path)"/>
+      <param name="input_mode" value="$(var input_mode)"/>
+      <param name="decoder" value="$(var decoder)"/>
+      <remap from="~/input/image" to="$(var input_topic)"/>
+      <remap from="~/input/h265" to="$(var input_topic)"/>
+      <remap from="~/output/image" to="$(var output/image)"/>
+      <remap from="~/output/camera_info" to="$(var output/camera_info)"/>
+      <extra_arg name="use_intra_process_comms" value="true"/>
+    </composable_node>
+  </load_composable_node>
+</launch>

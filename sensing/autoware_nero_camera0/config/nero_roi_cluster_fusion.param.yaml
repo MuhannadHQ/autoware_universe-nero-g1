@@ -1,0 +1,15 @@
+# [nero camfront 2026-11-09] roi_cluster_fusion on camera0: an UNKNOWN cluster whose projected box matches a camera box (IoU > 0.65
+# for a known class, the camera box inside the cluster's box x1.1) takes the camera's class; remove_unknown false: nothing is ever
+# dropped (Ahmed's rule: never drop an UNKNOWN). Within 100 m (the camera's useful range is far less).
+/**:
+  ros__parameters:
+    fusion_distance: 100.0
+    trust_object_distance: 100.0
+    trust_object_iou_mode: "iou"
+    non_trust_object_iou_mode: "iou_x"
+    use_cluster_semantic_type: false
+    only_allow_inside_cluster: true
+    roi_scale_factor: 1.1
+    iou_threshold: 0.65
+    unknown_iou_threshold: 0.1
+    remove_unknown: false

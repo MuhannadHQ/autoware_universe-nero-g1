@@ -1,0 +1,28 @@
+# [nero camstack 2026-11-10] camera0 (C++ autoware_nero_camera0_rect) = camfront_1109's camera0.param.yaml + the decoder lines. camera0 = the forward wide camera (recorded cross_left). Intrinsics: camfront's targetless calibration
+# (Kannala-Brandt / equidistant, 1920x1536); see /work/vehicle-enhancement/camfront/README.md. The extrinsics are in the sensor kit
+# (sensor_kit_calibration.yaml camera0/camera_link).
+/**:
+  ros__parameters:
+    frame_id: camera0/camera_optical_link
+    fisheye:
+      width: 1920
+      height: 1536
+      fx: 921.73
+      fy: 921.73
+      cx: 961.56
+      cy: 772.15
+      k1: 0.00563
+      k2: -0.01202
+      k3: -0.01960
+      k4: 0.0
+    rectified:          # virtual pinhole camera in the same optical frame (no rotation)
+      width: 960
+      height: 720
+      hfov_deg: 100.0
+    cycle_sec: 0.1        # one frame per lidar cycle
+    cycle_phase_sec: -1.0 # < 0: follow the lidar cloud stamps (cycle_phase_topic)
+    cycle_phase_topic: /perception/obstacle_segmentation/range_cropped/pointcloud/debug/published_time
+    frame_half_window_sec: 0.0167
+    decoder: hevc           # libavcodec decoder by name (h265 input only): hevc = software; hevc_cuvid (desktop NVDEC) / hevc_nvv4l2dec (Jetson) where built
+    decoder_threads: 2      # slice threads (frame threading would buffer frames)
+    queue_max: 60           # packets waiting for the decoder before it drops to the next keyframe (2 s at 30 Hz; logged)

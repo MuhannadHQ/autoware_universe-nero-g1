@@ -18,6 +18,16 @@
   <let name="detected_object_feature_remover/input" value="$(var output/cluster_objects)"/>
   <let name="detected_object_feature_remover/output" value="$(var output/objects)"/>
 
+  <!-- [nero 2026-11-09 camfront] (QUEUE CAMFRONT) NERO_ROI_CLUSTER_FUSION=1 (with NERO_CAMERA0_INPUT): roi_cluster_fusion on camera0
+       between the clusters and shape estimation: a cluster whose image box matches a camera box of a pedestrian
+       (camera0/rois_label: pedestrians only by default; vehicle boxes never label a cluster) takes that class; nothing
+       is dropped (remove_unknown false; shape estimation keeps a failed fit as UNKNOWN); a late / missing camera holds the clusters
+       at most 20 ms (msg3d_timeout_sec). Unset: the clusters go straight to shape estimation as before. -->
+  <let name="nero_rcf_sw" value="$(env NERO_ROI_CLUSTER_FUSION '')"/>
+  <let name="nero_cam0_sw" value="$(env NERO_CAMERA0_INPUT '')"/>
+  <let name="nero_rcf" value="$(eval '&quot;$(var nero_rcf_sw)&quot; in (&quot;1&quot;, &quot;true&quot;) and &quot;$(var nero_cam0_sw)&quot; != &quot;&quot;')"/>
+  <let name="shape_estimation/input/objects" value="$(var ns)/clustering/camera_lidar_fusion/clusters" if="$(var nero_rcf)"/>
+
   <!-- Clustering -->
   <group>
     <push-ros-namespace namespace="clustering"/>
@@ -28,6 +38,20 @@
         <arg name="use_low_height_cropbox" value="$(var use_low_height_cropbox)"/>
         <arg name="use_pointcloud_container" value="true"/>
         <arg name="pointcloud_container_name" value="$(var node/pointcloud_container)"/>
+      </include>
+    </group>
+
+    <group if="$(var nero_rcf)">
+      <push-ros-namespace namespace="camera_lidar_fusion"/>
+      <include file="$(find-pkg-share autoware_image_projection_based_fusion)/launch/roi_cluster_fusion.launch.xml">
+        <arg name="input/rois_number" value="1"/>
+        <arg name="input/rois0" value="$(var ns)/camera0/rois_label"/>
+        <arg name="input/camera_info0" value="/sensing/camera/camera0/camera_info"/>
+        <arg name="input/image0" value="/sensing/camera/camera0/image_rect_color"/>
+        <arg name="input/clusters" value="$(var euclidean_cluster/output/clusters)"/>
+        <arg name="output/clusters" value="$(var ns)/clustering/camera_lidar_fusion/clusters"/>
+        <arg name="param_path" value="$(find-pkg-share autoware_nero_camera0)/config/nero_roi_cluster_fusion.param.yaml"/>
+        <arg name="sync_param_path" value="$(find-pkg-share autoware_nero_camera0)/config/nero_fusion_common.param.yaml"/>
       </include>
     </group>
 

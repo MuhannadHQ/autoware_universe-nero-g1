@@ -1,0 +1,12 @@
+# [nero camfront 2026-11-09] classes whose camera boxes may LABEL a lidar UNKNOWN cluster (roi_cluster_fusion): only labels that make
+# the stack more careful AND that YOLOX got right on our drives. Never CAR / TRUCK / BUS: YOLOX calls green garbage containers CAR
+# (11-03 13:04:57), and a vehicle label shrinks obstacle_stop's lateral margin and makes an obstacle a parked vehicle for static
+# avoidance. PEDESTRIAN only: 23 of 23 pedestrian labels on 6 windows were real people; MOTORCYCLE / BICYCLE were wrong 5 of 7
+# (a street worker pushing a cleaning trolley at 10 m, 11-08 13:37:35; a parked car cut by the image border, 14:25:24).
+/**:
+  ros__parameters:
+    keep_classes: ["PEDESTRIAN"]   # add "BICYCLE", "MOTORCYCLE" only with more evidence (see above)
+    min_score: 0.5        # people score 0.75 (median, 410 boxes); a false MOTORCYCLE on a cut-off parked car 0.39
+    border_px: 4          # boxes cut by the image border are classified worst (that MOTORCYCLE)
+    image_width: 960      # the rectified camera0 image (camera0.param.yaml rectified.*)
+    image_height: 720

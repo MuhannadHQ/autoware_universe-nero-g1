@@ -1,0 +1,30 @@
+# [nero camfront 2026-11-09] image_projection_based_fusion with ONE camera (camera0, the forward wide camera, rectified pinhole).
+# camera0_node publishes the frame nearest each lidar cloud stamp (+-16.7 ms), so the rois carry ~ the cloud's stamp: offset 0,
+# windows 20 ms each (the next frame of a 10 Hz stream is >= 83 ms away: no ambiguity).
+# msg3d_timeout_sec 0.02: the fusion holds a cluster / object message at most 20 ms for camera boxes that are late or missing
+# (the boxes normally arrive ~40 ms after their stamp, the clusters ~200 ms after theirs: no wait), then publishes it unfused.
+/**:
+  ros__parameters:
+    rois_timestamp_offsets: [0.0]
+    rois_timeout_sec: 0.5
+    msg3d_timeout_sec: 0.02
+    image_buffer_size: 15
+    point_project_to_unrectified_image: [false]
+    filter_scope_min_x: -100.0
+    filter_scope_min_y: -100.0
+    filter_scope_min_z: -100.0
+    filter_scope_max_x: 100.0
+    filter_scope_max_y: 100.0
+    filter_scope_max_z: 100.0
+    approximate_camera_projection: [false]
+    approximation_grid_cell_width: 1.0
+    approximation_grid_cell_height: 1.0
+    debug_mode: false
+    collector_debug_mode: false
+    publish_processing_time_detail: false
+    publish_previous_but_late_output_msg: false
+    rosbag_length: 10.0
+    matching_strategy:
+      type: advanced
+      msg3d_noise_window: 0.02
+      rois_timestamp_noise_window: [0.02]

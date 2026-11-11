@@ -1,0 +1,21 @@
+<?xml version="1.0"?>
+<!-- [nero camstack 2026-11-10] camera0 (the forward wide camera), C++ image path (replaces autoware_nero_camera0's camera0.launch.xml:
+     the same arguments, node name, parameters and outputs): the driver's stream -> rectified pinhole image + camera_info at one frame
+     per lidar cycle. input_mode raw = the driver's sensor_msgs/Image, h265 = its H.265 CompressedImage (libavcodec, decoder by name). -->
+<launch>
+  <arg name="input_mode" default="raw"/>
+  <arg name="input_topic" default="/sensing/camera/camera0/image_raw"/>
+  <arg name="output/image" default="/sensing/camera/camera0/image_rect_color"/>
+  <arg name="output/camera_info" default="/sensing/camera/camera0/camera_info"/>
+  <arg name="param_path" default="$(find-pkg-share autoware_nero_camera0_rect)/config/camera0.param.yaml"/>
+  <arg name="decoder" default="$(env NERO_CAMERA0_DECODER hevc)"/>
+  <node pkg="autoware_nero_camera0_rect" exec="camera0_rect_node" name="camera0_node" namespace="/sensing/camera/camera0" output="screen">
+    <param from="$(var param_path)"/>
+    <param name="input_mode" value="$(var input_mode)"/>
+    <param name="decoder" value="$(var decoder)"/>
+    <remap from="~/input/image" to="$(var input_topic)"/>
+    <remap from="~/input/h265" to="$(var input_topic)"/>
+    <remap from="~/output/image" to="$(var output/image)"/>
+    <remap from="~/output/camera_info" to="$(var output/camera_info)"/>
+  </node>
+</launch>

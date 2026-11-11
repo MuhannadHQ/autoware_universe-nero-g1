@@ -1,0 +1,18 @@
+<?xml version="1.0"?>
+<!-- [nero camfront 2026-11-09] camera0 (the forward wide camera) for perception: the driver's stream -> rectified pinhole image +
+     camera_info at one frame per lidar cycle. input_mode raw = the driver's sensor_msgs/Image, h265 = its H.265 CompressedImage. -->
+<launch>
+  <arg name="input_mode" default="raw"/>
+  <arg name="input_topic" default="/sensing/camera/camera0/image_raw"/>
+  <arg name="output/image" default="/sensing/camera/camera0/image_rect_color"/>
+  <arg name="output/camera_info" default="/sensing/camera/camera0/camera_info"/>
+  <arg name="param_path" default="$(find-pkg-share autoware_nero_camera0)/config/camera0.param.yaml"/>
+  <node pkg="autoware_nero_camera0" exec="camera0_node" name="camera0_node" namespace="/sensing/camera/camera0" output="screen">
+    <param from="$(var param_path)"/>
+    <param name="input_mode" value="$(var input_mode)"/>
+    <remap from="~/input/image" to="$(var input_topic)"/>
+    <remap from="~/input/h265" to="$(var input_topic)"/>
+    <remap from="~/output/image" to="$(var output/image)"/>
+    <remap from="~/output/camera_info" to="$(var output/camera_info)"/>
+  </node>
+</launch>
