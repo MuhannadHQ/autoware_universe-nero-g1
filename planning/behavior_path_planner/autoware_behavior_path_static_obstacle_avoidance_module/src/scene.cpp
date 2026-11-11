@@ -102,6 +102,177 @@ bool isDrivingSameLane(
   return !same_ids.empty();
 }
 
+// NERO_SOA_DRIVABLE_MERGE=1 (SOA14, mainlane-6 2026-11-11): the drivable lanes of this module combined with the previous
+// module's. Stock combineDrivableLanes matches lanes by lanelet id AND bound ids. The lane change hands over EXPANDED copies of
+// its lanes (drivable_area_left/right_bound_offset 0.2 / 0.1: new bound ids), so when this module runs on an approved lane
+// change none of its lanes match: the lane change's lanes from its second element on are appended BEHIND this module's,
+// e.g. [93795|93828,93834|93840] [140954|...|140951] [140436] [93795||93828] [140954||140953]. The manager's
+// cutOverlappedLanes then finds 93795 / 93828 twice (two or more elements apart), keeps the elements before the second copy
+// and cuts the path to the first ones it meets in order: only the path's piece on 140436, which ends where 93795 begins. With
+// the robot standing at the start of 93795 (s 3.0-3.5, the G1 waiting place after the right turn) the path ended 3.0-5.2 m
+// BEHIND it -> planning_validator "too far from ego in longitudinal direction" -> emergency-stop MRMs at standstill
+// (11-01 15:55 x2, 11-03 14:30, 11-08 13:54-13:55 x6; reproduced in logsim w110802, mainlane-6). Upstream main the same.
+// Acts only when the stock result would make that cut end the path less than 1 m ahead of the robot (emulated by lanelet
+// id with the first split duplicate as the overlap index: the manager's polygon test never finds a later one); then the
+// lanes are merged by lanelet id (an expanded copy is the same lanelet) and the previous module's elements before the
+// first one this module shares are kept in front (road order). Every other cycle: the stock result (the car).
+bool nero_soa_drivable_merge()
+{
+  static const bool on = [] {
+    const char * v = std::getenv("NERO_SOA_DRIVABLE_MERGE");
+    return v != nullptr && std::atoi(v) > 0;
+  }();
+  return on;
+}
+
+std::vector<lanelet::Id> neroDrivableIds(const DrivableLanes & d)
+{
+  std::vector<lanelet::Id> ids{d.right_lane.id(), d.left_lane.id()};
+  for (const auto & m : d.middle_lanes) ids.push_back(m.id());
+  return ids;
+}
+
+bool neroSharesLanelet(const DrivableLanes & a, const DrivableLanes & b)
+{
+  const auto ia = neroDrivableIds(a);
+  const auto ib = neroDrivableIds(b);
+  return std::any_of(ia.begin(), ia.end(), [&ib](const auto id) {
+    return std::find(ib.begin(), ib.end(), id) != ib.end();
+  });
+}
+
+// true if one lanelet id is held by two elements at least two apart (what getOverlappedLaneletId always reports)
+bool neroHasSplitDuplicate(const std::vector<DrivableLanes> & lanes)
+{
+  for (size_t i = 0; i + 2 < lanes.size(); ++i) {
+    for (size_t j = i + 2; j < lanes.size(); ++j) {
+      if (neroSharesLanelet(lanes.at(i), lanes.at(j))) return true;
+    }
+  }
+  return false;
+}
+
+// the manager's cutOverlappedLanes (Step 1 / Step 2) emulated by lanelet id, with the first split duplicate as the overlap
+// index; returns the index of the last path point it keeps (nullopt: nothing kept or no split duplicate)
+std::optional<size_t> neroLastPointKeptByCut(
+  const PathWithLaneId & path, const std::vector<DrivableLanes> & lanes, bool & has_dup)
+{
+  has_dup = false;
+  size_t j_dup = lanes.size();
+  for (size_t j = 2; j < lanes.size() && j_dup == lanes.size(); ++j) {
+    for (size_t i = 0; i + 2 <= j; ++i) {
+      if (neroSharesLanelet(lanes.at(i), lanes.at(j))) {
+        j_dup = j;
+        break;
+      }
+    }
+  }
+  if (j_dup == lanes.size()) return std::nullopt;
+  has_dup = true;
+  const auto in_lanes = [](const DrivableLanes & d, const auto & p) {
+    const auto ids = neroDrivableIds(d);
+    return std::any_of(p.lane_ids.begin(), p.lane_ids.end(), [&ids](const auto id) {
+      return std::find(ids.begin(), ids.end(), id) != ids.end();
+    });
+  };
+  size_t start = path.points.size();
+  for (size_t i = 0; i < path.points.size() && start == path.points.size(); ++i) {
+    for (size_t k = 0; k < j_dup; ++k) {
+      if (in_lanes(lanes.at(k), path.points.at(i))) {
+        start = i;
+        break;
+      }
+    }
+  }
+  std::optional<size_t> last;
+  std::set<size_t> kept;
+  for (size_t k = 0; k < j_dup; ++k) {
+    for (size_t i = start; i < path.points.size(); ++i) {
+      if (in_lanes(lanes.at(k), path.points.at(i)) && kept.count(i) == 0) {
+        kept.insert(i);
+        last = i;
+        continue;
+      }
+      start = i;
+      break;
+    }
+  }
+  return last;
+}
+
+// stock combineDrivableLanes with the lanelet match by id only, plus the previous module's elements before the first
+// shared one kept in front
+std::vector<DrivableLanes> neroCombineDrivableLanesById(
+  const std::vector<DrivableLanes> & original_drivable_lanes_vec,
+  const std::vector<DrivableLanes> & new_drivable_lanes_vec)
+{
+  const auto has_same_lane =
+    [](const lanelet::ConstLanelet & target_lane, const lanelet::ConstLanelets & lanes) {
+      return std::find_if(lanes.begin(), lanes.end(), [&](const auto & ll) {
+               return ll.id() == target_lane.id();
+             }) != lanes.end();
+    };
+  const auto convert_to_lanes = [](const DrivableLanes & drivable_lanes) {
+    auto lanes = drivable_lanes.middle_lanes;
+    lanes.push_back(drivable_lanes.right_lane);
+    lanes.push_back(drivable_lanes.left_lane);
+    return lanes;
+  };
+
+  std::optional<size_t> first_new_idx;
+  auto updated_drivable_lanes_vec = original_drivable_lanes_vec;
+  size_t new_drivable_lanes_idx = 0;
+  for (auto & updated_drivable_lanes : updated_drivable_lanes_vec) {
+    const auto opt_new_drivable_lanes_idx = [&]() -> std::optional<size_t> {
+      for (size_t n_idx = 0; n_idx < new_drivable_lanes_vec.size(); ++n_idx) {
+        for (const auto & ll : convert_to_lanes(updated_drivable_lanes)) {
+          if (has_same_lane(ll, convert_to_lanes(new_drivable_lanes_vec.at(n_idx)))) {
+            return n_idx;
+          }
+        }
+      }
+      return std::nullopt;
+    }();
+    if (!opt_new_drivable_lanes_idx) {
+      continue;
+    }
+    new_drivable_lanes_idx = *opt_new_drivable_lanes_idx;
+    if (!first_new_idx) first_new_idx = new_drivable_lanes_idx;
+    const auto & new_drivable_lanes = new_drivable_lanes_vec.at(new_drivable_lanes_idx);
+
+    if (has_same_lane(updated_drivable_lanes.left_lane, convert_to_lanes(new_drivable_lanes))) {
+      updated_drivable_lanes.left_lane = new_drivable_lanes.left_lane;
+    }
+    if (has_same_lane(updated_drivable_lanes.right_lane, convert_to_lanes(new_drivable_lanes))) {
+      updated_drivable_lanes.right_lane = new_drivable_lanes.right_lane;
+    }
+    for (const auto & middle_lane : convert_to_lanes(new_drivable_lanes)) {
+      if (!has_same_lane(middle_lane, convert_to_lanes(updated_drivable_lanes))) {
+        updated_drivable_lanes.middle_lanes.push_back(middle_lane);
+      }
+    }
+    auto & middle_lanes = updated_drivable_lanes.middle_lanes;
+    const auto right_id = updated_drivable_lanes.right_lane.id();
+    const auto left_id = updated_drivable_lanes.left_lane.id();
+    middle_lanes.erase(
+      std::remove_if(
+        middle_lanes.begin(), middle_lanes.end(),
+        [&](const auto & m) { return m.id() == right_id || m.id() == left_id; }),
+      middle_lanes.end());
+  }
+  if (new_drivable_lanes_idx + 1 < new_drivable_lanes_vec.size()) {
+    updated_drivable_lanes_vec.insert(
+      updated_drivable_lanes_vec.end(), new_drivable_lanes_vec.begin() + new_drivable_lanes_idx + 1,
+      new_drivable_lanes_vec.end());
+  }
+  if (first_new_idx && *first_new_idx > 0) {
+    updated_drivable_lanes_vec.insert(
+      updated_drivable_lanes_vec.begin(), new_drivable_lanes_vec.begin(),
+      new_drivable_lanes_vec.begin() + *first_new_idx);
+  }
+  return updated_drivable_lanes_vec;
+}
+
 bool isBestEffort(const std::string & policy)
 {
   return policy == "best_effort";
@@ -5550,6 +5721,45 @@ BehaviorModuleOutput StaticObstacleAvoidanceModule::plan()
 
     output.drivable_area_info = utils::combineDrivableAreaInfo(
       current_drivable_area_info, getPreviousModuleOutput().drivable_area_info);
+    // NERO_SOA_DRIVABLE_MERGE=1 (SOA14): see neroCombineDrivableLanesById above
+    bool nero_dup = false;
+    const auto nero_cut_end =
+      nero_soa_drivable_merge()
+        ? neroLastPointKeptByCut(output.path, output.drivable_area_info.drivable_lanes, nero_dup)
+        : std::nullopt;
+    const bool nero_chopped =
+      nero_dup && (!nero_cut_end || output.path.points.size() < 2 ||
+                   nero_mu::calcSignedArcLength(
+                     output.path.points, getEgoPosition(), *nero_cut_end) < 1.0);
+    if (nero_chopped) {
+      const auto merged = neroCombineDrivableLanesById(
+        current_drivable_area_info.drivable_lanes,
+        getPreviousModuleOutput().drivable_area_info.drivable_lanes);
+      static double nero_merge_last_log = 0.0;
+      const double now = clock_->now().seconds();
+      if (now - nero_merge_last_log > 1.0) {
+        nero_merge_last_log = now;
+        const std::string cut_str =
+          nero_cut_end ? std::to_string(nero_mu::calcSignedArcLength(
+                                          output.path.points, getEgoPosition(), *nero_cut_end)) +
+                           " m from ego"
+                       : std::string("with no point");
+        const auto dl = [](const std::vector<DrivableLanes> & v) {
+          std::string str;
+          for (const auto & d : v) {
+            str += "[" + std::to_string(d.right_lane.id()) + "|";
+            for (const auto & m : d.middle_lanes) str += std::to_string(m.id()) + ",";
+            str += "|" + std::to_string(d.left_lane.id()) + "] ";
+          }
+          return str;
+        };
+        RCLCPP_INFO(
+          getLogger(), "[NERO_SOA_DA_MERGE] stock %s(cut would end the path %s) -> merged %s(dup %d)",
+          dl(output.drivable_area_info.drivable_lanes).c_str(), cut_str.c_str(), dl(merged).c_str(),
+          static_cast<int>(neroHasSplitDuplicate(merged)));
+      }
+      output.drivable_area_info.drivable_lanes = merged;
+    }
 
     setDrivableLanes(output.drivable_area_info.drivable_lanes);
   }
