@@ -17,14 +17,22 @@
 
 #include "autoware/object_merger/object_association_merger_node.hpp"
 #include "autoware/object_recognition_utils/object_recognition_utils.hpp"
+#include "autoware/object_recognition_utils/matching.hpp"
 #include "autoware_utils/geometry/geometry.hpp"
+#include "autoware_utils_geometry/boost_geometry.hpp"
+#include "autoware_utils_geometry/boost_polygon_utils.hpp"
 
 #include <Eigen/Core>
 #include <Eigen/Geometry>
 
+#include <boost/geometry.hpp>
 #include <boost/optional.hpp>
 
 #include <chrono>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <exception>
 #include <map>
 #include <memory>
 #include <string>
@@ -59,6 +67,53 @@ bool isUnknownObjectOverlapped(
     autoware::object_recognition_utils::get2dGeneralizedIoU(unknown_object, known_object);
   return precision > precision_threshold || recall > recall_threshold ||
          generalized_iou > generalized_iou_threshold;
+}
+
+// NERO_MERGER_UNKNOWN_HULL=<min_cover> (camwall, 2026-11-10, research/merge41 REPORT.md / REPORT_d.md): an UNKNOWN whose shape is a
+// POLYGON and that the overlap test keeps is also dropped when the test on the CONVEX HULL of its footprint (the car's shape for every
+// UNKNOWN) passes for a known object AND the known objects within the test's distance together cover >= min_cover of its published
+// outline's area (the cluster is made of those vehicles). The kept object is published unchanged (NERO_SHAPE_UNKNOWN_CHI's faithful
+// outline). With the chi outline the test's generalized IoU fell below -0.1 for a one-frame cluster of a cut-in car's rear + a parked car
+// (11-08 19:13:33.4: -0.32 / -0.27 instead of the car's hull -0.06 / +0.01, coverage 0.845): it survived as an UNKNOWN across the path
+// and made a stop-now at 5.6 m/s. A work-zone wall with a parked car inside its hull stays (coverage <= 0.57 on the 11-08 trips; merged
+// vehicles >= 0.70). Never publishes what the test drops today; drops only what the car's test on the hull drops. Unset / < 0 = as before.
+double neroUnknownHullCover()
+{
+  static const double v = [] {
+    const char * e = std::getenv("NERO_MERGER_UNKNOWN_HULL");
+    double r = -1.0;
+    if (e != nullptr && e[0] != '\0') {
+      char * end = nullptr;
+      const double d = std::strtod(e, &end);
+      if (end != e && d >= 0.0) r = d;
+    }
+    std::fprintf(stderr, "[NERO_MERGER] unknown_hull=%s min_cover=%.3f\n", r >= 0.0 ? "on" : "off", r);
+    return r;
+  }();
+  return v;
+}
+
+// a copy of the object with its POLYGON footprint (object frame) replaced by that footprint's convex hull; pose untouched
+autoware_perception_msgs::msg::DetectedObject neroHullCopy(
+  const autoware_perception_msgs::msg::DetectedObject & object)
+{
+  autoware_utils_geometry::Polygon2d ring;
+  for (const auto & p : object.shape.footprint.points) {
+    boost::geometry::append(ring.outer(), autoware_utils_geometry::Point2d(p.x, p.y));
+  }
+  autoware_utils_geometry::Polygon2d hull;
+  boost::geometry::convex_hull(ring, hull);
+  auto copy = object;
+  if (hull.outer().size() < 4) return copy;  // fewer than 3 distinct vertices: the footprint as it is
+  copy.shape.footprint.points.clear();
+  for (std::size_t i = 0; i + 1 < hull.outer().size(); ++i) {  // the hull ring is closed: skip the repeated point
+    geometry_msgs::msg::Point32 q;
+    q.x = static_cast<float>(hull.outer()[i].x());
+    q.y = static_cast<float>(hull.outer()[i].y());
+    q.z = object.shape.footprint.points.front().z;
+    copy.shape.footprint.points.push_back(q);
+  }
+  return copy;
 }
 }  // namespace
 
@@ -221,6 +276,7 @@ void ObjectAssociationMergerNode::objectsCallback(
     }
     output_msg.objects.clear();
     output_msg.objects = known_objects;
+    const double nero_cover = neroUnknownHullCover();  // NERO_MERGER_UNKNOWN_HULL (< 0 = off)
     for (const auto & unknown_object : unknown_objects) {
       bool is_overlapped = false;
       for (const auto & known_object : known_objects) {
@@ -231,6 +287,59 @@ void ObjectAssociationMergerNode::objectsCallback(
               overlapped_judge_param_.generalized_iou_threshold)) {
           is_overlapped = true;
           break;
+        }
+      }
+      // [nero camwall] NERO_MERGER_UNKNOWN_HULL: the hull test + the vehicles' coverage of the outline (only for objects kept above)
+      if (
+        !is_overlapped && nero_cover >= 0.0 &&
+        unknown_object.shape.type == autoware_perception_msgs::msg::Shape::POLYGON &&
+        unknown_object.shape.footprint.points.size() >= 4) {
+        const auto hull_object = neroHullCopy(unknown_object);
+        bool hull_hit = false;
+        for (const auto & known_object : known_objects) {
+          if (isUnknownObjectOverlapped(
+                hull_object, known_object, overlapped_judge_param_.precision_threshold,
+                overlapped_judge_param_.recall_threshold,
+                overlapped_judge_param_.distance_threshold_map,
+                overlapped_judge_param_.generalized_iou_threshold)) {
+            hull_hit = true;
+            break;
+          }
+        }
+        if (hull_hit) {
+          namespace bg = boost::geometry;
+          auto outline = autoware_utils_geometry::to_polygon2d(unknown_object);
+          bg::correct(outline);
+          const double outline_area = std::abs(bg::area(outline));
+          autoware_utils_geometry::MultiPolygon2d known_union;
+          for (const auto & known_object : known_objects) {
+            const double d = overlapped_judge_param_.distance_threshold_map.at(
+              autoware::object_recognition_utils::getHighestProbLabel(known_object.classification));
+            if (
+              autoware_utils::calc_squared_distance2d(
+                unknown_object.kinematics.pose_with_covariance.pose,
+                known_object.kinematics.pose_with_covariance.pose) > d * d) {
+              continue;
+            }
+            auto kp = autoware_utils_geometry::to_polygon2d(known_object);
+            bg::correct(kp);
+            autoware_utils_geometry::MultiPolygon2d tmp;
+            try {
+              bg::union_(known_union, kp, tmp);
+            } catch (const std::exception &) {
+              continue;  // a failed union adds nothing (keeps the object = as today)
+            }
+            known_union.swap(tmp);
+          }
+          double cover = 0.0;
+          try {
+            autoware_utils_geometry::MultiPolygon2d covered;
+            bg::intersection(outline, known_union, covered);
+            cover = outline_area > 1e-6 ? std::abs(bg::area(covered)) / outline_area : 0.0;
+          } catch (const std::exception &) {
+            cover = 0.0;  // invalid geometry: the object is kept, as today
+          }
+          if (cover >= nero_cover) is_overlapped = true;
         }
       }
       if (!is_overlapped) {

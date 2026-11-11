@@ -17,6 +17,7 @@
 #include "autoware/shape_estimation/corrector/corrector.hpp"
 #include "autoware/shape_estimation/filter/filter.hpp"
 #include "autoware/shape_estimation/model/model.hpp"
+#include "autoware/shape_estimation/model/nero_chi_shape.hpp"
 
 #include <iostream>
 #include <memory>
@@ -90,7 +91,17 @@ bool ShapeEstimator::estimateOriginalShapeAndPose(
     model_ptr.reset(new model::ConvexHullShapeModel());
   }
 
-  return model_ptr->estimate(cluster, shape_output, pose_output);
+  if (!model::neroChiEnabled()) {
+    return model_ptr->estimate(cluster, shape_output, pose_output);
+  }
+  // NERO_SHAPE_UNKNOWN_CHI: the hull's footprint becomes the chi-shape of the points (wallbox_1107)
+  const bool ok = model_ptr->estimate(cluster, shape_output, pose_output);
+  if (ok && label != Label::PEDESTRIAN && !(
+    label == Label::CAR || label == Label::TRUCK || label == Label::BUS || label == Label::TRAILER ||
+    label == Label::MOTORCYCLE || label == Label::BICYCLE)) {
+    model::neroChiFootprint(cluster, pose_output, shape_output);
+  }
+  return ok;
 }
 
 bool ShapeEstimator::applyFilter(

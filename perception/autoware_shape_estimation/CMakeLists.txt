@@ -27,6 +27,7 @@ set(${PROJECT_NAME}_SOURCES
   lib/shape_estimator.cpp
   lib/model/bounding_box.cpp
   lib/model/convex_hull.cpp
+  lib/model/nero_chi_shape.cpp
   lib/model/cylinder.cpp
   lib/filter/car_filter.cpp
   lib/filter/bus_filter.cpp

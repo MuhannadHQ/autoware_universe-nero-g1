@@ -23,6 +23,7 @@
 #include "autoware/behavior_path_static_obstacle_avoidance_module/data_structs.hpp"
 #include "autoware/behavior_path_static_obstacle_avoidance_module/utils.hpp"
 
+#include <mutex>
 #include <Eigen/Dense>
 #include <autoware_lanelet2_extension/regulatory_elements/road_marking.hpp>
 #include <autoware_lanelet2_extension/utility/message_conversion.hpp>
@@ -2012,6 +2013,52 @@ void fillObjectEnvelopePolygon(
   object_data.envelope_poly = one_shot_envelope_poly;
 }
 
+// nero camwall: NERO_SOA_UNKNOWN_STILL_CLOCK=<cap_v>,<keep_s> (QUEUE WALL130): a STILL UNKNOWN keeps its stop clock (1) across
+// module instances: the registry (stopped_objects_) belongs to the instance and BPP replaces the instance, so a wall became a "new
+// object" whose first fast twist sample (a wall track's false speed 0.5-0.9 m/s) gave move_time = inf -> MOVING, else UNSTABLE for 3 s;
+// here the clock of an UNKNOWN registered as still is kept per object id process-wide and restored into a new instance (forgotten
+// keep_s after it was last seen); (2) against single fast samples: a registered still UNKNOWN reading faster than the moving speed
+// but slower than cap_v counts as still until it has been fast for moving_time_threshold IN A ROW (the module's own moving time).
+// Faster than cap_v (a rider, a walker, a car) -> stock at once. Unset = the car.
+namespace nero_still_clock
+{
+struct Cfg
+{
+  bool on{false};
+  double cap_v{1.2};
+  double keep_s{5.0};
+};
+const Cfg & cfg()
+{
+  static const Cfg c = [] {
+    Cfg o;
+    const char * e = std::getenv("NERO_SOA_UNKNOWN_STILL_CLOCK");
+    if (e == nullptr || *e == '\0') return o;
+    double a = 0.0, b = 0.0;
+    const int n = std::sscanf(e, "%lf,%lf", &a, &b);
+    if (n < 1 || !(a > 0.0)) return o;
+    o.on = true;
+    o.cap_v = a;
+    if (n >= 2 && b > 0.0) o.keep_s = b;
+    RCLCPP_INFO(
+      rclcpp::get_logger("static_obstacle_avoidance"), "[NERO_SOA_UNKNOWN_STILL_CLOCK] on: cap %.2f m/s, kept %.1f s", o.cap_v,
+      o.keep_s);
+    return o;
+  }();
+  return c;
+}
+struct Entry
+{
+  rclcpp::Time last_move;
+  rclcpp::Time last_stop;
+  geometry_msgs::msg::Pose init_pose;
+  double seen{0.0};
+  double fast_since{-1.0};
+};
+std::mutex g_mtx;
+std::map<std::array<std::uint8_t, 16>, Entry> g_table;
+}  // namespace nero_still_clock
+
 void fillObjectMovingTime(
   ObjectData & object_data, ObjectDataArray & stopped_objects,
   const std::shared_ptr<AvoidanceParameters> & parameters)
@@ -2021,15 +2068,79 @@ void fillObjectMovingTime(
 
   const auto & object_twist = object_data.object.kinematics.initial_twist_with_covariance.twist;
   const auto object_vel_norm = std::hypot(object_twist.linear.x, object_twist.linear.y);
-  const auto is_faster_than_threshold = object_vel_norm > object_parameter.moving_speed_threshold;
+  const auto raw_faster_than_threshold = object_vel_norm > object_parameter.moving_speed_threshold;
 
   const auto id = object_data.object.object_id;
+  const rclcpp::Time now = rclcpp::Clock(RCL_ROS_TIME).now();
+
+  // nero camwall NERO_SOA_UNKNOWN_STILL_CLOCK: restore a still UNKNOWN's registry entry kept from an earlier instance
+  const auto & ncl = nero_still_clock::cfg();
+  const bool ncl_on = ncl.on && object_type == ObjectClassification::UNKNOWN;
+  std::array<std::uint8_t, 16> ncl_key{};
+  std::copy(id.uuid.begin(), id.uuid.end(), ncl_key.begin());
+  double ncl_fast_since = -1.0;
+  if (ncl_on) {
+    std::lock_guard<std::mutex> lk(nero_still_clock::g_mtx);
+    auto & T = nero_still_clock::g_table;
+    for (auto it = T.begin(); it != T.end();) {
+      it = (now.seconds() - it->second.seen > ncl.keep_s) ? T.erase(it) : std::next(it);
+    }
+    const auto it = T.find(ncl_key);
+    if (it != T.end()) {
+      ncl_fast_since = it->second.fast_since;
+      const bool in_registry = std::any_of(
+        stopped_objects.begin(), stopped_objects.end(), [&id](const auto & o) { return o.object.object_id == id; });
+      if (!in_registry) {
+        ObjectData r = object_data;
+        r.last_move = it->second.last_move;
+        r.last_stop = it->second.last_stop;
+        r.init_pose = it->second.init_pose;
+        r.move_time = 0.0;
+        r.stop_time = (now - it->second.last_move).seconds();
+        stopped_objects.push_back(r);
+      }
+    }
+  }
+
   const auto same_id_obj = std::find_if(
     stopped_objects.begin(), stopped_objects.end(),
     [&id](const auto & o) { return o.object.object_id == id; });
 
   const auto is_new_object = same_id_obj == stopped_objects.end();
-  const rclcpp::Time now = rclcpp::Clock(RCL_ROS_TIME).now();
+
+  // nero camwall NERO_SOA_UNKNOWN_STILL_CLOCK: a registered still UNKNOWN's fast sample below cap_v is noise until it has been fast
+  // for the moving time in a row
+  if (ncl_on) {
+    ncl_fast_since = raw_faster_than_threshold ? (ncl_fast_since < 0.0 ? now.seconds() : ncl_fast_since) : -1.0;
+  }
+  const auto is_faster_than_threshold =
+    raw_faster_than_threshold &&
+    !(ncl_on && !is_new_object && object_vel_norm < ncl.cap_v &&
+      now.seconds() - ncl_fast_since < object_parameter.moving_time_threshold);
+  struct NclOnExit
+  {
+    bool on;
+    const std::array<std::uint8_t, 16> & key;
+    const unique_identifier_msgs::msg::UUID & id;
+    const ObjectDataArray & reg;
+    double now, fast_since;
+    ~NclOnExit()
+    {
+      if (!on) return;
+      std::lock_guard<std::mutex> lk(nero_still_clock::g_mtx);
+      const auto it = std::find_if(reg.begin(), reg.end(), [this](const auto & o) { return o.object.object_id == id; });
+      if (it == reg.end()) {
+        nero_still_clock::g_table.erase(key);  // moving (or never still): stock next time
+        return;
+      }
+      auto & e = nero_still_clock::g_table[key];
+      e.last_move = it->last_move;
+      e.last_stop = it->last_stop;
+      e.init_pose = it->init_pose;
+      e.seen = now;
+      e.fast_since = fast_since;
+    }
+  } ncl_on_exit{ncl_on, ncl_key, id, stopped_objects, now.seconds(), ncl_fast_since};
 
   // nero retaa: NERO_SOA_AMBIGUOUS_FRAGMENT (see nero_frag); the table is updated after the decision
   const auto & nf = nero_frag::env();

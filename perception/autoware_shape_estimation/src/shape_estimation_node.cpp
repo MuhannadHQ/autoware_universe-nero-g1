@@ -15,6 +15,7 @@
 #include "shape_estimation_node.hpp"
 
 #include "autoware/shape_estimation/shape_estimator.hpp"
+#include "autoware/shape_estimation/model/nero_chi_shape.hpp"
 #include "autoware_utils/math/unit_conversion.hpp"
 
 #include "autoware_perception_msgs/msg/object_classification.hpp"
@@ -72,6 +73,29 @@ ShapeEstimationNode::ShapeEstimationNode(const rclcpp::NodeOptions & node_option
   }
 #endif
 
+  // NERO_SHAPE_UNKNOWN_CHI field 7 (wallbox-4): the chi-shape only near the planned trajectory; unset = no subscription (the car)
+  if (model::neroChiCorridorWanted()) {
+    nero_path_sub_ = create_subscription<autoware_planning_msgs::msg::Trajectory>(
+      "/planning/scenario_planning/trajectory", rclcpp::QoS{1},
+      [this](const autoware_planning_msgs::msg::Trajectory::ConstSharedPtr msg) {
+        std::vector<std::array<double, 2>> p;
+        p.reserve(msg->points.size());
+        for (const auto & q : msg->points) p.push_back({q.pose.position.x, q.pose.position.y});
+        std::lock_guard<std::mutex> lk(nero_path_mtx_);
+        nero_path_map_.swap(p);
+        nero_path_t_ = rclcpp::Time(msg->header.stamp).seconds();
+      });
+    nero_kin_sub_ = create_subscription<nav_msgs::msg::Odometry>(
+      "/localization/kinematic_state", rclcpp::QoS{10}, [this](const nav_msgs::msg::Odometry::ConstSharedPtr msg) {
+        const double t = rclcpp::Time(msg->header.stamp).seconds();
+        std::lock_guard<std::mutex> lk(nero_path_mtx_);
+        if (!nero_kin_.empty() && t <= nero_kin_.back()[0]) nero_kin_.clear();  // time went back (a new replay)
+        nero_kin_.push_back(
+          {t, msg->pose.pose.position.x, msg->pose.pose.position.y, tf2::getYaw(msg->pose.pose.orientation)});
+        while (nero_kin_.size() > 2 && nero_kin_.front()[0] < t - 2.0) nero_kin_.pop_front();
+      });
+  }
+
   processing_time_publisher_ =
     std::make_unique<autoware_utils::DebugPublisher>(this, "shape_estimation");
   stop_watch_ptr_ = std::make_unique<autoware_utils::StopWatch<std::chrono::milliseconds>>();
@@ -107,6 +131,59 @@ void ShapeEstimationNode::callback(const DetectedObjectsWithFeature::ConstShared
   // Create output msg
   DetectedObjectsWithFeature output_msg;
   output_msg.header = input_msg->header;
+
+  // NERO_SHAPE_UNKNOWN_CHI field 7: the planned trajectory in this message's frame (a fresh plan, <= 1 s; else every cluster)
+  model::neroChiSetCorridor(nullptr);
+  if (nero_path_sub_) {
+    std::vector<std::array<double, 2>> pm;
+    double tp = -1.0;
+    bool ok = false;
+    double ex = 0.0, ey = 0.0, eyaw = 0.0;
+    const double ts = rclcpp::Time(input_msg->header.stamp).seconds();
+    {
+      std::lock_guard<std::mutex> lk(nero_path_mtx_);
+      pm = nero_path_map_;
+      tp = nero_path_t_;
+      // the robot (base_link) at the clusters' stamp: interpolated between the two kinematic states around it (<= 0.2 s away)
+      for (std::size_t i = 1; i < nero_kin_.size(); ++i) {
+        const auto & a = nero_kin_[i - 1];
+        const auto & b = nero_kin_[i];
+        if (a[0] <= ts && ts <= b[0] && b[0] - a[0] <= 0.2) {
+          const double w = b[0] > a[0] ? (ts - a[0]) / (b[0] - a[0]) : 0.0;
+          ex = a[1] + w * (b[1] - a[1]);
+          ey = a[2] + w * (b[2] - a[2]);
+          eyaw = a[3] + w * std::remainder(b[3] - a[3], 2.0 * M_PI);
+          ok = true;
+          break;
+        }
+      }
+      if (!ok && !nero_kin_.empty() && std::abs(nero_kin_.back()[0] - ts) <= 0.1) {  // the newest state just before the stamp
+        ex = nero_kin_.back()[1];
+        ey = nero_kin_.back()[2];
+        eyaw = nero_kin_.back()[3];
+        ok = true;
+      }
+    }
+    if (ok && pm.size() >= 2 && std::abs(ts - tp) <= 1.0 && input_msg->header.frame_id == "base_link") {
+      const double c = std::cos(eyaw);
+      const double s = std::sin(eyaw);
+      nero_path_local_.clear();
+      for (const auto & q : pm) {
+        const double dx = q[0] - ex;
+        const double dy = q[1] - ey;
+        nero_path_local_.push_back({c * dx + s * dy, -s * dx + c * dy});
+      }
+      model::neroChiSetCorridor(&nero_path_local_);
+      static const bool dbg = std::getenv("NERO_SHAPE_UNKNOWN_CHI_DEBUG") != nullptr;
+      if (dbg) {
+        double dmin = 1e9;
+        for (const auto & q : nero_path_local_) dmin = std::min(dmin, std::hypot(q[0], q[1]));
+        RCLCPP_INFO_THROTTLE(
+          get_logger(), *get_clock(), 1000, "[NERO_CHI_COR] stamp %.3f path_t %.3f ego (%.2f %.2f %.3f) path n %zu nearest %.2f",
+          ts, tp, ex, ey, eyaw, nero_path_local_.size(), dmin);
+      }
+    }
+  }
 
   // Create ml model input batch
   DetectedObjectsWithFeature input_trt_batch;

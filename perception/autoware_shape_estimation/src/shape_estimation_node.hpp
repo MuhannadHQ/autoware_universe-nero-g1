@@ -30,6 +30,13 @@
 
 #include <autoware_perception_msgs/msg/detected_objects.hpp>
 #include <tier4_perception_msgs/msg/detected_objects_with_feature.hpp>
+#include <autoware_planning_msgs/msg/trajectory.hpp>
+#include <nav_msgs/msg/odometry.hpp>
+
+#include <array>
+#include <deque>
+#include <mutex>
+#include <vector>
 
 #include <memory>
 
@@ -63,6 +70,15 @@ private:
 
   bool use_ml_shape_estimation_;
   size_t min_points_;
+
+  // NERO_SHAPE_UNKNOWN_CHI field 7 (wallbox-4): the planned trajectory (map) and the robot's pose history (map -> base_link)
+  rclcpp::Subscription<autoware_planning_msgs::msg::Trajectory>::SharedPtr nero_path_sub_;
+  rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr nero_kin_sub_;
+  std::deque<std::array<double, 4>> nero_kin_;  // t x y yaw, the last ~2 s
+  std::mutex nero_path_mtx_;
+  std::vector<std::array<double, 2>> nero_path_map_;
+  double nero_path_t_{-1.0};
+  std::vector<std::array<double, 2>> nero_path_local_;  // per message, the clusters' frame
 
 public:
   explicit ShapeEstimationNode(const rclcpp::NodeOptions & node_options);
