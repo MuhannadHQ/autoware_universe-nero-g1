@@ -97,6 +97,18 @@ rclcpp::Logger get_logger()
 
 bool is_mandatory_lane_change(const ModuleType lc_type)
 {
+  // NERO_ABLC_LANES=1 (mainlane 2026-11-11): avoidance_by_lane_change is NOT a route (mandatory) lane change. As one, its target
+  // lane came from getLaneChangeTarget (toward the preferred lane), which is empty while ego drives in its preferred lane, i.e.
+  // whenever it meets an object to pass: the module could never change lanes (sim: "path_cur 41680 -> tgt 0" with 41678 free).
+  // Non-mandatory: the lane beside that is not toward the preferred lane (getLaneChangeTargetExceptPreferredLane), the
+  // preferred current lane as the target neighbour. NORMAL lane changes unchanged; unset = upstream.
+  static const bool nero_ablc_lanes = [] {
+    const char * v = std::getenv("NERO_ABLC_LANES");
+    return v != nullptr && std::atoi(v) > 0;
+  }();
+  if (nero_ablc_lanes && lc_type == LaneChangeModuleType::AVOIDANCE_BY_LANE_CHANGE) {
+    return false;
+  }
   return lc_type == LaneChangeModuleType::NORMAL ||
          lc_type == LaneChangeModuleType::AVOIDANCE_BY_LANE_CHANGE;
 }

@@ -20,6 +20,8 @@
 #include "data_structs.hpp"
 
 #include <memory>
+#include <vector>
+#include <string>
 
 namespace autoware::behavior_path_planner
 {
@@ -45,6 +47,17 @@ public:
   bool specialExpiredCheck() const override;
 
   void updateSpecialData() override;
+
+  // NERO_ABLC_WAIT (mainlane): while waiting for a safe gap, stop where the change is still possible
+  void insert_stop_point(
+    const lanelet::ConstLanelets & lanelets, PathWithLaneId & path,
+    const bool is_waiting_approval = false) override;
+
+  // NERO_SOA_ABLC_HANDOFF (mainlane): the ids of the objects this module would change lanes for (avoid_required targets)
+  std::vector<std::string> nero_claim_ids() const;
+
+  // NERO_ABLC_LANES (mainlane): the nearest target that needs avoiding (call only with targets present)
+  const ObjectData & nero_nearest_required() const;
 
 private:
   std::shared_ptr<AvoidanceByLCParameters> avoidance_parameters_;

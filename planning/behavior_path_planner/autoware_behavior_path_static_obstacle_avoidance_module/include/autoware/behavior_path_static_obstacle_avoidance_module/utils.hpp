@@ -20,6 +20,7 @@
 #include "autoware/behavior_path_static_obstacle_avoidance_module/data_structs.hpp"
 
 #include <memory>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -275,6 +276,14 @@ double calcDistanceToAvoidStartLine(
  * @return error eclipse long radius.
  */
 double calcErrorEclipseLongRadius(const PoseWithCovariance & pose);
+
+// NERO_SOA_ABLC_HANDOFF=<hold_s> (mainlane 2026-11-11): avoidance_by_lane_change's claims on objects, shared inside the
+// behavior_path_planner process. avoidance_by_lane_change records the objects it requests a lane change for; static
+// avoidance leaves an object claimed within the last <hold_s> to it (unless it already shifts for it). <= 0 / unset: off.
+double nero_ablc_handoff_hold();
+void nero_ablc_claim(const std::vector<std::string> & ids, const double now_s);
+bool nero_ablc_claimed(const std::string & id, const double now_s);
+bool nero_ablc_claim_any(const double now_s);  // any claim within the hold
 
 }  // namespace autoware::behavior_path_planner::utils::static_obstacle_avoidance
 

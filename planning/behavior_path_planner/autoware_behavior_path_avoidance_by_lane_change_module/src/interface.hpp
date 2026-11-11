@@ -47,6 +47,10 @@ public:
 
   void processOnEntry() override;
 
+  void updateData() override;
+
+  void postProcess() override;
+
 protected:
   void updateRTCStatus(const double start_distance, const double finish_distance) override;
 };

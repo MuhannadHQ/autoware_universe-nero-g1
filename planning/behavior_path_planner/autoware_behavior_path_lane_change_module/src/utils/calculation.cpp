@@ -13,6 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <cstdlib>
 #include <autoware/behavior_path_lane_change_module/utils/calculation.hpp>
 #include <autoware/behavior_path_planner_common/utils/utils.hpp>
 #include <autoware/motion_utils/trajectory/path_shift.hpp>
@@ -302,6 +303,30 @@ std::vector<double> calc_shift_intervals(
   const auto direction = common_data_ptr->direction;
 
   auto intervals = route_handler_ptr->getLateralIntervalsToPreferredLane(lanes.back(), direction);
+  // NERO_ABLC_LANES=1 (mainlane 2026-11-11): avoidance_by_lane_change changes from the preferred lane to the lane beside it,
+  // so the intervals "to the preferred lane" are empty, every minimum length / distance buffer became DBL_MAX and its
+  // request ("object farther than the minimum lane change") could never pass. One change to the lane beside in `direction`
+  // (the same centreline-to-centreline measure upstream uses per change). Unset = upstream.
+  static const bool nero_ablc_lanes = [] {
+    const char * v = std::getenv("NERO_ABLC_LANES");
+    return v != nullptr && std::atoi(v) > 0;
+  }();
+  if (
+    nero_ablc_lanes && intervals.empty() && common_data_ptr->lc_type == LaneChangeModuleType::AVOIDANCE_BY_LANE_CHANGE &&
+    (direction == Direction::LEFT || direction == Direction::RIGHT)) {
+    // the first current lanelet with a lane-changeable neighbour on that side (the current lanes can run on for many
+    // lanelets past the object, to one with no neighbour: field logsim w1108_1747, last lanelet 42922 -> DBL_MAX)
+    const auto & graph = route_handler_ptr->getRoutingGraphPtr();
+    for (const auto & lane : lanes) {
+      const auto beside = direction == Direction::LEFT ? graph->left(lane) : graph->right(lane);
+      if (beside && !lane.centerline().empty() && !beside->centerline().empty()) {
+        const double d = lanelet::geometry::distance2d(
+          lanelet::utils::to2D(lane.centerline().front()), lanelet::utils::to2D(beside->centerline().front()));
+        intervals.push_back(direction == Direction::LEFT ? d : -d);
+        break;
+      }
+    }
+  }
   // NERO_LC_ROUTE_GATE=1 (routelc job 2026-10-26, QUEUE KRS): upstream counts every lane change to the preferred lane
   // as due before the end of the current lanes. Where the first target lane runs on in the route past that end (the
   // KRS road: 91174 -> 93732 -> 93726 -> 47326 -> 42025 beside the preferred 93787 -> 93781 -> 47324 -> 42027), only

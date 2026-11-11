@@ -48,6 +48,7 @@
 #include <cstdlib>
 #include <limits>
 #include <map>
+#include <unordered_map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -3274,5 +3275,65 @@ double calcErrorEclipseLongRadius(const PoseWithCovariance & pose)
   Eigen::SelfAdjointEigenSolver<Eigen::Matrix2d> eigensolver(xy_covariance);
 
   return std::sqrt(eigensolver.eigenvalues()(1));
+}
+
+// NERO_SOA_ABLC_HANDOFF (mainlane): see utils.hpp
+double nero_ablc_handoff_hold()
+{
+  static const double hold = [] {
+    const char * v = std::getenv("NERO_SOA_ABLC_HANDOFF");
+    const double h = v != nullptr ? std::atof(v) : -1.0;
+    if (h > 0.0) {
+      std::fprintf(stderr, "[NERO_SOA] ablc_handoff=%.2f\n", h);
+    }
+    return h;
+  }();
+  return hold;
+}
+
+namespace
+{
+std::mutex nero_ablc_claim_mutex;
+std::unordered_map<std::string, double> nero_ablc_claims;  // object id -> last claim time [s]
+}  // namespace
+
+void nero_ablc_claim(const std::vector<std::string> & ids, const double now_s)
+{
+  if (nero_ablc_handoff_hold() <= 0.0) {
+    return;
+  }
+  std::lock_guard<std::mutex> lock(nero_ablc_claim_mutex);
+  for (const auto & id : ids) {
+    nero_ablc_claims[id] = now_s;
+  }
+  if (nero_ablc_claims.size() > 64) {
+    for (auto it = nero_ablc_claims.begin(); it != nero_ablc_claims.end();) {
+      it = (now_s - it->second > 10.0 || now_s < it->second) ? nero_ablc_claims.erase(it) : std::next(it);
+    }
+  }
+}
+
+bool nero_ablc_claim_any(const double now_s)
+{
+  const double hold = nero_ablc_handoff_hold();
+  if (hold <= 0.0) {
+    return false;
+  }
+  std::lock_guard<std::mutex> lock(nero_ablc_claim_mutex);
+  for (const auto & [id, t] : nero_ablc_claims) {
+    if (now_s >= t && now_s - t <= hold) return true;
+  }
+  return false;
+}
+
+bool nero_ablc_claimed(const std::string & id, const double now_s)
+{
+  const double hold = nero_ablc_handoff_hold();
+  if (hold <= 0.0) {
+    return false;
+  }
+  std::lock_guard<std::mutex> lock(nero_ablc_claim_mutex);
+  const auto it = nero_ablc_claims.find(id);
+  return it != nero_ablc_claims.end() && now_s >= it->second && now_s - it->second <= hold;
 }
 }  // namespace autoware::behavior_path_planner::utils::static_obstacle_avoidance

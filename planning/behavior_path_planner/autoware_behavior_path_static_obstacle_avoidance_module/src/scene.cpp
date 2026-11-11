@@ -1201,6 +1201,46 @@ void StaticObstacleAvoidanceModule::fillFundamentalData(
     }
   }
 
+  // NERO_SOA_ABLC_HANDOFF=<hold_s> (mainlane 2026-11-11): a target avoidance_by_lane_change requested a lane change for
+  // within the last <hold_s> is left to it (other_objects, IS_NOT_TARGET_OBJECT), unless this module already shifts for
+  // it (its registered lines). Both modules sit in slot 2; avoidance_by_lane_change comes first and is exclusive while it
+  // requests, but any one cycle without its request (the cycle after a cancel by the lane change's strict hold: its lanes
+  // are rebuilt; a path search that finds nothing for a cycle) launched this module for the object, and an approved static
+  // avoidance never lets avoidance_by_lane_change start again (not simultaneous): it straddled round the object instead of
+  // changing lanes (sim lc05 drv_yield 1111-0813: approved change cancelled at 0.2 s, this module took the wall at once).
+  // Once avoidance_by_lane_change stops requesting for <hold_s> (object nearer than its minimum lengths, no lane, no path)
+  // the object is this module's again: the late fallback as before. Unset = the car.
+  // Only an APPROVED static avoidance keeps an object it has registered a line for: a waiting candidate registers its line
+  // too, and as a candidate it locks new module launches in the slot (lockNewModuleLaunch), so avoidance_by_lane_change
+  // could not even become a candidate (sim r24b: ABLC requested every cycle for 12 s while this module waited to shift).
+  if (utils::static_obstacle_avoidance::nero_ablc_handoff_hold() > 0.0 && !data.target_objects.empty()) {
+    const auto registered = generator_.getRawRegisteredShiftLine();
+    const bool approved = getCurrentStatus() == ModuleStatus::RUNNING;
+    const double now = clock_->now().seconds();
+    static std::unordered_map<std::string, double> last_log;
+    ObjectDataArray kept;
+    for (auto & o : data.target_objects) {
+      const auto id = to_hex_string(o.object.object_id);
+      const bool shifting_for_it = approved && std::any_of(registered.begin(), registered.end(), [&](const auto & al) {
+        return al.object.object.object_id == o.object.object_id;
+      });
+      if (!shifting_for_it && utils::static_obstacle_avoidance::nero_ablc_claimed(id, now)) {
+        o.info = ObjectInfo::IS_NOT_TARGET_OBJECT;
+        data.other_objects.push_back(o);
+        const auto sid = id.substr(0, 8);
+        if (now - last_log[sid] > 2.0) {
+          last_log[sid] = now;
+          RCLCPP_INFO(
+            getLogger(), "[NERO_SOA_ABLC] %s left to avoidance_by_lane_change: %.1f m ahead", sid.c_str(),
+            o.longitudinal);
+        }
+        continue;
+      }
+      kept.push_back(o);
+    }
+    data.target_objects = kept;
+  }
+
   // once an object filtered for boundary clipping, this module keeps the information until the end
   // of execution.
   utils::static_obstacle_avoidance::updateClipObject(clip_objects_, data);
@@ -6071,6 +6111,25 @@ void StaticObstacleAvoidanceModule::updateData()
 
   // update base path and target objects.
   fillFundamentalData(avoid_data_, debug_data_);
+
+  // NERO_SOA_ABLC_HANDOFF (mainlane): a static avoidance that is not approved yet (a waiting candidate) holds the slot's
+  // new-launch lock from the moment it registers a line (updatePathShifter -> lockNewModuleLaunch) until it exits, and the
+  // manager then drops every other request in the slot: avoidance_by_lane_change requested a change past a wall for 6 s while
+  // this module waited to nudge past kerb-parked cars, and the robot stood 5 m before the wall (sim S4 r32). While avoidance by
+  // lane change claims an object, release the lock: it comes first in the slot and takes over; this module's nudges come back
+  // once it stops claiming. An approved static avoidance keeps its lock (it already moves).
+  if (
+    utils::static_obstacle_avoidance::nero_ablc_handoff_hold() > 0.0 && isLockedNewModuleLaunch() &&
+    getCurrentStatus() != ModuleStatus::RUNNING &&
+    utils::static_obstacle_avoidance::nero_ablc_claim_any(clock_->now().seconds())) {
+    unlockNewModuleLaunch();
+    static double last_log = 0.0;
+    const double now = clock_->now().seconds();
+    if (now - last_log > 2.0) {
+      last_log = now;
+      RCLCPP_INFO(getLogger(), "[NERO_SOA_ABLC] waiting candidate released its launch lock: avoidance by lane change claims");
+    }
+  }
 
   // an empty path will kill further processing
   if (avoid_data_.reference_path.points.empty()) {

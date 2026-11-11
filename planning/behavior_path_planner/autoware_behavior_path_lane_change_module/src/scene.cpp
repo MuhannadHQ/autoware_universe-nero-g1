@@ -15,7 +15,10 @@
 #include "autoware/behavior_path_lane_change_module/scene.hpp"
 #include "autoware/behavior_path_planner_common/utils/nero_mu.hpp"  // NERO_BPP_PROJ_FAST
 #include <cstdio>
+#include <autoware_utils/ros/uuid_helper.hpp>
+
 #include <array>
+#include <deque>
 
 #include <chrono>
 #include <cstdlib>
@@ -399,6 +402,38 @@ void NormalLaneChange::update_transient_data(const bool is_approved)
     common_data_ptr_, common_data_ptr_->lanes_ptr->current, common_data_ptr_->get_ego_pose());
   transient_data.dist_to_terminal_start =
     transient_data.dist_to_terminal_end - transient_data.current_dist_buffer.min;
+
+  // NERO_LC_TERMINAL_OVERRUN=<m>[,<v>] (mainlane 2026-11-11): a robot that stands / crawls (< v, default 1.5 m/s) up to <m> past the
+  // change's terminal start borrows that much (+0.5 m) from the end-of-lane buffer for this cycle, so its terminal start lies just
+  // ahead of it and candidates exist again (the next change's buffer and the last change's 10 m end-of-lane buffer shrink by it;
+  // only while at least 5 m of the next buffer is left). Upstream: past the terminal start the prepare window is negative and no
+  // candidate can exist for the rest of the wait: 11-08 17:26 the robot stopped 1.4 m past the first of two left changes'
+  // terminal start at 93795 (its waiting stop 2 m before it + the chassis' stop overrun) and waited ~50 s with "cands 0" (logsim
+  // l2d_1726; l3g_1726: a prepare-window-only patch left the lane-changing phase without room). Unset = the car.
+  {
+    static const std::pair<double, double> overrun = [] {
+      double m = -1.0, v = 1.5;
+      if (const char * e = std::getenv("NERO_LC_TERMINAL_OVERRUN")) {
+        std::sscanf(e, "%lf,%lf", &m, &v);
+      }
+      return std::make_pair(m, v);
+    }();
+    const double past = -transient_data.dist_to_terminal_start;
+    const double borrow = past + 0.5;
+    if (
+      overrun.first > 0.0 && !is_approved && past >= 0.0 && past < overrun.first &&
+      std::abs(common_data_ptr_->get_ego_speed()) < overrun.second &&
+      transient_data.next_dist_buffer.min - borrow >= 5.0) {
+      transient_data.current_dist_buffer.min -= borrow;
+      transient_data.next_dist_buffer.min -= borrow;
+      transient_data.dist_to_terminal_start += borrow;
+      if (nero_lc_debug_every("terminal_overrun", 1000)) {
+        RCLCPP_INFO(
+          logger_, "[NERO_LC_OVERRUN] %.2f m past the terminal start at %.2f m/s: %.2f m borrowed from the end buffer (next %.1f)",
+          past, common_data_ptr_->get_ego_speed(), borrow, transient_data.next_dist_buffer.min);
+      }
+    }
+  }
 
   transient_data.dist_to_target_end = calculation::calc_dist_from_pose_to_terminal_end(
     common_data_ptr_, common_data_ptr_->lanes_ptr->target, common_data_ptr_->get_ego_pose());
@@ -996,6 +1031,22 @@ bool NormalLaneChange::isStoppedAtRedTrafficLight() const
 TurnSignalInfo NormalLaneChange::get_current_turn_signal_info() const
 {
   const auto original_turn_signal_info = prev_module_output_.turn_signal_info;
+
+  // NERO_ABLC_BLINK=1 (mainlane 2026-11-11): avoidance by lane change signals toward its target lane while it waits for a
+  // gap, as a route lane change does (upstream passes the previous module's blinker through for this module type, so the
+  // robot waited behind a wall / parked car with no blinker: target-lane drivers could not see it wanted in; sim r24c
+  // 2-12 s). Its signal while executing is unchanged. Unset = upstream.
+  static const bool nero_ablc_blink = [] {
+    const char * v = std::getenv("NERO_ABLC_BLINK");
+    return v != nullptr && std::atoi(v) > 0;
+  }();
+  if (
+    nero_ablc_blink && getModuleType() == LaneChangeModuleType::AVOIDANCE_BY_LANE_CHANGE &&
+    !get_current_lanes().empty() && (direction_ == Direction::LEFT || direction_ == Direction::RIGHT) &&
+    status_.is_valid_path) {
+    set_signal_activation_time();
+    return get_turn_signal(getEgoPose(), getLaneChangePath().info.lane_changing_end);
+  }
 
   if (getModuleType() != LaneChangeModuleType::NORMAL || get_current_lanes().empty()) {
     return original_turn_signal_info;
@@ -2498,6 +2549,66 @@ bool NormalLaneChange::check_candidate_path_safety(
     throw std::logic_error("Path footprint exceeds target lane boundary. Skip lane change.");
   }
 
+  // NERO_LC_PASSED_CLEAR=<m> (mainlane 2026-11-11): a STOPPED object in the target lane whose front is no longer ahead of
+  // ego's front is dropped by filter_target_lane_objects (neither leading nor trailing), so no check looks at it: a change
+  // back into the lane of a wall / parked car just passed started beside its end and swept the robot's body 0.59 m past
+  // its corner (sim lc05 drv_close r26, the keep-right return after avoidance by lane change); past the middle of a longer
+  // object it would turn into it. Keep the robot's footprint along the candidate (from ego to 5 m past the end of its lane
+  // changing) at least <m> from every such object (within 30 m behind). Unset = the car.
+  {
+    static const double passed_clear = [] {
+      const char * v = std::getenv("NERO_LC_PASSED_CLEAR");
+      return v != nullptr ? std::atof(v) : -1.0;
+    }();
+    if (passed_clear > 0.0 && candidate_path.path.points.size() >= 2) {
+      using utils::path_safety_checker::filter::velocity_filter;
+      const auto & lanes_polygon = *common_data_ptr_->lanes_polygon_ptr;
+      const auto stopped_th = common_data_ptr_->lc_param_ptr->safety.th_stopped_object_velocity;
+      // the dropped ones (others) and the leading stopped ones beside the robot (a wall whose far end is still just ahead of
+      // ego's front counts as leading: sim r40 returned past its end at 0.59 m with them only checked by the RSS polygons)
+      std::vector<const ExtendedPredictedObject *> passed;
+      const auto consider = [&](const auto & objs) {
+        for (const auto & o : objs) {
+          if (o.dist_from_ego < -30.0 || o.dist_from_ego - 0.5 * o.shape.dimensions.x > 5.0) continue;
+          if (!velocity_filter(o.initial_twist, -std::numeric_limits<double>::epsilon(), stopped_th)) continue;
+          if (boost::geometry::disjoint(o.initial_polygon, lanes_polygon.target)) continue;
+          passed.push_back(&o);
+        }
+      };
+      consider(filtered_objects_.others);
+      consider(filtered_objects_.target_lane_leading.stopped);
+      consider(filtered_objects_.target_lane_leading.stopped_at_bound);
+      if (!passed.empty()) {
+        const auto & pts = candidate_path.path.points;
+        const auto & vi = common_data_ptr_->bpp_param_ptr->vehicle_info;
+        const size_t i0 = autoware::motion_utils::findNearestIndex(pts, getEgoPosition());
+        const auto & lc_end = candidate_path.info.lane_changing_end.position;
+        double s_end = 0.0;
+        for (size_t i = i0 + 1; i < pts.size(); ++i) {
+          s_end += autoware_utils::calc_distance2d(pts.at(i - 1), pts.at(i));
+          if (autoware_utils::calc_distance2d(pts.at(i).point.pose.position, lc_end) < 1.0) break;
+        }
+        double s = 0.0;
+        double min_d = std::numeric_limits<double>::max();
+        for (size_t i = i0; i < pts.size() && s <= s_end; ++i) {
+          if (i > i0) s += autoware_utils::calc_distance2d(pts.at(i - 1), pts.at(i));
+          const auto fp = utils::lane_change::get_ego_footprint(pts.at(i).point.pose, vi);
+          for (const auto * o : passed) {
+            min_d = std::min(min_d, static_cast<double>(boost::geometry::distance(fp, o->initial_polygon)));
+          }
+        }
+        if (min_d < passed_clear) {
+          if (nero_lc_debug_every("passed_clear", 500)) {
+            RCLCPP_INFO(
+              logger_, "[NERO_LC_PASSED] candidate rejected: %.2f m from a stopped object just passed (< %.2f), %zu such",
+              min_d, passed_clear, passed.size());
+          }
+          throw std::logic_error("NERO: a stopped object just passed is too close to the lane change path.");
+        }
+      }
+    }
+  }
+
   if ((target_objects.empty()) || candidate_path.path.points.empty()) {
     RCLCPP_DEBUG(logger_, "There is nothing to check.");
     return true;
@@ -2760,7 +2871,20 @@ bool NormalLaneChange::nero_in_hold_mode() const
     const char * v = std::getenv("NERO_LC_HOLD_DIR");
     return v ? std::atoi(v) : 0;
   }();
-  if (hold_dir == 1 && direction_ != Direction::LEFT) {
+  // NERO_LC_HOLD_COMMITTED=1 (mainlane 2026-11-11, Fable research/r79 "B"): a RIGHT change that can no longer be cancelled
+  // (the robot past the change's shift start, or near the terminal: upstream then neither cancels nor aborts) is held like a
+  // left one while the robot is slow and its body still inside its lane. Without it a right change re-checks with the loose
+  // abort RSS only, and upstream's 'incoming rear object' stop brakes ALONG the sideways path after 6 unsafe cycles: sim
+  // D1108 y, a yielder standing 2.95 m behind drove off as the robot launched -> the car squeezed him to 0.47 m, held: 1.40 m.
+  // A right change still in its prepare phase keeps being cancelled as before (session 5's 18952 stall). Unset = the car.
+  static const bool hold_committed = [] {
+    const char * e = std::getenv("NERO_LC_HOLD_COMMITTED");
+    return e && std::atoi(e) != 0;
+  }();
+  if (
+    hold_dir == 1 && direction_ != Direction::LEFT &&
+    (!hold_committed || status_.lane_change_path.path.points.size() < 2 ||
+     (isEgoOnPreparePhase() && !is_near_terminal()))) {
     return false;
   }
   return utils::isEgoWithinOriginalLane(
@@ -3106,7 +3230,288 @@ PathSafetyStatus NormalLaneChange::isLaneChangePathSafe(
     });
   };
 
-  if (all_paths_collide(collision_check_objects.trailing)) {
+  // NERO_LC_R79_REAR=<a>,<t_react>,<t_gap> (mainlane 2026-11-11): a moving vehicle fully BEHIND the robot in the target lane is
+  // safe when, for every predicted step of the robot's change from the start of its lane changing on, the gap from the robot's
+  // rear to its front (it at constant speed) is at least UN R79 5.6.4.7's S_critical = dv t_react + dv^2 / (2 a) + v_ego t_gap
+  // (dv = v_rear - v_ego > 0): it can keep a t_gap gap behind the robot by braking <= a after t_react. The car's RSS (rear
+  // reaction 1.5 + 0.8 s, 1.5 m/s2) refused 15-28 m gaps behind 8-9 m/s cars to a robot launching from a crawl: 11-08 17:26 at
+  // 93795 the robot waited ~50 s (logsim l2d_1726). a = 2.5 m/s2 = MEASURE's bar for a target-lane car's braking. Any other
+  // object, and a rear car that fails it, is checked by the RSS as before. Unset = the car.
+  static const std::array<double, 4> nero_r79 = [] {
+    std::array<double, 4> p{-1.0, 0.4, 1.0, 0.0};
+    if (const char * e = std::getenv("NERO_LC_R79_REAR")) {
+      std::sscanf(e, "%lf,%lf,%lf,%lf", &p[0], &p[1], &p[2], &p[3]);
+    }
+    return p;
+  }();
+  // NERO_LC_R79_REAR 4th field = 1 (mainlane-4 2026-11-11, Fable research/r79 "A"; Ahmed 13:05 "there are no indicators on the car
+  // yet"): S_crit is judged at the predicted moment the robot's FOOTPRINT FIRST LEAVES ITS LANE (the first pose of its predicted
+  // path not within the current lanes), the rear car carried at its measured speed until then: with no indicator nothing tells
+  // the driver behind before the body is over the line, so his reaction (t_react, a) is counted from there. 0 / absent = from the
+  // start of the lane changing phase (the 1st version: it nosed the robot out in front of a driver who did not brake, D1108).
+  // NERO_LC_R79_YIELD=<hold_closing>,<hold_s>,<slowed>,<slowed_s>,<min_gap> (mainlane 2026-11-11, Ahmed ~09:5x: "it should know if a car
+  // is letting it by or not"): a rear car is LETTING THE ROBOT IN when its own MEASURED motion shows a hold: the gap from the robot's
+  // rear to its front has not shrunk faster than <hold_closing> m/s over the last <hold_s>, its speed dropped >= <slowed> m/s within
+  // the last <slowed_s>, and the gap is >= <min_gap> m. Then S_crit is judged on the gap NOW (no projection of its earlier speed
+  // over the prepare time). Field (Fable helper, research/rightchange: 156 episodes of a moving car behind in the next lane, 10 Hz):
+  // 0.3,1.0,1.0,4.0,3.0 fires on the real yields (818488 2.5 s before the field robot moved, 584c04) and never on a car that then
+  // passed; braking alone must never count (half of the braking cars pass anyway). A car speeding up >= 0.5 m/s2 over 1 s is
+  // taken at its speed after the reaction time. Nothing from a prediction or a blinker; no history yet = as R79 above.
+  // mainlane-4: its own gate (it works without NERO_LC_R79_REAR: then only measured holders leave the check, a 2.5 / t_gap 1.0), and
+  // a car once accepted as holding STAYS accepted while it keeps holding (gap not shrinking faster than <hold_closing>, >= <min_gap>,
+  // >= S_crit on the gap now) after its slowing has left the <slowed_s> window (sim K1103 y: the yielder stood 4 s and the robot
+  // launching in front of him was stopped); revoked the cycle it closes in.
+  static const std::array<double, 5> nero_yield = [] {
+    std::array<double, 5> p{-1.0, 1.0, 1.0, 4.0, 3.0};
+    if (const char * e = std::getenv("NERO_LC_R79_YIELD")) {
+      std::sscanf(e, "%lf,%lf,%lf,%lf,%lf", &p[0], &p[1], &p[2], &p[3], &p[4]);
+    }
+    return p;
+  }();
+  // NERO_LC_R79_SHIELD=<lateral m> (mainlane-4 2026-11-11): a car behind in the target lane that is directly behind ANOTHER car of
+  // the target lane (centres within <lateral m> across its heading, both four-wheeled) which stands or holds for the robot, cannot
+  // reach the robot's gap before that car moves; it is left out of the check (the car in front of it is checked as before). Sim
+  // K1103 y (13:15): E held 3.4 m behind, F stood behind E, G came up behind F at 7 m/s -> the strict check carried G at constant
+  // speed through F and E and stopped the robot's launch in front of E twice; the yield was wasted (104 s). Unset = off.
+  static const double nero_shield = [] {
+    const char * e = std::getenv("NERO_LC_R79_SHIELD");
+    return e ? std::atof(e) : -1.0;
+  }();
+  auto trailing_to_check = collision_check_objects.trailing;
+  if (
+    (nero_r79[0] > 0.0 || nero_yield[0] > 0.0) && !trailing_to_check.empty() &&
+    !ego_predicted_paths.empty()) {
+    const auto & vi = common_data_ptr_->bpp_param_ptr->vehicle_info;
+    const double t_lc = lane_change_path.info.duration.prepare;
+    const double stopped_th = lane_change_parameters_->safety.th_stopped_object_velocity;
+    const double a_r79 = nero_r79[0] > 0.0 ? nero_r79[0] : 2.5;
+    const double tgap_r79 = nero_r79[0] > 0.0 ? nero_r79[2] : 1.0;
+    struct NeroHist
+    {
+      std::deque<std::array<double, 3>> h;  // time, speed, gap behind the robot's rear
+      bool held{false};
+      double restart{-1e9};  // when it came (back) into the list at a crawl: it stood (standing cars are not in `trailing`)
+    };
+    static std::unordered_map<std::string, NeroHist> nero_hist;
+    const double now_s = clock_.now().seconds();
+    if (nero_hist.size() > 200) {  // forget cars not seen for 10 s
+      for (auto it = nero_hist.begin(); it != nero_hist.end();) {
+        it = (it->second.h.empty() || now_s - it->second.h.back()[0] > 10.0) ? nero_hist.erase(it) : std::next(it);
+      }
+    }
+    // A (4th field 1): per ego predicted path, the first pose whose footprint is not within the current lanes: its time, the arc
+    // length driven to it (forward progress only: an approved frenet path restarts its lane-changing poses at its own start) and the
+    // robot's speed there. Not found within the path = the car cannot be judged by R79 (left to the RSS).
+    struct NeroLeave
+    {
+      bool found{false};
+      double t{0.0}, s{0.0}, v{0.0};
+    };
+    std::vector<NeroLeave> leaves;
+    if (nero_r79[0] > 0.0 && nero_r79[3] > 0.5) {
+      const auto & lane_poly = common_data_ptr_->lanes_polygon_ptr->current;
+      const auto & ego_pose = getEgoPose();
+      const double c = std::cos(tf2::getYaw(ego_pose.orientation)), sn = std::sin(tf2::getYaw(ego_pose.orientation));
+      for (const auto & path : ego_predicted_paths) {
+        NeroLeave lv;
+        double s_e = 0.0, lon_max = -1e9;
+        const geometry_msgs::msg::Pose * prev = nullptr;
+        for (const auto & p : path) {
+          const double lon = (p.pose.position.x - ego_pose.position.x) * c + (p.pose.position.y - ego_pose.position.y) * sn;
+          if (lon < lon_max - 0.05) continue;  // a pose behind the furthest one taken (frenet restart)
+          lon_max = std::max(lon_max, lon);
+          if (prev != nullptr) s_e += autoware_utils::calc_distance2d(*prev, p.pose);
+          prev = &p.pose;
+          if (lane_poly.empty() || !utils::isEgoWithinOriginalLane(lane_poly, p.pose, planner_data_->parameters, 0.0)) {
+            lv = {true, std::max(0.0, static_cast<double>(p.time)), s_e, std::max(0.0, static_cast<double>(p.velocity))};
+            break;
+          }
+        }
+        leaves.push_back(lv);
+      }
+    }
+    const auto obj_front_of = [&](const ExtendedPredictedObject & o) {
+      return o.dist_from_ego + 0.5 * o.shape.dimensions.x;  // along the current lanes, ego base_link = 0
+    };
+    // the measured hold test (and its latch); updates the car's history once per call
+    // (called for every vehicle behind, standing ones too, so a holder's history has no hole when it stops and creeps on)
+    const auto measured_hold = [&](const ExtendedPredictedObject & o, const double v_r) {
+      if (nero_yield[0] <= 0.0) return false;
+      const std::string uid = autoware_utils::to_hex_string(o.uuid);
+      auto & st = nero_hist[uid];
+      auto & hh = st.h;
+      // mainlane-4 (Fable review 14:04): a car standing <= th_stopped_object_velocity is not in the target-lane trailing list at all,
+      // so a stand shows only as a HOLE in its history. A latch never survives a hole, and a car that comes (back) at a crawl stood:
+      // it is starting off (its history restarts, the restart time is kept for the A test below).
+      if (hh.empty() ? v_r < stopped_th + 0.5 : now_s - hh.back()[0] > 0.5) {
+        st.held = false;
+        if (v_r < stopped_th + 0.5) {
+          st.restart = now_s;
+          hh.clear();
+        }
+      }
+      const double gap_now = -vi.rear_overhang_m - obj_front_of(o);
+      if (hh.empty() || now_s - hh.back()[0] >= 0.09) hh.push_back({now_s, v_r, gap_now});
+      const double keep = std::max(nero_yield[1], nero_yield[3]) + 0.5;
+      while (!hh.empty() && now_s - hh.front()[0] > keep) hh.pop_front();
+      // the samples nearest to now - hold_s and the speed maximum within slowed_s
+      const std::array<double, 3> * h_hold = nullptr;
+      double v_max = v_r;
+      for (const auto & e : hh) {
+        if (now_s - e[0] <= nero_yield[3] + 1e-3) v_max = std::max(v_max, e[1]);
+        if (now_s - e[0] >= nero_yield[1] - 0.05 && (h_hold == nullptr || e[0] > (*h_hold)[0])) h_hold = &e;
+      }
+      if (h_hold == nullptr) return false;  // too young a history (the latch is kept for the next cycle)
+      const double dt = now_s - (*h_hold)[0];
+      const double closing = ((*h_hold)[2] - gap_now) / dt;  // > 0: the gap shrinks
+      const double v_e0 = std::max(0.0, getEgoVelocity());
+      const double dv0 = std::max(v_r - v_e0, 0.0);
+      const double s_now = dv0 * dv0 / (2.0 * a_r79) + v_e0 * tgap_r79;
+      const bool holding_now = closing <= nero_yield[0] && gap_now >= nero_yield[4] && gap_now >= s_now;
+      const bool new_hold = holding_now && v_max - v_r >= nero_yield[2];
+      const bool kept = holding_now && st.held;
+      if (new_hold || kept) {
+        if (nero_lc_debug_every("r79_hold_" + uid.substr(0, 6), 1000)) {
+          RCLCPP_INFO(
+            logger_,
+            "[NERO_LC_R79] %s %s for the robot: closing %.2f m/s over %.1f s, slowed %.1f m/s, gap %.1f m (S_crit now %.1f)",
+            uid.substr(0, 6).c_str(), new_hold ? "holds" : "still holds", closing, dt, v_max - v_r, gap_now, s_now);
+        }
+        st.held = true;
+        return true;
+      }
+      if (st.held && nero_lc_debug_every("r79_rev_" + uid.substr(0, 6), 1000)) {
+        RCLCPP_INFO(
+          logger_, "[NERO_LC_R79] %s no longer holds: closing %.2f m/s, gap %.1f m (S_crit now %.1f)",
+          uid.substr(0, 6).c_str(), closing, gap_now, s_now);
+      }
+      st.held = false;
+      return false;
+    };
+    // standing or holding four-wheelers behind the robot in the target lane (the shield)
+    const auto four_wheeler = [](const ExtendedPredictedObject & o) {
+      using L = autoware_perception_msgs::msg::ObjectClassification;
+      const auto lb = o.classification.label;
+      return lb == L::CAR || lb == L::TRUCK || lb == L::BUS || lb == L::TRAILER;
+    };
+    std::vector<const ExtendedPredictedObject *> blockers;
+    std::unordered_map<const ExtendedPredictedObject *, bool> held_now;
+    for (const auto & o : trailing_to_check) {
+      const double v_r = std::hypot(o.initial_twist.linear.x, o.initial_twist.linear.y);
+      const bool behind = obj_front_of(o) <= -vi.rear_overhang_m;
+      const bool hold = behind && utils::path_safety_checker::filter::is_vehicle(o.classification) &&
+                        measured_hold(o, v_r) && v_r > stopped_th;
+      held_now[&o] = hold;
+      if (nero_shield > 0.0 && behind && four_wheeler(o) && (v_r <= stopped_th || hold)) blockers.push_back(&o);
+    }
+    const auto shielded = [&](const ExtendedPredictedObject & o) -> const ExtendedPredictedObject * {
+      if (nero_shield <= 0.0 || !four_wheeler(o)) return nullptr;
+      const double yaw = tf2::getYaw(o.initial_pose.orientation);
+      for (const auto * b : blockers) {
+        if (b == &o) continue;
+        const double b_rear = b->dist_from_ego - 0.5 * b->shape.dimensions.x;
+        if (b_rear < obj_front_of(o) || b_rear - obj_front_of(o) > 20.0) continue;  // not in front of it / too far for its line
+        const double dx = b->initial_pose.position.x - o.initial_pose.position.x;
+        const double dy = b->initial_pose.position.y - o.initial_pose.position.y;
+        const double yaw_b = tf2::getYaw(b->initial_pose.orientation);
+        if (
+          std::abs(-dx * std::sin(yaw) + dy * std::cos(yaw)) <= nero_shield &&
+          std::abs(-dx * std::sin(yaw_b) + dy * std::cos(yaw_b)) <= nero_shield) {
+          return b;  // on its line by both headings, within 20 m (Fable review 14:04: at 30 m a 2 deg yaw error is 1 m)
+        }
+      }
+      return nullptr;
+    };
+    const auto r79_safe = [&](const ExtendedPredictedObject & o) {
+      double v_r = std::hypot(o.initial_twist.linear.x, o.initial_twist.linear.y);
+      if (v_r <= stopped_th || !utils::path_safety_checker::filter::is_vehicle(o.classification)) return false;
+      const double obj_front = obj_front_of(o);
+      if (obj_front > -vi.rear_overhang_m) return false;  // not fully behind the robot
+      if (held_now[&o]) return true;                      // measured hold, judged on the gap now (above)
+      if (const auto * b = shielded(o)) {
+        if (nero_lc_debug_every("r79_shield", 1000)) {
+          RCLCPP_INFO(
+            logger_, "[NERO_LC_R79] %s is behind %s (%s) in the target lane: shielded",
+            autoware_utils::to_hex_string(o.uuid).substr(0, 6).c_str(),
+            autoware_utils::to_hex_string(b->uuid).substr(0, 6).c_str(),
+            held_now[b] ? "holding" : "standing");
+        }
+        return true;
+      }
+      if (nero_r79[0] <= 0.0) return false;  // NERO_LC_R79_YIELD alone: only measured holders leave the check
+      const double t_react = nero_r79[1];
+      if (nero_yield[0] > 0.0) {  // the speed-up correction of the hold test's history (no new sample)
+        const auto it = nero_hist.find(autoware_utils::to_hex_string(o.uuid));
+        // a car that STOOD within the last <slowed_s> and moves now is starting off: his speed by the time the robot is at the
+        // line is unknown, so he is never let out by the constant-speed test (sim D1108 y, mlfix7: the yielder standing 2.95 m
+        // behind drove off as the robot launched; judged at his first 1-2 m/s he passed S_crit and the strict hold came ~3 s
+        // late, the robot 0.6 m out of its lane). The stand is the hole / crawl start marked in measured_hold.
+        if (it != nero_hist.end() && now_s - it->second.restart <= nero_yield[3]) {
+          if (nero_lc_debug_every("r79_start", 1000)) {
+            RCLCPP_INFO(
+              logger_, "[NERO_LC_R79] %s starts off behind (%.1f m/s, %.1f s after its stand): left to the RSS",
+              autoware_utils::to_hex_string(o.uuid).substr(0, 6).c_str(), v_r, now_s - it->second.restart);
+          }
+          return false;
+        }
+        if (it != nero_hist.end() && it->second.h.size() >= 2) {
+          const auto & hh = it->second.h;
+          for (auto e = hh.rbegin(); e != hh.rend(); ++e) {  // the newest sample at least hold_s old
+            const double dt = now_s - (*e)[0];
+            if (dt >= nero_yield[1] - 0.05 && dt > 0.0) {
+              const double acc = (v_r - (*e)[1]) / dt;
+              if (acc >= 0.5) v_r += acc * t_react;  // measured: speeding up; its speed after the reaction time
+              break;
+            }
+          }
+        }
+      }
+      if (!leaves.empty()) {  // A: at the moment the robot's footprint leaves its lane
+        for (const auto & lv : leaves) {
+          if (!lv.found) return false;
+          const double gap = (lv.s - vi.rear_overhang_m) - (obj_front + v_r * lv.t);
+          const double dv = std::max(v_r - lv.v, 0.0);
+          const double s_crit = dv * t_react + dv * dv / (2.0 * nero_r79[0]) + lv.v * nero_r79[2];
+          if (gap < s_crit) return false;
+        }
+        return true;
+      }
+      // S_critical at the moment the robot starts to move into the target lane (UN R79: "shall not start a lane change if ...");
+      // it already contains the rear car's closing and braking, so it is not re-applied to every later step at constant speed
+      // (that refused a yielding car 10 m back at +0.8 m/s: sim r45)
+      for (const auto & path : ego_predicted_paths) {
+        double s_e = 0.0;
+        bool checked = false;
+        for (size_t i = 0; i < path.size(); ++i) {
+          if (i > 0) s_e += autoware_utils::calc_distance2d(path.at(i - 1).pose, path.at(i).pose);
+          if (path.at(i).time + 1e-3 < t_lc) continue;
+          const double v_e = std::max(0.0, static_cast<double>(path.at(i).velocity));
+          const double gap = (s_e - vi.rear_overhang_m) - (obj_front + v_r * path.at(i).time);
+          const double dv = std::max(v_r - v_e, 0.0);
+          const double s_crit = dv * t_react + dv * dv / (2.0 * nero_r79[0]) + v_e * nero_r79[2];
+          if (gap < s_crit) return false;
+          checked = true;
+          break;
+        }
+        if (!checked) return false;
+      }
+      return true;
+    };
+    std::vector<ExtendedPredictedObject> kept;
+    kept.reserve(trailing_to_check.size());
+    for (const auto & o : trailing_to_check) {
+      if (!r79_safe(o)) kept.push_back(o);
+    }
+    const auto n0 = trailing_to_check.size();
+    if (kept.size() < n0 && nero_lc_debug_every("r79", 1000)) {
+      RCLCPP_INFO(
+        logger_, "[NERO_LC_R79] %zu of %zu car(s) behind in the target lane pass S_crit (a %.1f%s): RSS skipped for them",
+        n0 - kept.size(), n0, a_r79, (nero_r79[0] > 0.0 && nero_r79[3] > 0.5) ? ", at the line" : "");
+    }
+    trailing_to_check = std::move(kept);
+  }
+
+  if (all_paths_collide(trailing_to_check)) {
     return {!is_safe, is_object_behind_ego};
   }
 
