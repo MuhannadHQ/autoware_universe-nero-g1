@@ -21,7 +21,11 @@
   <!-- [nero 2026-11-10 camstack] (QUEUE CAMSTACK) the camera0 node in C++ (autoware_nero_camera0_rect: the same parameters / outputs as the
        Python node, which stays as NERO_CAMERA0_NODE=py): in the logsim replays the Python node fell 0.7-1.0 s behind under load (CAMLAT).
        NERO_CAMERA0_CONTAINER=<container> loads it into that existing container with intra-process comms (the car: the camera driver's
-       container of cross_left, so its raw frames arrive by pointer); unset: a node of its own. -->
+       container of cross_left, so its raw frames arrive by pointer); unset: a node of its own.
+       [nero 2026-11-11 camera0 input] NERO_CAMERA0_CONTAINER=driver: Autoware starts NO camera0_node; the camera driver's own launch
+       (nero-jetson-bridge sensing_camera_stream/run_stream_cameras.sh, which the launcher starts for streaming) reads the same switches,
+       publishes that camera raw at 30 Hz and loads camera0_node into its container, so camera0 lives and dies with the driver (an Autoware
+       Restart that keeps the cameras up never loads a second one). YOLOX and the filter below run as usual. -->
   <let name="cam0_node" value="$(env NERO_CAMERA0_NODE cpp)"/>
   <let name="cam0_container" value="$(env NERO_CAMERA0_CONTAINER '')"/>
   <group if="$(eval &quot;'$(var cam0_node)' == 'cpp' and '$(var cam0_container)' == ''&quot;)">
@@ -32,7 +36,7 @@
       <arg name="output/camera_info" value="$(var camera0/info)"/>
     </include>
   </group>
-  <group if="$(eval &quot;'$(var cam0_node)' == 'cpp' and '$(var cam0_container)' != ''&quot;)">
+  <group if="$(eval &quot;'$(var cam0_node)' == 'cpp' and '$(var cam0_container)' not in ('', 'driver')&quot;)">
     <include file="$(find-pkg-share autoware_nero_camera0_rect)/launch/camera0_rect_load.launch.xml">
       <arg name="container" value="$(var cam0_container)"/>
       <arg name="input_mode" value="$(var input_mode)"/>
