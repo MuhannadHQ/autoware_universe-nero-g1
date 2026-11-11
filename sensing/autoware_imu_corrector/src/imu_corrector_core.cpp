@@ -75,8 +75,11 @@ ImuCorrector::ImuCorrector(const rclcpp::NodeOptions & options)
 
   accel_stddev_imu_link_ = declare_parameter<double>("acceleration_stddev", 10000.0);
 
+  // [nero 2026-11-11] depth 10 (was 1): the 100 Hz IMU reaches this node in short bursts under load (USB delivery, executor
+  // scheduling); with depth 1 every sample but the newest of a burst was overwritten: nero-jetson lost 13.8 % at FTDI 16 ms and
+  // still ~1.5 % at 1 ms in a loaded run, while the raw IMU was a full 100 Hz. gyro_odometer downstream already uses 100.
   imu_sub_ = create_subscription<sensor_msgs::msg::Imu>(
-    "input", rclcpp::QoS{1}, std::bind(&ImuCorrector::callback_imu, this, std::placeholders::_1));
+    "input", rclcpp::QoS{10}, std::bind(&ImuCorrector::callback_imu, this, std::placeholders::_1));
 
   imu_pub_ = create_publisher<sensor_msgs::msg::Imu>("output", rclcpp::QoS{10});
 }
