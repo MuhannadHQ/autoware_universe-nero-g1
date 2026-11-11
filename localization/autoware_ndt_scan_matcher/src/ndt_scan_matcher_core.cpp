@@ -218,7 +218,7 @@ NDTScanMatcher::NDTScanMatcher(const rclcpp::NodeOptions & options)
 
   diagnostics_scan_points_ = std::make_unique<DiagnosticsInterface>(this, "scan_matching_status");
   diagnostics_initial_pose_ =
-    std::make_unique<DiagnosticsInterface>(this, "initial_pose_subscriber_status");
+    std::make_unique<nero_diag::RateLimitedDiagnostics>(this, "initial_pose_subscriber_status");
   diagnostics_map_update_ = std::make_unique<DiagnosticsInterface>(this, "map_update_status");
   diagnostics_ndt_align_ = std::make_unique<DiagnosticsInterface>(this, "ndt_align_service_status");
   diagnostics_trigger_node_ =

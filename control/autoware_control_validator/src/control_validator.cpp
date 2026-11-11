@@ -18,15 +18,32 @@
 #include "autoware/motion_utils/trajectory/interpolation.hpp"
 #include "autoware/motion_utils/trajectory/trajectory.hpp"
 #include "autoware_vehicle_info_utils/vehicle_info_utils.hpp"
+#include "nero_diag_gate.hpp"
 
 #include <algorithm>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <unordered_map>
 #include <utility>
 
 namespace autoware::control_validator
 {
+namespace
+{
+// [nero 2026-11-11 DIAGHZ] NERO_DIAG_HZ: the updater was force-updated on every control command (~46 per second).
+// The gate holds it back only while every check is valid; while any check fails, every cycle goes out as before (the
+// key is the invalid count), and the return to valid goes out at once. Per validator, outside the class layout.
+nero_diag::Gate & neroValidatorDiagGate(const void * validator)
+{
+  static std::mutex mutex;
+  static std::unordered_map<const void *, nero_diag::Gate> gates;
+  std::lock_guard<std::mutex> lock(mutex);
+  return gates[validator];
+}
+}  // namespace
+
 using diagnostic_msgs::msg::DiagnosticStatus;
 
 void LatencyValidator::validate(
@@ -312,7 +329,11 @@ void ControlValidator::on_control_cmd(const Control::ConstSharedPtr msg)
   // post process
   validation_status_.invalid_count =
     is_all_valid(validation_status_) ? 0 : validation_status_.invalid_count + 1;
-  diag_updater_.force_update();
+  if (neroValidatorDiagGate(this).pass(
+        validation_status_.invalid_count == 0 ? 0 : 1 + static_cast<int>(validation_status_.invalid_count),
+        std::string())) {
+    diag_updater_.force_update();
+  }
 
   publish_debug_info(kinematics_msg->pose.pose);
   display_status();

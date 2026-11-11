@@ -22,6 +22,7 @@
 #include "hyper_parameters.hpp"
 #include "map_update_module.hpp"
 #include "ndt_omp/multigrid_ndt_omp.h"
+#include "nero_diag_gate.hpp"
 
 #include <autoware_utils/ros/logger_level_configure.hpp>
 #include <rclcpp/rclcpp.hpp>
@@ -213,7 +214,8 @@ private:
 
   std::atomic<bool> is_activated_;
   std::unique_ptr<DiagnosticsInterface> diagnostics_scan_points_;
-  std::unique_ptr<DiagnosticsInterface> diagnostics_initial_pose_;
+  // [nero 2026-11-11 DIAGHZ] one status per EKF pose (50 per second): NERO_DIAG_HZ limits it
+  std::unique_ptr<nero_diag::RateLimitedDiagnostics> diagnostics_initial_pose_;
   std::unique_ptr<DiagnosticsInterface> diagnostics_regularization_pose_;
   std::unique_ptr<DiagnosticsInterface> diagnostics_map_update_;
   std::unique_ptr<DiagnosticsInterface> diagnostics_ndt_align_;

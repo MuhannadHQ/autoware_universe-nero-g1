@@ -18,6 +18,7 @@
 #include "autoware/motion_utils/trajectory/trajectory.hpp"
 #include "autoware_utils/geometry/geometry.hpp"
 #include "autoware_utils/math/normalization.hpp"
+#include "nero_diag_gate.hpp"
 
 #include "autoware_internal_planning_msgs/msg/scenario.hpp"
 
@@ -40,6 +41,18 @@ namespace autoware::motion::control::pid_longitudinal_controller
 {
 namespace
 {
+// [nero 2026-11-11 DIAGHZ] NERO_DIAG_HZ: the shared diagnostic updater was force-updated every control cycle (30 Hz)
+// by this controller and again by the lateral one. The gate lets it through at most NERO_DIAG_HZ per second and at
+// once when the control state changes (EMERGENCY = ERROR in checkControlState()). Per controller, outside the class
+// layout.
+nero_diag::Gate & neroPidDiagGate(const void * controller)
+{
+  static std::mutex mutex;
+  static std::unordered_map<const void *, nero_diag::Gate> gates;
+  std::lock_guard<std::mutex> lock(mutex);
+  return gates[controller];
+}
+
 // [nero] NERO_PID_SLOPE_STOP (slopestop, QUEUE SMSG): settings and state per controller, outside
 // the class layout
 struct NeroSlopeStop
@@ -616,7 +629,10 @@ trajectory_follower::LongitudinalOutput PidLongitudinalController::run(
   publishDebugData(ctrl_cmd, control_data);
 
   // diagnostic
-  diag_updater_->force_update();
+  // [nero 2026-11-11 DIAGHZ] the control state is what checkControlState() reports
+  if (neroPidDiagGate(this).pass(static_cast<int>(m_control_state), std::string())) {
+    diag_updater_->force_update();
+  }
 
   return output;
 }

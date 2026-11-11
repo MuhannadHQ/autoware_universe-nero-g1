@@ -59,7 +59,7 @@ LocalizationErrorMonitor::LocalizationErrorMonitor(const rclcpp::NodeOptions & o
   logger_configure_ = std::make_unique<autoware_utils::LoggerLevelConfigure>(this);
 
   diagnostics_error_monitor_ =
-    std::make_unique<autoware_utils::DiagnosticsInterface>(this, "ellipse_error_status");
+    std::make_unique<nero_diag::RateLimitedDiagnostics>(this, "ellipse_error_status");
 }
 
 void LocalizationErrorMonitor::on_odom(nav_msgs::msg::Odometry::ConstSharedPtr input_msg)

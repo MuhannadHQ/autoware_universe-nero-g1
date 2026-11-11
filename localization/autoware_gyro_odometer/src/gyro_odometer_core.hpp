@@ -16,6 +16,7 @@
 #define GYRO_ODOMETER_CORE_HPP_
 
 #include "autoware_utils/ros/diagnostics_interface.hpp"
+#include "nero_diag_gate.hpp"
 #include "autoware_utils/ros/logger_level_configure.hpp"
 #include "autoware_utils/ros/msg_covariance.hpp"
 #include "autoware_utils/ros/transform_listener.hpp"
@@ -80,7 +81,8 @@ private:
   std::deque<geometry_msgs::msg::TwistWithCovarianceStamped> vehicle_twist_queue_;
   std::deque<sensor_msgs::msg::Imu> gyro_queue_;
 
-  std::unique_ptr<autoware_utils::DiagnosticsInterface> diagnostics_;
+  // [nero 2026-11-11 DIAGHZ] one status per IMU and per twist message (~220 per second): NERO_DIAG_HZ limits it
+  std::unique_ptr<nero_diag::RateLimitedDiagnostics> diagnostics_;
 };
 
 }  // namespace autoware::gyro_odometer

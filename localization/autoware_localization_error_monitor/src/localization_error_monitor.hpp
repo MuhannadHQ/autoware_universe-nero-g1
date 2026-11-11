@@ -17,6 +17,7 @@
 
 #include "autoware/localization_util/covariance_ellipse.hpp"
 #include "autoware_utils/ros/diagnostics_interface.hpp"
+#include "nero_diag_gate.hpp"
 
 #include <Eigen/Dense>
 #include <autoware_utils/ros/logger_level_configure.hpp>
@@ -39,7 +40,8 @@ private:
 
   std::unique_ptr<autoware_utils::LoggerLevelConfigure> logger_configure_;
 
-  std::unique_ptr<autoware_utils::DiagnosticsInterface> diagnostics_error_monitor_;
+  // [nero 2026-11-11 DIAGHZ] one status per EKF odometry (~50 per second): NERO_DIAG_HZ limits it
+  std::unique_ptr<nero_diag::RateLimitedDiagnostics> diagnostics_error_monitor_;
 
   double scale_;
   double error_ellipse_size_;

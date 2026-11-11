@@ -21,6 +21,7 @@
 #include "autoware/mpc_lateral_controller/vehicle_model/vehicle_model_bicycle_kinematics.hpp"
 #include "autoware/mpc_lateral_controller/vehicle_model/vehicle_model_bicycle_kinematics_no_delay.hpp"
 #include "autoware_vehicle_info_utils/vehicle_info_utils.hpp"
+#include "nero_diag_gate.hpp"
 #include "tf2/utils.h"
 #include "tf2_ros/create_timer_ros.h"
 
@@ -43,6 +44,17 @@ namespace autoware::motion::control::mpc_lateral_controller
 {
 namespace
 {
+// [nero 2026-11-11 DIAGHZ] NERO_DIAG_HZ: the shared diagnostic updater was force-updated every control cycle (30 Hz)
+// by this controller and again by the longitudinal one. The gate lets it through at most NERO_DIAG_HZ per second and
+// at once when the MPC result or its failure reason changes. Per controller, outside the class layout.
+nero_diag::Gate & neroMpcDiagGate(const void * controller)
+{
+  static std::mutex mutex;
+  static std::unordered_map<const void *, nero_diag::Gate> gates;
+  std::lock_guard<std::mutex> lock(mutex);
+  return gates[controller];
+}
+
 // [nero] NERO_MPC_CONVERGE_WINDOW=<s> (pulloff, QUEUE PULLOFF): the steadiness window of isMpcConverged() (the MPC's own
 // steering solution within mpc_converged_threshold_rps over the window). Upstream hard-codes 1.0 s; the PID keeps
 // the robot stopped until the steering is converged (keep_stopped_until_steer_convergence), so after a release that
@@ -352,7 +364,12 @@ trajectory_follower::LateralOutput MpcLateralController::run(
   }
   m_mpc_solved_status = mpc_solved_status;  // for diagnostic updater
 
-  diag_updater_->force_update();
+  // [nero 2026-11-11 DIAGHZ] OK / ERROR + reason as setStatus() reports them
+  if (neroMpcDiagGate(this).pass(
+        m_mpc_solved_status.result ? 0 : 2,
+        m_mpc_solved_status.result ? std::string() : m_mpc_solved_status.reason)) {
+    diag_updater_->force_update();
+  }
 
   // reset previous MPC result
   // Note: When a large deviation from the trajectory occurs, the optimization stops and
