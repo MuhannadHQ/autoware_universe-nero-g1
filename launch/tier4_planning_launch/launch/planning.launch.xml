@@ -40,7 +40,10 @@
     </group>
 
     <!-- planning evaluator -->
-    <group>
+    <!-- [nero 2026-11-12 CPU] NERO_PLANNING_EVALUATOR=0: not launched. A debug evaluator (planning metrics topics; nothing on
+         the car reads them, the trip bags do not record them): 4 % of one core on the parked car. Unset or any other value:
+         launched as before. -->
+    <group if="$(eval &quot;'$(env NERO_PLANNING_EVALUATOR 1)'.strip().lower() not in ('0', 'false', 'off', 'no')&quot;)">
       <include file="$(find-pkg-share autoware_planning_evaluator)/launch/planning_evaluator.launch.xml"/>
     </group>
 

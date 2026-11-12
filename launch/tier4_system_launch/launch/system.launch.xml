@@ -67,7 +67,10 @@
     </group>
 
     <!-- Processing Time Checker -->
-    <group>
+    <!-- [nero 2026-11-12 CPU] NERO_PROCESSING_TIME_CHECKER=0: not launched. A debug evaluator (one metrics topic built from
+         every node's processing_time_ms; nothing on the car reads it, the trip bags record the per-node topics themselves):
+         6 % of one core on the parked car. Unset or any other value: launched as before. -->
+    <group if="$(eval &quot;'$(env NERO_PROCESSING_TIME_CHECKER 1)'.strip().lower() not in ('0', 'false', 'off', 'no')&quot;)">
       <include file="$(find-pkg-share autoware_processing_time_checker)/launch/processing_time_checker.launch.xml">
         <arg name="config_file" value="$(var processing_time_checker_param_path)"/>
       </include>
