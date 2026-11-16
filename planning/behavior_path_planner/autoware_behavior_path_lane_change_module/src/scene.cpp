@@ -846,6 +846,25 @@ void NormalLaneChange::update_transient_data(const bool is_approved)
         }
       }
       held = cmd;
+      // NERO_LC_INCH_BACK_STAND=<v m/s> (mainlane-20 2026-11-16, Fable research/b3/FABLE_YAWLOCK.md): a STANDING robot cannot drive the pull-back;
+      // the return bend from its lateral place to the hug level (inch_back_len ahead of it) then stays in front of it, every frenet candidate's
+      // prepare segment is cut from it and its joint with the lane-changing part fails the stock 10 deg yaw test: 15 Nov B3 replayed on the
+      // ready set (sim 1116-131858) stood 0.37 m out after a cancel mid-move and rejected 27 of 27 candidates for 23 s ("Excessive yaw
+      // difference 10.20"), o04 1111-100459 the same (11.73). Below <v> while pulling back the inched path keeps the robot's lateral place
+      // (no ramp); held / pulling / cmd are unchanged, so the pull-back resumes the moment the robot rolls. Unset = the car.
+      static const double inch_back_stand = [] {
+        const char * v = std::getenv("NERO_LC_INCH_BACK_STAND");
+        const double x = (v != nullptr && *v != '\0') ? std::atof(v) : -1.0;
+        if (x > 0.0) {
+          RCLCPP_INFO(
+            rclcpp::get_logger("lane_change"),
+            "[NERO_LC_INCH_BACK_STAND] on: below %.2f m/s a pull-back keeps the robot's lateral place (no return bend in front of a "
+            "standing robot)", x);
+        }
+        return x;
+      }();
+      const bool back_stand =
+        pulling && inch_back_stand > 0.0 && std::abs(common_data_ptr_->get_ego_speed()) < inch_back_stand;
       double s_a = std::max(0.0, s_stop - inch_ramp);
       double s_b = std::max(s_a + 0.5 * inch_ramp, s_stop);
       if (pulling) {
@@ -858,7 +877,7 @@ void NormalLaneChange::update_transient_data(const bool is_approved)
           arc += autoware_utils::calc_distance2d(path.points.at(i - 1), path.points.at(i));
         }
         double off = ego_lat;
-        if (i > ego_idx && arc > s_a) {
+        if (!back_stand && i > ego_idx && arc > s_a) {
           const double x = std::clamp((arc - s_a) / (s_b - s_a), 0.0, 1.0);
           off = ego_lat + (cmd - ego_lat) * x * x * (3.0 - 2.0 * x);
         }
@@ -870,8 +889,8 @@ void NormalLaneChange::update_transient_data(const bool is_approved)
       autoware::motion_utils::insertOrientation(path.points, true);
       if (nero_lc_debug_tick("inch")) {
         RCLCPP_INFO(
-          logger_, "[NERO_LC] inch safe %d threat %d back %d cmd %.2f full %.2f ego_lat %.2f s_stop %.1f room %.2f",
-          inch_safe, inch_threat, pulling, cmd, full, ego_lat, s_stop, room);
+          logger_, "[NERO_LC] inch safe %d threat %d back %d cmd %.2f full %.2f ego_lat %.2f s_stop %.1f room %.2f%s",
+          inch_safe, inch_threat, pulling, cmd, full, ego_lat, s_stop, room, back_stand ? " stand 1" : "");
       }
     } else if (is_approved) {
       inch_cmd_held.erase(this);
