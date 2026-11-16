@@ -2434,6 +2434,109 @@ void compensateLostTargetObjects(
   }
 }
 
+// NERO_SOA_FIX_10669=1: port of upstream #10669 (see utils.hpp). Unset = the car.
+bool nero_fix_10669()
+{
+  static const bool fix = [] {
+    const char * v = std::getenv("NERO_SOA_FIX_10669");
+    return v != nullptr && std::atoi(v) > 0;
+  }();
+  return fix;
+}
+
+void compensateLostTargetObjects(
+  AvoidancePlanningData & data, const ObjectDataArray & stored_objects,
+  const std::shared_ptr<const PlannerData> & planner_data)
+{
+  // Check if object is currently detected
+  const auto is_detected = [&](const auto & object_id) {
+    return std::any_of(
+      data.target_objects.begin(), data.target_objects.end(),
+      [&object_id](const auto & o) { return o.object.object_id == object_id; });
+  };
+
+  // Check if object should be ignored
+  const auto is_ignored = [&](const auto & object_id) {
+    return std::any_of(
+      data.other_objects.begin(), data.other_objects.end(),
+      [&object_id](const auto & o) { return o.object.object_id == object_id; });
+  };
+
+  // Add stored objects that are not currently detected or ignored
+  for (const auto & stored_object : stored_objects) {
+    if (is_detected(stored_object.object.object_id)) {
+      continue;
+    }
+    if (is_ignored(stored_object.object.object_id)) {
+      continue;
+    }
+
+    const auto & ego_pos = planner_data->self_odometry->pose.pose.position;
+    auto object_copy = stored_object;
+    fillLongitudinalAndLengthByClosestEnvelopeFootprint(
+      data.reference_path_rough, ego_pos, object_copy);
+
+    data.target_objects.push_back(object_copy);
+  }
+}
+
+void updateStoredObjects(
+  ObjectDataArray & stored_objects, const ObjectDataArray & current_objects,
+  const rclcpp::Time & now, const std::shared_ptr<AvoidanceParameters> & parameters)
+{
+  // Match function to update stored objects with current detections
+  const auto match = [&current_objects](auto & object) {
+    const auto & search_id = object.object.object_id;
+    const auto same_id_object = std::find_if(
+      current_objects.begin(), current_objects.end(),
+      [&search_id](const auto & o) { return o.object.object_id == search_id; });
+
+    if (same_id_object != current_objects.end()) {
+      object = *same_id_object;
+      return true;
+    }
+
+    const auto similar_pos_obj =
+      std::find_if(current_objects.begin(), current_objects.end(), [&object](const auto & o) {
+        constexpr double position_threshold = 1.5;
+        return calc_distance2d(object.getPose(), o.getPose()) < position_threshold;
+      });
+
+    if (similar_pos_obj != current_objects.end()) {
+      object = *similar_pos_obj;
+      return true;
+    }
+
+    return false;
+  };
+
+  // Remove expired objects
+  const auto itr = std::remove_if(
+    stored_objects.begin(), stored_objects.end(), [&now, &match, &parameters](auto & o) {
+      if (!match(o)) {
+        o.lost_time = (now - o.last_seen).seconds();
+      } else {
+        o.last_seen = now;
+        o.lost_time = 0.0;
+      }
+      return o.lost_time > parameters->object_last_seen_threshold;
+    });
+  stored_objects.erase(itr, stored_objects.end());
+
+  // Add new objects
+  const auto include = [](const auto & objects, const auto & search_id) {
+    return std::any_of(objects.begin(), objects.end(), [&search_id](const auto & o) {
+      return o.object.object_id == search_id;
+    });
+  };
+
+  for (const auto & current_object : current_objects) {
+    if (!include(stored_objects, current_object.object.object_id)) {
+      stored_objects.push_back(current_object);
+    }
+  }
+}
+
 void updateClipObject(ObjectDataArray & clip_objects, AvoidancePlanningData & data)
 {
   std::for_each(data.target_objects.begin(), data.target_objects.end(), [](auto & o) {
@@ -2826,6 +2929,31 @@ lanelet::ConstLanelets getAdjacentLane(
         }
       }
     }
+  }
+
+  // NERO_SOA_FIX_10890=1: port of upstream #10890: index loop instead of the range-for that push_back()s into the vector it
+  // walks (iterator invalidation, UB). Unset = the car (the range-for).
+  static const bool fix_10890 = [] {
+    const char * v = std::getenv("NERO_SOA_FIX_10890");
+    return v != nullptr && std::atoi(v) > 0;
+  }();
+  // NERO_SOA_FIX_11106=1: port of upstream #11106 (on top of #10890; either switch leaves the range-for): only the lanes
+  // collected above get their next lanes (the size is fixed before the loop), not the next lanes' next lanes as well.
+  static const bool fix_11106 = [] {
+    const char * v = std::getenv("NERO_SOA_FIX_11106");
+    return v != nullptr && std::atoi(v) > 0;
+  }();
+  if (fix_10890 || fix_11106) {
+    const auto lanes_size = lanes.size();
+    for (std::size_t i = 0; i < (fix_11106 ? lanes_size : lanes.size()); ++i) {
+      const auto & lane = lanes[i];
+      for (const auto & next_lane : rh->getNextLanelets(lane)) {
+        if (!exist(next_lane.id())) {
+          lanes.push_back(next_lane);
+        }
+      }
+    }
+    return lanes;
   }
 
   for (const auto & lane : lanes) {

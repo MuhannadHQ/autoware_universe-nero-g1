@@ -502,6 +502,25 @@ std::pair<LaneChangeStates, std::string_view> LaneChangeInterface::check_transit
     return {LaneChangeStates::Abort, "Aborting"};
   }
 
+  // NERO_LC_FIX_11599=1: port of upstream #11599: cancel ("EgoOutOfLanes") when ego's closest route lanelet is in
+  // neither the current nor the target lanes (re-engaged mid-change after a takeover, or lanes rebuilt elsewhere: the
+  // path was distorted toward lanes ego is not in). Waiting or approved alike. Unset = the car.
+  static const bool fix_11599 = [] {
+    const char * v = std::getenv("NERO_LC_FIX_11599");
+    return v != nullptr && std::atoi(v) > 0;
+  }();
+  if (fix_11599 && !module_type_->is_ego_in_current_or_target_lanes()) {
+    return {LaneChangeStates::Cancel, "EgoOutOfLanes"};
+  }
+
+  // NERO_LC_FIX_12280=1: port of upstream #12280: cancel ("MissedLaneChangePath") when ego is laterally farther from
+  // the lane change path than a speed-dependent threshold, or has passed its shift end by more than
+  // threshold_longitudinal with no part of its footprint in the target lanes; the module is then re-planned. Off
+  // (returns false at once) unless the switch set enable_path_miss_detection (LaneChangeModuleManager). Unset = the car.
+  if (module_type_->hasMissedLaneChangePath()) {
+    return {LaneChangeStates::Cancel, "MissedLaneChangePath"};
+  }
+
   if (isWaitingApproval()) {
     if (module_type_->is_near_regulatory_element()) {
       return {LaneChangeStates::Cancel, "CloseToRegElement"};

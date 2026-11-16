@@ -330,6 +330,20 @@ CandidateOutput assignToCandidate(
 std::optional<lanelet::ConstLanelet> get_lane_change_target_lane(
   const CommonDataPtr & common_data_ptr, const lanelet::ConstLanelets & current_lanes)
 {
+  // NERO_LC_FIX_12039=1: port of upstream #12039's lane change half: the target lane is searched from the current lanes
+  // that are not behind ego (a current lane whose end is behind ego no longer yields a target lane; route_handler's
+  // getLaneChangeTarget / ...ExceptPreferredLane took the first current lane with a neighbour, behind ego or not: the
+  // module activated for a change already done). The rules per lanelet are upstream's copy of the route_handler ones.
+  // Unset = the car.
+  static const bool fix_12039 = [] {
+    const char * v = std::getenv("NERO_LC_FIX_12039");
+    return v != nullptr && std::atoi(v) > 0;
+  }();
+  if (fix_12039) {
+    const bool is_mandatory_lc = is_mandatory_lane_change(common_data_ptr->lc_type);
+    return get_target_lane(common_data_ptr, current_lanes, is_mandatory_lc);
+  }
+
   const auto direction = common_data_ptr->direction;
   const auto route_handler_ptr = common_data_ptr->route_handler_ptr;
   if (is_mandatory_lane_change(common_data_ptr->lc_type)) {
@@ -337,6 +351,103 @@ std::optional<lanelet::ConstLanelet> get_lane_change_target_lane(
   }
 
   return route_handler_ptr->getLaneChangeTargetExceptPreferredLane(current_lanes, direction);
+}
+
+std::optional<lanelet::ConstLanelet> get_target_lane_for_mandatory_lane_change(
+  const CommonDataPtr & common_data_ptr, const lanelet::ConstLanelet & ref_lane)
+{
+  const auto direction = common_data_ptr->direction;
+  const auto route_handler_ptr = common_data_ptr->route_handler_ptr;
+  const auto routing_graph_ptr = route_handler_ptr->getRoutingGraphPtr();
+
+  const bool is_intersection_ll = std::invoke([&]() -> bool {
+    const std::string id = ref_lane.attributeOr("intersection_area", "else");
+    return id != "else" && std::atoi(id.c_str());
+  });
+
+  const int num = route_handler_ptr->getNumLaneToPreferredLane(ref_lane, direction);
+  if (num == 0) return std::nullopt;
+  if (direction == Direction::NONE || direction == Direction::RIGHT) {
+    if (num < 0) {
+      const auto right_lanes = is_intersection_ll ? routing_graph_ptr->adjacentRight(ref_lane)
+                                                  : routing_graph_ptr->right(ref_lane);
+      if (right_lanes) return *right_lanes;
+    }
+  }
+
+  if (direction == Direction::NONE || direction == Direction::LEFT) {
+    if (num > 0) {
+      const auto left_lanes = is_intersection_ll ? routing_graph_ptr->adjacentLeft(ref_lane)
+                                                 : routing_graph_ptr->left(ref_lane);
+      if (left_lanes) return *left_lanes;
+    }
+  }
+  return std::nullopt;
+}
+
+std::optional<lanelet::ConstLanelet> get_target_lane_for_non_mandatory_lane_change(
+  const CommonDataPtr & common_data_ptr, const lanelet::ConstLanelet & ref_lane)
+{
+  const auto direction = common_data_ptr->direction;
+  const auto route_handler_ptr = common_data_ptr->route_handler_ptr;
+  const auto routing_graph_ptr = route_handler_ptr->getRoutingGraphPtr();
+
+  if (direction == Direction::RIGHT) {
+    // Get right lanelet if preferred lane is on the left
+    if (route_handler_ptr->getNumLaneToPreferredLane(ref_lane, direction) < 0) {
+      return std::nullopt;
+    }
+
+    const auto right_lanes = routing_graph_ptr->right(ref_lane);
+    if (right_lanes) {
+      return *right_lanes;
+    }
+  }
+
+  if (direction == Direction::LEFT) {
+    // Get left lanelet if preferred lane is on the right
+    if (route_handler_ptr->getNumLaneToPreferredLane(ref_lane, direction) > 0) {
+      return std::nullopt;
+    }
+    const auto left_lanes = routing_graph_ptr->left(ref_lane);
+    if (left_lanes) {
+      return *left_lanes;
+    }
+  }
+  return std::nullopt;
+}
+
+std::optional<lanelet::ConstLanelet> get_target_lane(
+  const CommonDataPtr & common_data_ptr, const lanelet::ConstLanelets & current_lanes,
+  const bool is_mandatory_lc)
+{
+  const auto & ego_pose = common_data_ptr->get_ego_pose();
+  const auto & route_handler_ptr = common_data_ptr->route_handler_ptr;
+  const auto current_lanes_path =
+    route_handler_ptr->getCenterLinePath(current_lanes, 0.0, std::numeric_limits<double>::max());
+
+  auto is_lanelet_behind_ego = [&](const lanelet::ConstLanelet & lanelet) {
+    const auto lanelet_end = lanelet.centerline2d().back().basicPoint2d();
+    const auto lanelet_end_position =
+      autoware_utils::create_point(lanelet_end.x(), lanelet_end.y(), 0.0);
+    // mainlane-5 (nero_lint): called per current lanelet every cycle -> nero_mu (copy-free with the car's NERO_BPP_PROJ_FAST=1, the
+    // same numbers: bppstall_1103's check mode 2), not upstream's motion_utils call that copies the path per call
+    const auto dist_from_ego = nero_mu::calcSignedArcLength(
+      current_lanes_path.points, ego_pose.position, lanelet_end_position);
+    return dist_from_ego < 0.0;
+  };
+
+  for (const auto & lanelet : current_lanes) {
+    if (is_lanelet_behind_ego(lanelet)) continue;
+
+    const auto target_lane =
+      is_mandatory_lc ? get_target_lane_for_mandatory_lane_change(common_data_ptr, lanelet)
+                      : get_target_lane_for_non_mandatory_lane_change(common_data_ptr, lanelet);
+
+    if (target_lane) return target_lane;
+  }
+
+  return std::nullopt;
 }
 
 std::vector<PoseWithVelocityStamped> convert_to_predicted_path(
@@ -394,6 +505,78 @@ std::vector<PoseWithVelocityStamped> convert_to_predicted_path(
       path.points, vehicle_pose_frenet.length + length);
 
     predicted_path.emplace_back(t, pose, velocity);
+  }
+
+  return predicted_path;
+}
+
+// NERO_LC_FIX_11360=1: port of upstream #11360. Read once. Unset = the car.
+bool nero_lc_fix_11360()
+{
+  static const bool fix = [] {
+    const char * v = std::getenv("NERO_LC_FIX_11360");
+    return v != nullptr && std::atoi(v) > 0;
+  }();
+  return fix;
+}
+
+std::vector<PoseWithVelocityStamped> convert_to_predicted_path(
+  const CommonDataPtr & common_data_ptr, const LaneChangePath & lane_change_path)
+{
+  if (lane_change_path.path.points.empty()) {
+    return {};
+  }
+
+  const auto & path = lane_change_path.path;
+  const auto & vehicle_pose = common_data_ptr->get_ego_pose();
+  const auto & bpp_param_ptr = common_data_ptr->bpp_param_ptr;
+  // upstream's calc_arc_length (nearest segment with soft constraints, then the frenet length)
+  const auto calc_arc_length = [&](const geometry_msgs::msg::Pose & pose) {
+    const auto nearest_seg_idx = nero_mu::findFirstNearestSegmentIndexWithSoftConstraints(
+      path.points, pose, bpp_param_ptr->ego_nearest_dist_threshold,
+      bpp_param_ptr->ego_nearest_yaw_threshold);
+    return convertToFrenetPoint(path.points, pose.position, nearest_seg_idx).length;
+  };
+  const auto ego_arc_length = calc_arc_length(vehicle_pose);
+
+  const auto & lc_start = lane_change_path.info.lane_changing_start;
+  const auto lc_start_arc_length = calc_arc_length(lc_start);
+
+  const auto & lc_end = lane_change_path.info.lane_changing_end;
+  const auto lc_end_arc_length = calc_arc_length(lc_end);
+
+  const auto initial_velocity = common_data_ptr->get_ego_speed();
+  const auto duration = lane_change_path.info.duration.sum();
+  const auto & lc_param_ptr = common_data_ptr->lc_param_ptr;
+  const auto resolution = lc_param_ptr->safety.collision_check.prediction_time_resolution;
+  std::vector<PoseWithVelocityStamped> predicted_path;
+  predicted_path.reserve(static_cast<size_t>(std::ceil(duration / resolution)));
+  const auto curr_acc = std::max(common_data_ptr->get_current_accel(), 0.0);
+
+  auto prev_vel = initial_velocity;
+  const auto calc_velocity = [&](const auto dt) {
+    auto vel = prev_vel + curr_acc * dt;
+    if (ego_arc_length < lc_start_arc_length) {
+      vel = std::clamp(vel, 0.0, lane_change_path.info.velocity.prepare);
+    } else {
+      vel = std::clamp(
+        vel, lc_param_ptr->trajectory.min_lane_changing_velocity,
+        lane_change_path.info.velocity.lane_changing);
+    }
+    return vel;
+  };
+
+  for (double t = 0.0; t < duration; t += resolution) {
+    const auto velocity = calc_velocity(t);
+    const auto length = velocity * t + 0.5 * curr_acc * t * t;
+    const auto offset = std::min(ego_arc_length + length, lc_end_arc_length);
+    const auto pose = autoware::motion_utils::calcInterpolatedPose(path.points, offset);
+
+    predicted_path.emplace_back(t, pose, velocity);
+    if (offset + std::numeric_limits<double>::epsilon() > lc_end_arc_length) {
+      break;
+    }
+    prev_vel = velocity;
   }
 
   return predicted_path;
@@ -767,6 +950,76 @@ bool is_ahead_of_ego(
   return ego_min_dist_to_end - current_min_dist_to_end >= 0.0;
 }
 
+// NERO_LC_FIX_11342=1: port of upstream #11342 (include a stopping object beside ego as target; trailing objects checked
+// on the un-braked ego prediction only). Read once. Unset = the car.
+bool nero_lc_fix_11342()
+{
+  static const bool fix = [] {
+    const char * v = std::getenv("NERO_LC_FIX_11342");
+    return v != nullptr && std::atoi(v) > 0;
+  }();
+  return fix;
+}
+
+MinMaxValue calc_polygon_dist_range_from_terminal_end(
+  const PathWithLaneId & path, const Polygon2d & polygon)
+{
+  MinMaxValue dist_from_terminal_end;
+
+  const auto & vertices = polygon.outer();
+  if (path.points.empty() || vertices.empty()) {
+    return {};
+  }
+
+  dist_from_terminal_end.max = -std::numeric_limits<double>::infinity();
+  dist_from_terminal_end.min = std::numeric_limits<double>::infinity();
+
+  for (const auto & vertex : vertices) {
+    const auto vertex_pt = autoware_utils::create_point(vertex.x(), vertex.y(), 0.0);
+    const auto dist_to_end = nero_mu::calcSignedArcLength(
+      path.points, vertex_pt, path.points.back().point.pose.position);
+    dist_from_terminal_end.min = std::min(dist_to_end, dist_from_terminal_end.min);
+    dist_from_terminal_end.max = std::max(dist_to_end, dist_from_terminal_end.max);
+  }
+
+  return dist_from_terminal_end;
+}
+
+EgoObjectProximity calc_ego_object_proximity(
+  const CommonDataPtr & common_data_ptr, const PathWithLaneId & path,
+  const ExtendedPredictedObject & object)
+{
+  const auto & ego_info = common_data_ptr->bpp_param_ptr->vehicle_info;
+  const auto lon_dev = std::max(
+    ego_info.max_longitudinal_offset_m + ego_info.rear_overhang_m, object.shape.dimensions.x);
+
+  // we don't always have to check the distance accurately.
+  EgoObjectProximity ego_obj_proximity;
+  if (std::abs(object.dist_from_ego) > lon_dev) {
+    ego_obj_proximity.is_ahead_of_ego = object.dist_from_ego >= 0.0;
+    return ego_obj_proximity;
+  }
+
+  ego_obj_proximity.ego_dist_to_terminal_end =
+    common_data_ptr->transient_data.ego_to_terminal_end_proximity;
+  ego_obj_proximity.object_dist_to_terminal_end =
+    calc_polygon_dist_range_from_terminal_end(path, object.initial_polygon);
+
+  if (ego_obj_proximity.ego_dist_to_terminal_end && ego_obj_proximity.object_dist_to_terminal_end) {
+    ego_obj_proximity.is_ahead_of_ego =
+      (ego_obj_proximity.ego_dist_to_terminal_end->min >=
+       ego_obj_proximity.object_dist_to_terminal_end->max);
+  }
+
+  return ego_obj_proximity;
+}
+
+bool is_moving_object(const CommonDataPtr & common_data_ptr, const ExtendedPredictedObject & object)
+{
+  return object.initial_twist.linear.x >
+         common_data_ptr->lc_param_ptr->safety.th_stopped_object_velocity;
+}
+
 bool is_before_terminal(
   const CommonDataPtr & common_data_ptr, const PathWithLaneId & path,
   const ExtendedPredictedObject & object)
@@ -968,7 +1221,7 @@ bool filter_target_lane_objects(
   const CommonDataPtr & common_data_ptr, const ExtendedPredictedObject & object,
   const double dist_ego_to_current_lanes_center, const bool ahead_of_ego,
   const bool before_terminal, TargetLaneLeadingObjects & leading_objects,
-  ExtendedPredictedObjects & trailing_objects)
+  ExtendedPredictedObjects & trailing_objects, const bool overlapping_with_ego)
 {
   using behavior_path_planner::utils::path_safety_checker::filter::is_vehicle;
   using behavior_path_planner::utils::path_safety_checker::filter::velocity_filter;
@@ -993,7 +1246,9 @@ bool filter_target_lane_objects(
        object_path_overlaps_lanes(object, lanes_polygon.target));
 
     if (overlapping_with_target_lanes) {
-      if (!ahead_of_ego && !is_stopped) {
+      // NERO_LC_FIX_11342: an object (stopped or not) whose extent along the lanes overlaps ego's is a trailing target
+      // (overlapping_with_ego is false unless the switch is set)
+      if ((!ahead_of_ego && !is_stopped) || overlapping_with_ego) {
         trailing_objects.push_back(object);
         return true;
       }
@@ -1130,7 +1385,7 @@ void nero_cap_predicted_launch(std::vector<PoseWithVelocityStamped> & pp, const 
 
 std::vector<std::vector<PoseWithVelocityStamped>> convert_to_predicted_paths(
   const CommonDataPtr & common_data_ptr, const LaneChangePath & lane_change_path,
-  const size_t deceleration_sampling_num)
+  const size_t deceleration_sampling_num, const bool is_approved)
 {
   static constexpr double floating_err_th{1e-3};
   const auto bpp_param = *common_data_ptr->bpp_param_ptr;
@@ -1149,6 +1404,13 @@ std::vector<std::vector<PoseWithVelocityStamped>> convert_to_predicted_paths(
           common_data_ptr, lane_change_path.frenet_path, deceleration_sampling_num);
       }
       auto acc = lane_changing_acc + static_cast<double>(n) * acc_resolution;
+      // NERO_LC_FIX_11360=1: port of upstream #11360: the approved path's prediction (every sample alike, as upstream)
+      // runs at ego's measured acceleration (>= 0) and stops at the lane changing end (before: on along the path to the
+      // full duration at the sampled accelerations: cancels for objects beyond the change). nero_cap_predicted_launch
+      // below applies to it as to every prediction. Unset = the car.
+      if (is_approved && nero_lc_fix_11360()) {
+        return utils::lane_change::convert_to_predicted_path(common_data_ptr, lane_change_path);
+      }
       return utils::lane_change::convert_to_predicted_path(common_data_ptr, lane_change_path, acc);
     });
     nero_cap_predicted_launch(pp, common_data_ptr->get_ego_speed());
@@ -1211,5 +1473,14 @@ bool is_valid_start_point(const lane_change::CommonDataPtr & common_data_ptr, co
   // Check the target lane because the previous approved path might be shifted by avoidance module
   return boost::geometry::covered_by(lc_start_point, target_neighbor_poly) ||
          boost::geometry::covered_by(lc_start_point, target_lane_poly);
+}
+
+// NERO_LC_FIX_11599: port of upstream #11599.
+bool is_lanelet_in_lanelet_collections(
+  const lanelet::ConstLanelets & lanelet_collections, const lanelet::ConstLanelet & lanelet)
+{
+  return std::any_of(
+    lanelet_collections.begin(), lanelet_collections.end(),
+    [&](const auto & lane) { return lane.id() == lanelet.id(); });
 }
 }  // namespace autoware::behavior_path_planner::utils::lane_change

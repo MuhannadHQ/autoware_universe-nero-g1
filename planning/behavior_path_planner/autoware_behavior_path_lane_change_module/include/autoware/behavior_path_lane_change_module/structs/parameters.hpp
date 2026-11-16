@@ -169,6 +169,7 @@ struct Parameters
   double backward_length_buffer_for_blocking_object{0.0};
   double backward_length_from_intersection{5.0};
   bool enable_stopped_vehicle_buffer{false};
+  double overhang_tolerance{0.0};  // NERO_LC_FIX_13079 (port of upstream #13079): read only when the switch is set
 
   // parked vehicle
   double object_check_min_road_shoulder_width{0.5};
@@ -190,6 +191,14 @@ struct Parameters
   double lane_change_finish_judge_buffer{3.0};
   double th_finish_judge_lateral_diff{0.2};
   double th_finish_judge_yaw_diff{autoware_utils::deg2rad(3.0)};
+
+  // path miss detection parameters (NERO_LC_FIX_12280, port of upstream #12280: read only when the switch is set)
+  double path_miss_threshold_longitudinal{5.0};
+  bool enable_path_miss_detection{false};
+
+  // path miss velocity scaling parameters
+  std::vector<double> path_miss_velocity_points{0.0, 20.0};
+  std::vector<double> path_miss_lateral_thresholds{2.0, 0.8};
 
   // debug marker
   bool publish_debug_marker{false};

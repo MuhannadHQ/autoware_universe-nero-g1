@@ -26,6 +26,7 @@
 #include <boost/scope_exit.hpp>
 
 #include <algorithm>
+#include <cstdlib>
 #include <iostream>
 #include <memory>
 #include <string>
@@ -99,6 +100,40 @@ void PlannerManager::configureModuleSlot(
     }
   }
 }
+
+// NERO_BPP_FIX_10989=1: port of upstream #10989: the output path is resampled here, before the combined drivable area is
+// generated for it (upstream moved the resampling out of BehaviorPathPlannerNode::getPath, which then returns the path
+// as it is; the drivable area was made for the unresampled path). Unset = the car (resampled in getPath, after).
+bool nero_bpp_fix_10989()
+{
+  static const bool fix = [] {
+    const char * v = std::getenv("NERO_BPP_FIX_10989");
+    return v != nullptr && std::atoi(v) > 0;
+  }();
+  return fix;
+}
+
+namespace
+{
+// This is a temporary process until motion planning can take the terminal pose into account
+bool keep_input_points(const std::vector<std::shared_ptr<SceneModuleStatus>> & statuses)
+{
+  const std::vector<std::string> target_modules = {"goal_planner", "avoidance"};
+
+  const auto target_status = ModuleStatus::RUNNING;
+
+  for (auto & status : statuses) {
+    if (status->is_waiting_approval || status->status == target_status) {
+      if (
+        std::find(target_modules.begin(), target_modules.end(), status->module_name) !=
+        target_modules.end()) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+}  // namespace
 
 BehaviorModuleOutput PlannerManager::run(const std::shared_ptr<PlannerData> & data)
 {
@@ -186,6 +221,12 @@ BehaviorModuleOutput PlannerManager::run(const std::shared_ptr<PlannerData> & da
     m->publish_planning_factors();
   });
 
+  if (nero_bpp_fix_10989()) {
+    // resample the path prior to generating the drivable area
+    result_output.valid_output.path = utils::resamplePathWithSpline(
+      result_output.valid_output.path, data->parameters.output_path_interval,
+      keep_input_points(getSceneModuleStatus()));
+  }
   generateCombinedDrivableArea(result_output.valid_output, data);
   return result_output.valid_output;
 }
@@ -240,6 +281,41 @@ void PlannerManager::updateCurrentRouteLanelet(
   const auto & pose = data->self_odometry->pose.pose;
   const auto p = data->parameters;
 
+  // NERO_BPP_FIX_12576=1: port of upstream #12576: while NOT in autonomous mode with autoware control (manual driving /
+  // override), a current route lanelet that leaves ego out of route is snapped to the closest route lanelet within the
+  // whole route (or reset when none and no approved module runs), so the route lanelet is recovered when ego was driven
+  // by hand to another lane of the route. Unset = the car (the lambda returns at once).
+  static const bool fix_12576 = [] {
+    const char * v = std::getenv("NERO_BPP_FIX_12576");
+    return v != nullptr && std::atoi(v) > 0;
+  }();
+  const bool skip_global_route_snap =
+    !fix_12576 ||
+    (data->operation_mode && data->operation_mode->mode == OperationModeState::AUTONOMOUS &&
+     data->operation_mode->is_autoware_control_enabled);
+
+  const auto snap_to_global_route_if_ego_out = [&]() {
+    if (skip_global_route_snap) {
+      return;
+    }
+    if (!current_route_lanelet_->has_value()) {
+      return;
+    }
+    if (!utils::isEgoOutOfRoute(
+          pose, current_route_lanelet_->value(), data->prev_modified_goal, route_handler)) {
+      return;
+    }
+    lanelet::ConstLanelet constrained{};
+    if (route_handler->getClosestLaneletWithConstrainsWithinRoute(
+          pose, &constrained, p.ego_nearest_dist_threshold, p.ego_nearest_yaw_threshold)) {
+      *current_route_lanelet_ = constrained;
+      return;
+    }
+    if (!is_any_approved_module_running) {
+      resetCurrentRouteLanelet(data);
+    }
+  };
+
   constexpr double extra_margin = 10.0;
   const auto backward_length =
     std::max(p.backward_path_length, p.backward_path_length + extra_margin);
@@ -250,6 +326,7 @@ void PlannerManager::updateCurrentRouteLanelet(
         pose, current_route_lanelet_->value(), &closest_lane, p.ego_nearest_dist_threshold,
         p.ego_nearest_yaw_threshold)) {
     *current_route_lanelet_ = closest_lane;
+    snap_to_global_route_if_ego_out();
     return;
   }
 
@@ -264,6 +341,7 @@ void PlannerManager::updateCurrentRouteLanelet(
 
   if (could_calculate_closest_lanelet) {
     *current_route_lanelet_ = closest_lane;
+    snap_to_global_route_if_ego_out();
   } else if (!is_any_approved_module_running) {
     resetCurrentRouteLanelet(data);
   }

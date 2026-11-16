@@ -90,6 +90,9 @@ public:
 
   virtual TurnSignalInfo updateOutputTurnSignal() const = 0;
 
+  // NERO_LC_FIX_12280 (port of upstream #12280): used by LaneChangeInterface only when the switch is set.
+  virtual bool hasMissedLaneChangePath() const = 0;
+
   virtual bool hasFinishedLaneChange() const = 0;
 
   virtual bool hasFinishedAbort() const = 0;
@@ -189,6 +192,7 @@ public:
     common_data_ptr_->lc_param_ptr = lane_change_parameters_;
     common_data_ptr_->lc_type = type_;
     common_data_ptr_->direction = direction_;
+    common_data_ptr_->current_acceleration = data->self_acceleration;  // NERO_LC_FIX_11360 (#11360)
   }
 
   void setTimeKeeper(const std::shared_ptr<autoware_utils::TimeKeeper> & time_keeper)
@@ -233,6 +237,9 @@ public:
   virtual TurnSignalInfo get_current_turn_signal_info() const = 0;
 
   virtual bool is_near_regulatory_element() const = 0;
+
+  // NERO_LC_FIX_11599 (port of upstream #11599): used by LaneChangeInterface only when the switch is set.
+  virtual bool is_ego_in_current_or_target_lanes() const = 0;
 
 protected:
   virtual bool isValidPath(const PathWithLaneId & path) const = 0;

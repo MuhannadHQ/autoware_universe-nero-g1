@@ -34,6 +34,7 @@
 #include "autoware/behavior_path_planner_common/utils/traffic_light_utils.hpp"
 #include "autoware/behavior_path_planner_common/utils/utils.hpp"
 
+#include <autoware/interpolation/linear_interpolation.hpp>
 #include <autoware/motion_utils/trajectory/path_shift.hpp>
 #include <autoware/motion_utils/trajectory/trajectory.hpp>
 #include <autoware_frenet_planner/frenet_planner.hpp>
@@ -454,6 +455,13 @@ void NormalLaneChange::update_transient_data(const bool is_approved)
 
   transient_data.current_footprint = utils::lane_change::get_ego_footprint(
     common_data_ptr_->get_ego_pose(), common_data_ptr_->bpp_param_ptr->vehicle_info);
+
+  // NERO_LC_FIX_11342: port of upstream #11342 (unset: not computed)
+  if (utils::lane_change::nero_lc_fix_11342()) {
+    transient_data.ego_to_terminal_end_proximity =
+      utils::lane_change::calc_polygon_dist_range_from_terminal_end(
+        common_data_ptr_->current_lanes_path, transient_data.current_footprint);
+  }
 
   const auto & ego_lane = common_data_ptr_->lanes_ptr->ego_lane;
   const auto & route_handler_ptr = common_data_ptr_->route_handler_ptr;
@@ -1348,7 +1356,12 @@ void NormalLaneChange::insert_stop_point_on_current_lanes(
   const auto & bpp_param_ptr = common_data_ptr_->bpp_param_ptr;
   const auto dist_to_terminal_stop_raw = std::invoke([&]() -> double {
     const auto & curr_lanes_poly = common_data_ptr_->lanes_polygon_ptr->current;
-    if (!utils::isEgoWithinOriginalLane(curr_lanes_poly, getEgoPose(), *bpp_param_ptr)) {
+    // NERO_LC_FIX_13079: port of upstream #13079: ego counts as within its original lanes (the terminal stop then is
+    // the last place the body still fits, not the terminal start) up to overhang_tolerance outside them (0.0 = as
+    // before; it is 0.0 unless the switch is set and the launch sets lane_change.overhang_tolerance).
+    if (!utils::isEgoWithinOriginalLane(
+          curr_lanes_poly, getEgoPose(), *bpp_param_ptr,
+          lane_change_parameters_->overhang_tolerance)) {
       return dist_from_path_front + dist_to_terminal_start;
     }
 
@@ -1894,12 +1907,25 @@ FilteredLanesObjects NormalLaneChange::filter_objects() const
     const auto is_before_terminal =
       utils::lane_change::is_before_terminal(common_data_ptr_, current_lanes_ref_path, ext_object);
 
-    const auto ahead_of_ego =
-      utils::lane_change::is_ahead_of_ego(common_data_ptr_, current_lanes_ref_path, ext_object);
+    // NERO_LC_FIX_11342=1: port of upstream #11342: an object is ahead of ego only when its whole extent along the
+    // current lanes is ahead of ego's front (before: when its front is ahead of ego's front), and an object whose extent
+    // overlaps ego's (beside ego, stopped or not) in the target lanes is a trailing target. Unset = the car.
+    bool ahead_of_ego = false;
+    bool overlapping_with_ego = false;
+    if (utils::lane_change::nero_lc_fix_11342()) {
+      const auto ego_object_proximity = utils::lane_change::calc_ego_object_proximity(
+        common_data_ptr_, current_lanes_ref_path, ext_object);
+      ahead_of_ego = ego_object_proximity.is_ahead_of_ego;
+      overlapping_with_ego = ego_object_proximity.is_overlapping();
+    } else {
+      ahead_of_ego =
+        utils::lane_change::is_ahead_of_ego(common_data_ptr_, current_lanes_ref_path, ext_object);
+    }
 
     if (utils::lane_change::filter_target_lane_objects(
           common_data_ptr_, ext_object, dist_ego_to_current_lanes_center, ahead_of_ego,
-          is_before_terminal, target_lane_leading, filtered_objects.target_lane_trailing)) {
+          is_before_terminal, target_lane_leading, filtered_objects.target_lane_trailing,
+          overlapping_with_ego)) {
       continue;
     }
 
@@ -1924,9 +1950,22 @@ FilteredLanesObjects NormalLaneChange::filter_objects() const
   ranges::sort(target_lane_leading.stopped_at_bound, dist_comparator);
   ranges::sort(target_lane_leading.stopped, dist_comparator);
   ranges::sort(target_lane_leading.moving, dist_comparator);
-  ranges::sort(filtered_objects.target_lane_trailing, [&](const auto & obj1, const auto & obj2) {
-    return !dist_comparator(obj1, obj2);
-  });
+  // NERO_LC_FIX_10866=1: port of upstream #10866: a strict weak order for the trailing objects (farthest behind first:
+  // obj2 < obj1); `!dist_comparator` is not one (true for equal distances: UB in std::sort, a rare node crash).
+  // Unset = the car.
+  static const bool fix_10866 = [] {
+    const char * v = std::getenv("NERO_LC_FIX_10866");
+    return v != nullptr && std::atoi(v) > 0;
+  }();
+  if (fix_10866) {
+    ranges::sort(filtered_objects.target_lane_trailing, [](const auto & obj1, const auto & obj2) {
+      return obj2.dist_from_ego < obj1.dist_from_ego;
+    });
+  } else {
+    ranges::sort(filtered_objects.target_lane_trailing, [&](const auto & obj1, const auto & obj2) {
+      return !dist_comparator(obj1, obj2);
+    });
+  }
 
   lane_change_debug_.filtered_objects = filtered_objects;
 
@@ -2929,13 +2968,21 @@ PathSafetyStatus NormalLaneChange::isApprovedPathSafe() const
 
   const auto decel_sampling_num =
     static_cast<size_t>(lane_change_parameters_->cancel.deceleration_sampling_num);
-  const auto ego_predicted_paths =
-    utils::lane_change::convert_to_predicted_paths(common_data_ptr_, path, decel_sampling_num);
+  // NERO_LC_FIX_11360=1 (port of upstream #11360): the approved path's prediction at ego's measured acceleration, clipped
+  // at the lane changing end, for the RSS checks; the NERO_LC_R79_* block keeps judging on the sampled predictions
+  // (r79_paths: computed only when the switch is set). Unset = the car (the sampled predictions for both).
+  const auto ego_predicted_paths = utils::lane_change::convert_to_predicted_paths(
+    common_data_ptr_, path, decel_sampling_num, true);
+  std::vector<std::vector<PoseWithVelocityStamped>> r79_paths;
+  if (utils::lane_change::nero_lc_fix_11360()) {
+    r79_paths =
+      utils::lane_change::convert_to_predicted_paths(common_data_ptr_, path, decel_sampling_num);
+  }
   const auto safety_status = isLaneChangePathSafe(
     path, ego_predicted_paths, target_objects,
     nero_in_hold_mode() ? lane_change_parameters_->safety.rss_params  // strict while slow and in lane (NERO hold)
                         : lane_change_parameters_->safety.rss_params_for_abort,
-    debug_data);
+    debug_data, true, utils::lane_change::nero_lc_fix_11360() ? &r79_paths : nullptr);
   {
     // only for debug purpose
     lane_change_debug_.collision_check_objects.clear();
@@ -3207,21 +3254,26 @@ PathSafetyStatus NormalLaneChange::isLaneChangePathSafe(
   const std::vector<std::vector<PoseWithVelocityStamped>> & ego_predicted_paths,
   const lane_change::TargetObjects & collision_check_objects,
   const utils::path_safety_checker::RSSparams & rss_params,
-  CollisionCheckDebugMap & debug_data) const
+  CollisionCheckDebugMap & debug_data, const bool is_approved,
+  const std::vector<std::vector<PoseWithVelocityStamped>> * r79_ego_predicted_paths) const
 {
   autoware_utils::ScopedTimeTrack st(__func__, *time_keeper_);
   constexpr auto is_safe = true;
   constexpr auto is_object_behind_ego = true;
 
   const auto is_check_prepare_phase = check_prepare_phase();
+  // NERO_LC_FIX_11360=1: port of upstream #11360: the approved path checks stopped objects with the RSS it is given
+  // (rss_params_for_abort, or the NERO hold's rss_params), not rss_params_for_parked. Unset = the car.
+  const bool use_parked_rss = !(is_approved && utils::lane_change::nero_lc_fix_11360());
 
   const auto all_paths_collide = [&](const auto & objects) {
     const auto stopped_obj_vel_th = lane_change_parameters_->safety.th_stopped_object_velocity;
     return ranges::all_of(ego_predicted_paths, [&](const auto & ego_predicted_path) {
       const auto check_for_collision = [&](const auto & object) {
-        const auto selected_rss_param = (object.initial_twist.linear.x <= stopped_obj_vel_th)
-                                          ? lane_change_parameters_->safety.rss_params_for_parked
-                                          : rss_params;
+        const auto selected_rss_param =
+          (use_parked_rss && object.initial_twist.linear.x <= stopped_obj_vel_th)
+            ? lane_change_parameters_->safety.rss_params_for_parked
+            : rss_params;
         return is_colliding(
           lane_change_path, object, ego_predicted_path, selected_rss_param, is_check_prepare_phase,
           debug_data);
@@ -3277,10 +3329,14 @@ PathSafetyStatus NormalLaneChange::isLaneChangePathSafe(
     const char * e = std::getenv("NERO_LC_R79_SHIELD");
     return e ? std::atof(e) : -1.0;
   }();
+  // NERO_LC_FIX_11360: the R79 block below judges on the ego predictions it always had (the approved path's sampled
+  // ones), also when the switch gives the RSS check the clipped prediction: r79_ego_predicted_paths. Unset = the same.
+  const auto & r79_ego_paths =
+    r79_ego_predicted_paths != nullptr ? *r79_ego_predicted_paths : ego_predicted_paths;
   auto trailing_to_check = collision_check_objects.trailing;
   if (
     (nero_r79[0] > 0.0 || nero_yield[0] > 0.0) && !trailing_to_check.empty() &&
-    !ego_predicted_paths.empty()) {
+    !r79_ego_paths.empty()) {
     const auto & vi = common_data_ptr_->bpp_param_ptr->vehicle_info;
     const double t_lc = lane_change_path.info.duration.prepare;
     const double stopped_th = lane_change_parameters_->safety.th_stopped_object_velocity;
@@ -3312,7 +3368,7 @@ PathSafetyStatus NormalLaneChange::isLaneChangePathSafe(
       const auto & lane_poly = common_data_ptr_->lanes_polygon_ptr->current;
       const auto & ego_pose = getEgoPose();
       const double c = std::cos(tf2::getYaw(ego_pose.orientation)), sn = std::sin(tf2::getYaw(ego_pose.orientation));
-      for (const auto & path : ego_predicted_paths) {
+      for (const auto & path : r79_ego_paths) {
         NeroLeave lv;
         double s_e = 0.0, lon_max = -1e9;
         const geometry_msgs::msg::Pose * prev = nullptr;
@@ -3479,7 +3535,7 @@ PathSafetyStatus NormalLaneChange::isLaneChangePathSafe(
       // S_critical at the moment the robot starts to move into the target lane (UN R79: "shall not start a lane change if ...");
       // it already contains the rear car's closing and braking, so it is not re-applied to every later step at constant speed
       // (that refused a yielding car 10 m back at +0.8 m/s: sim r45)
-      for (const auto & path : ego_predicted_paths) {
+      for (const auto & path : r79_ego_paths) {
         double s_e = 0.0;
         bool checked = false;
         for (size_t i = 0; i < path.size(); ++i) {
@@ -3509,6 +3565,53 @@ PathSafetyStatus NormalLaneChange::isLaneChangePathSafe(
         n0 - kept.size(), n0, a_r79, (nero_r79[0] > 0.0 && nero_r79[3] > 0.5) ? ", at the line" : "");
     }
     trailing_to_check = std::move(kept);
+  }
+
+  // NERO_LC_FIX_11342=1: port of upstream #11342's isLaneChangePathSafe part, after the NERO_LC_R79_* block (which runs
+  // the same with the switch set or not and still decides which trailing objects are left to this check):
+  // - no ego prediction: safe (before: all_of over no path = "all collide" = unsafe with an object behind);
+  // - the trailing objects are checked against the FIRST ego prediction only (the path's own lane-changing
+  //   acceleration; the deceleration samples are not used for cars behind: braking only shortens the gap to them),
+  //   every object on it (not the first hit), and "object behind" (isRequiredStop etc.) is set only when a colliding
+  //   trailing object moves (initial_twist.linear.x > th_stopped_object_velocity; a stopped car beside ego, a target
+  //   since this switch, makes the path unsafe without that);
+  // - the leading objects: unchanged (all predictions must collide). Upstream's find_colliding_object_if_all_paths_collide
+  //   counts an object only on the first prediction it collides on, so with >1 prediction (the car: deceleration_sampling_num
+  //   5) a leading object colliding on all of them would no longer be "all collide"; with upstream launch #1653 (1 sample)
+  //   both are the same: the old check is kept here.
+  // Unset = the car.
+  if (utils::lane_change::nero_lc_fix_11342()) {
+    constexpr auto is_moving_object_behind_ego = true;
+    if (ego_predicted_paths.empty()) {
+      return {is_safe, !is_moving_object_behind_ego};
+    }
+    const auto stopped_obj_vel_th = lane_change_parameters_->safety.th_stopped_object_velocity;
+    const auto & front_ego_path = ego_predicted_paths.front();
+    bool any_trailing_colliding = false;
+    bool any_trailing_moving = false;
+    for (const auto & object : trailing_to_check) {
+      const auto selected_rss_param =
+        (use_parked_rss && object.initial_twist.linear.x <= stopped_obj_vel_th)
+          ? lane_change_parameters_->safety.rss_params_for_parked
+          : rss_params;
+      if (!is_colliding(
+            lane_change_path, object, front_ego_path, selected_rss_param, is_check_prepare_phase,
+            debug_data)) {
+        continue;
+      }
+      any_trailing_colliding = true;
+      any_trailing_moving =
+        any_trailing_moving || utils::lane_change::is_moving_object(common_data_ptr_, object);
+    }
+    if (any_trailing_colliding) {
+      return {!is_safe, any_trailing_moving};
+    }
+
+    if (all_paths_collide(collision_check_objects.leading)) {
+      return {!is_safe, !is_moving_object_behind_ego};
+    }
+
+    return {is_safe, !is_moving_object_behind_ego};
   }
 
   if (all_paths_collide(trailing_to_check)) {
@@ -3794,9 +3897,12 @@ bool NormalLaneChange::is_ego_stuck() const
     filtered_objects_.current_lane.begin(), filtered_objects_.current_lane.end(),
     [&](const auto & object) {
       // Note: it needs chattering prevention.
+      // NERO_LC_FIX_11342: upstream #11342 judges "moving" by the signed speed (is_moving_object); unset = the car (abs)
       if (
-        std::abs(object.initial_twist.linear.x) >
-        lc_param_ptr->safety.th_stopped_object_velocity) {  // check if stationary
+        utils::lane_change::nero_lc_fix_11342()
+          ? utils::lane_change::is_moving_object(common_data_ptr_, object)
+          : std::abs(object.initial_twist.linear.x) >
+              lc_param_ptr->safety.th_stopped_object_velocity) {  // check if stationary
         return false;
       }
 
@@ -4155,5 +4261,93 @@ void NormalLaneChange::update_dist_from_intersection()
 
   path_after_intersection_.clear();
   transient_data.dist_from_prev_intersection = std::numeric_limits<double>::max();
+}
+
+// NERO_LC_FIX_11599: port of upstream #11599 (called by LaneChangeInterface::check_transit_failure only when set).
+bool NormalLaneChange::is_ego_in_current_or_target_lanes() const
+{
+  lanelet::ConstLanelet current_lane;
+  if (!common_data_ptr_->route_handler_ptr->getClosestLaneletWithinRoute(
+        common_data_ptr_->get_ego_pose(), &current_lane)) {
+    return false;
+  }
+
+  const auto & current_lanes = get_current_lanes();
+  const auto in_current =
+    utils::lane_change::is_lanelet_in_lanelet_collections(current_lanes, current_lane);
+
+  if (in_current) {
+    return true;
+  }
+
+  const auto & target_lanes = get_target_lanes();
+  const auto in_target =
+    utils::lane_change::is_lanelet_in_lanelet_collections(target_lanes, current_lane);
+
+  return in_target;
+}
+
+// NERO_LC_FIX_12280: port of upstream #12280 (enable_path_miss_detection is false unless the switch is set).
+bool NormalLaneChange::hasMissedLaneChangePath() const
+{
+  if (!lane_change_parameters_->enable_path_miss_detection) {
+    return false;
+  }
+
+  if (status_.lane_change_path.path.points.empty()) {
+    return false;
+  }
+
+  const auto & current_pose = getEgoPose();
+  const auto & path_points = status_.lane_change_path.path.points;
+
+  // Check lateral deviation from planned path
+  const auto lateral_deviation =
+    autoware::motion_utils::calcLateralOffset(path_points, current_pose.position);
+
+  const auto dynamic_lateral_threshold = [this]() -> double {
+    const double ego_velocity = getEgoVelocity();
+
+    const std::vector<double> velocity_points =
+      lane_change_parameters_->path_miss_velocity_points;  // m/s
+    const std::vector<double> lateral_thresholds =
+      lane_change_parameters_->path_miss_lateral_thresholds;
+
+    const double lateral_threshold = autoware::interpolation::lerp(
+      velocity_points, lateral_thresholds,
+      std::clamp(ego_velocity, velocity_points.front(), velocity_points.back()));
+
+    return lateral_threshold;
+  }();
+
+  // Check if lateral deviation exceeds threshold
+  if (std::abs(lateral_deviation) > dynamic_lateral_threshold) {
+    RCLCPP_WARN(
+      logger_, "Path miss detected: lateral deviation %.2f > threshold %.2f",
+      std::abs(lateral_deviation), dynamic_lateral_threshold);
+    return true;
+  }
+
+  // Check longitudinal deviation - if ego has passed the end but is not in target lane
+  const auto dist_to_end = utils::getSignedDistance(
+    current_pose, status_.lane_change_path.info.shift_line.end, get_target_lanes());
+
+  if (dist_to_end < -lane_change_parameters_->path_miss_threshold_longitudinal) {
+    // Passed end pose significantly
+    const auto & target_lanes_poly = common_data_ptr_->lanes_polygon_ptr->target;
+
+    const auto ego_footprint = utils::lane_change::get_ego_footprint(
+      current_pose, common_data_ptr_->bpp_param_ptr->vehicle_info);
+    const auto ego_in_target_lane = !boost::geometry::disjoint(target_lanes_poly, ego_footprint);
+
+    if (!ego_in_target_lane) {
+      RCLCPP_WARN(
+        logger_, "Path miss detected: passed end pose by %.2f but ego footprint not in target lane",
+        std::abs(dist_to_end));
+      return true;
+    }
+  }
+
+  return false;
 }
 }  // namespace autoware::behavior_path_planner

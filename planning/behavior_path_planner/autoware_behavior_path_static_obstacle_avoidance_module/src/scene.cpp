@@ -1308,8 +1308,18 @@ void StaticObstacleAvoidanceModule::fillFundamentalData(
   // compensate lost object which was avoidance target. if the time hasn't passed more than
   // threshold since perception module lost the target yet, this module keeps it as avoidance
   // target.
-  utils::static_obstacle_avoidance::compensateLostTargetObjects(
-    registered_objects_, data, clock_->now(), planner_data_, parameters_);
+  // NERO_SOA_FIX_10669=1: port of upstream #10669: snapshot the latest detected targets, compensate from the stored
+  // objects without touching them, and refresh the stored objects from the snapshot after its necessity is filled (below).
+  // Unset = the car (the stored objects refreshed here, before the necessity is filled).
+  const bool fix_10669 = utils::static_obstacle_avoidance::nero_fix_10669();
+  ObjectDataArray current_target_objects_snapshot;
+  if (fix_10669) {
+    current_target_objects_snapshot = data.target_objects;
+    utils::static_obstacle_avoidance::compensateLostTargetObjects(data, registered_objects_, planner_data_);
+  } else {
+    utils::static_obstacle_avoidance::compensateLostTargetObjects(
+      registered_objects_, data, clock_->now(), planner_data_, parameters_);
+  }
 
   // NERO_SOA_ROUTE_LC=<m> (lca job 2026-10-28): a target this module would pass by shifting toward the side the route's
   // own lane change goes (the route's preferred lane lies on that side of the object's lane), with less than <m> per
@@ -1418,6 +1428,11 @@ void StaticObstacleAvoidanceModule::fillFundamentalData(
 
   // calculate various data for each target objects.
   fillAvoidanceTargetData(data.target_objects);
+  if (fix_10669) {
+    fillAvoidanceTargetData(current_target_objects_snapshot);
+    utils::static_obstacle_avoidance::updateStoredObjects(
+      registered_objects_, current_target_objects_snapshot, clock_->now(), parameters_);
+  }
 
   // sort object order by longitudinal distance
   std::sort(data.target_objects.begin(), data.target_objects.end(), [](auto a, auto b) {
@@ -6007,6 +6022,22 @@ CandidateOutput StaticObstacleAvoidanceModule::planCandidate() const
   CandidateOutput output;
 
   auto shifted_path = data.candidate_path;
+
+  // NERO_SOA_FIX_13008=1: port of upstream #13008:
+  // In rare cases, updateData() returns early (e.g. after a modified goal),
+  // so fillShiftLine() is skipped and shifted_path remains empty.
+  // planWaitingApproval() may still call planCandidate(). Without this guard,
+  // findEgoIndex(shifted_path) would call validateNonEmpty() and throw
+  // std::invalid_argument. Unset = the car.
+  static const bool fix_13008 = [] {
+    const char * v = std::getenv("NERO_SOA_FIX_13008");
+    return v != nullptr && std::atoi(v) > 0;
+  }();
+  if (fix_13008 && shifted_path.path.points.empty()) {
+    RCLCPP_WARN_THROTTLE(
+      getLogger(), *clock_, 5000, "Candidate path is empty. Skip planning candidate.");
+    return output;
+  }
 
   if (data.safe_shift_line.empty()) {
     const size_t ego_idx = planner_data_->findEgoIndex(shifted_path.path.points);

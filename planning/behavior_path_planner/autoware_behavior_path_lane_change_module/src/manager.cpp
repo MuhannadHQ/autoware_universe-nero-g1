@@ -15,12 +15,14 @@
 #include "autoware/behavior_path_lane_change_module/manager.hpp"
 
 #include "autoware/behavior_path_lane_change_module/interface.hpp"
+#include "autoware/interpolation/interpolation_utils.hpp"
 #include "autoware_utils/ros/parameter.hpp"
 #include "autoware_utils/ros/update_param.hpp"
 
 #include <rclcpp/rclcpp.hpp>
 
 #include <algorithm>
+#include <cstdlib>
 #include <memory>
 #include <string>
 #include <vector>
@@ -33,6 +35,16 @@ void LaneChangeModuleManager::init(rclcpp::Node * node)
   // init manager interface
   initInterface(node, {""});
   initParams(node);
+}
+
+// NERO_LC_FIX_12280=1: port of upstream #12280 (path miss detection), read once. Unset = the car.
+bool nero_lc_fix_12280()
+{
+  static const bool fix = [] {
+    const char * v = std::getenv("NERO_LC_FIX_12280");
+    return v != nullptr && std::atoi(v) > 0;
+  }();
+  return fix;
 }
 
 LCParamPtr LaneChangeModuleManager::set_params(rclcpp::Node * node, const std::string & node_name)
@@ -211,6 +223,22 @@ LCParamPtr LaneChangeModuleManager::set_params(rclcpp::Node * node, const std::s
     get_or_declare_parameter<double>(*node, parameter("backward_length_from_intersection"));
   p.enable_stopped_vehicle_buffer =
     get_or_declare_parameter<bool>(*node, parameter("enable_stopped_vehicle_buffer"));
+  // NERO_LC_FIX_13079=1: port of upstream #13079: lane_change.overhang_tolerance [m] (read only when the switch is set;
+  // upstream's 0.0 when the launch has no key: no change until the launch sets it). Unset = the car (0.0, not read).
+  {
+    static const bool fix_13079 = [] {
+      const char * v = std::getenv("NERO_LC_FIX_13079");
+      return v != nullptr && std::atoi(v) > 0;
+    }();
+    if (fix_13079) {
+      const auto name = parameter("overhang_tolerance");
+      p.overhang_tolerance = node->has_parameter(name) ? node->get_parameter(name).get_value<double>()
+                                                       : node->declare_parameter<double>(name, 0.0);
+      RCLCPP_INFO(
+        node->get_logger().get_child(node_name), "[NERO_LC_FIX_13079] overhang_tolerance %.2f m",
+        p.overhang_tolerance);
+    }
+  }
 
   if (p.backward_length_buffer_for_end_of_lane < 1.0) {
     RCLCPP_WARN_STREAM(
@@ -258,6 +286,63 @@ LCParamPtr LaneChangeModuleManager::set_params(rclcpp::Node * node, const std::s
   const auto finish_judge_lateral_angle_deviation =
     get_or_declare_parameter<double>(*node, parameter("finish_judge_lateral_angle_deviation"));
   p.th_finish_judge_yaw_diff = autoware_utils::deg2rad(finish_judge_lateral_angle_deviation);
+
+  // NERO_LC_FIX_12280=1: port of upstream #12280 (path miss detection). The path_miss.* keys are read only when the
+  // switch is set; a missing key takes upstream's config value (threshold_longitudinal 1.0, velocity_points /
+  // lateral_thresholds as upstream's lane_change.param.yaml), except enable_path_miss_detection, which the switch turns
+  // on unless the launch sets it (upstream ships it false). Unset = the car (detection off, no key read).
+  if (nero_lc_fix_12280()) {
+    const auto get_or = [&](const std::string & name, auto default_value) -> decltype(default_value) {
+      using T = decltype(default_value);
+      const auto full = parameter(std::string(name));
+      if (node->has_parameter(full)) {
+        return node->get_parameter(full).get_value<T>();
+      }
+      return node->declare_parameter<T>(full, default_value);
+    };
+    // path miss detection parameters
+    p.enable_path_miss_detection = get_or("path_miss.enable_path_miss_detection", true);
+    p.path_miss_threshold_longitudinal = get_or("path_miss.threshold_longitudinal", 1.0);
+
+    // path miss velocity scaling parameters
+    p.path_miss_velocity_points = get_or(
+      "path_miss.velocity_points", std::vector<double>{0.0, 0.1, 0.11, 2.77, 2.78, 20.0});
+    p.path_miss_lateral_thresholds = get_or(
+      "path_miss.lateral_thresholds", std::vector<double>{3.0, 3.0, 5.0, 5.0, 1.5, 0.8});
+
+    if (p.path_miss_velocity_points.empty()) {
+      RCLCPP_ERROR(
+        node->get_logger().get_child(node_name), "Path miss velocity_points cannot be empty.");
+      exit(EXIT_FAILURE);
+    }
+
+    if (p.path_miss_lateral_thresholds.empty()) {
+      RCLCPP_ERROR(
+        node->get_logger().get_child(node_name), "Path miss lateral_thresholds cannot be empty.");
+      exit(EXIT_FAILURE);
+    }
+
+    if (p.path_miss_velocity_points.size() != p.path_miss_lateral_thresholds.size()) {
+      RCLCPP_ERROR(
+        node->get_logger().get_child(node_name),
+        "Path miss lateral thresholds parameters have mismatched sizes: velocity_points=%zu, "
+        "lateral_threshold=%zu",
+        p.path_miss_velocity_points.size(), p.path_miss_lateral_thresholds.size());
+      exit(EXIT_FAILURE);
+    }
+
+    if (!interpolation::isIncreasing(p.path_miss_velocity_points)) {
+      RCLCPP_ERROR(
+        node->get_logger().get_child(node_name),
+        "Path miss velocity points must be in ascending order.");
+      exit(EXIT_FAILURE);
+    }
+    RCLCPP_INFO(
+      node->get_logger().get_child(node_name),
+      "[NERO_LC_FIX_12280] path miss detection %s, longitudinal %.2f m, %zu velocity points",
+      p.enable_path_miss_detection ? "on" : "off", p.path_miss_threshold_longitudinal,
+      p.path_miss_velocity_points.size());
+  }
 
   // debug marker
   p.publish_debug_marker = get_or_declare_parameter<bool>(*node, parameter("publish_debug_marker"));
@@ -603,6 +688,34 @@ void LaneChangeModuleManager::updateModuleParams(const std::vector<rclcpp::Param
     update_param<double>(parameters, ns + "overhang_tolerance", p->cancel.overhang_tolerance);
     update_param<int>(
       parameters, ns + "unsafe_hysteresis_threshold", p->cancel.th_unsafe_hysteresis);
+  }
+
+  // NERO_LC_FIX_12280 (port of upstream #12280): only when the switch is set. Upstream checked velocity_points before
+  // taking lateral_thresholds (an update with velocity_points only emptied the thresholds): here each array is checked
+  // on its own and only a same-size pair is taken.
+  if (nero_lc_fix_12280()) {
+    const std::string ns = "lane_change.path_miss.";
+
+    update_param<bool>(
+      parameters, ns + "enable_path_miss_detection", p->enable_path_miss_detection);
+    update_param<double>(
+      parameters, ns + "threshold_longitudinal", p->path_miss_threshold_longitudinal);
+
+    std::vector<double> velocity_points = p->path_miss_velocity_points;
+    std::vector<double> lateral_thresholds = p->path_miss_lateral_thresholds;
+    update_param<std::vector<double>>(parameters, ns + "velocity_points", velocity_points);
+    update_param<std::vector<double>>(parameters, ns + "lateral_thresholds", lateral_thresholds);
+    if (
+      !velocity_points.empty() && velocity_points.size() == lateral_thresholds.size() &&
+      interpolation::isIncreasing(velocity_points)) {
+      p->path_miss_velocity_points = velocity_points;
+      p->path_miss_lateral_thresholds = lateral_thresholds;
+    } else {
+      RCLCPP_WARN_THROTTLE(
+        node_->get_logger(), *node_->get_clock(), 1000,
+        "Parameters 'velocity_points' / 'lateral_thresholds' not updated: empty, mismatched sizes or not "
+        "ascending.");
+    }
   }
 
   std::for_each(observers_.begin(), observers_.end(), [&p](const auto & observer) {

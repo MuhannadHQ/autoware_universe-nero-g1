@@ -23,6 +23,7 @@
 #include <autoware/route_handler/route_handler.hpp>
 #include <autoware_utils/math/unit_conversion.hpp>
 
+#include <geometry_msgs/msg/accel_with_covariance_stamped.hpp>
 #include <nav_msgs/msg/odometry.hpp>
 
 #include <lanelet2_core/primitives/Lanelet.h>
@@ -30,6 +31,7 @@
 
 #include <limits>
 #include <memory>
+#include <optional>
 #include <utility>
 #include <vector>
 
@@ -223,6 +225,10 @@ struct TransientData
     current_dist_buffer;  // distance buffer computed backward from current lanes' terminal end
   MinMaxValue
     next_dist_buffer;  // distance buffer computed backward  from target lanes' terminal end
+  // NERO_LC_FIX_11342 (port of upstream #11342): ego footprint's distance range to the current lanes' terminal end
+  // (set only when the switch is set)
+  MinMaxValue ego_to_terminal_end_proximity;
+
   double dist_to_terminal_end{
     std::numeric_limits<double>::min()};  // distance from ego base link to the current lanes'
                                           // terminal end
@@ -263,6 +269,8 @@ struct CommonData
 {
   RouteHandlerPtr route_handler_ptr;
   Odometry::ConstSharedPtr self_odometry_ptr;
+  // NERO_LC_FIX_11360 (port of upstream #11360): ego's measured acceleration (used only when the switch is set)
+  geometry_msgs::msg::AccelWithCovarianceStamped::ConstSharedPtr current_acceleration;
   BppParamPtr bpp_param_ptr;
   LCParamPtr lc_param_ptr;
   LanesPtr lanes_ptr;
@@ -276,6 +284,12 @@ struct CommonData
   [[nodiscard]] const Pose & get_ego_pose() const { return self_odometry_ptr->pose.pose; }
 
   [[nodiscard]] const Twist & get_ego_twist() const { return self_odometry_ptr->twist.twist; }
+
+  // NERO_LC_FIX_11360: 0.0 while no acceleration has been received (upstream dereferences it unchecked)
+  [[nodiscard]] double get_current_accel() const
+  {
+    return current_acceleration ? current_acceleration->accel.accel.linear.x : 0.0;
+  }
 
   [[nodiscard]] double get_ego_speed(bool use_norm = false) const
   {
@@ -301,6 +315,24 @@ struct CommonData
   }
 };
 using CommonDataPtr = std::shared_ptr<CommonData>;
+
+// NERO_LC_FIX_11342 (port of upstream #11342)
+struct EgoObjectProximity
+{
+  bool is_ahead_of_ego{false};
+  std::optional<MinMaxValue> ego_dist_to_terminal_end;
+  std::optional<MinMaxValue> object_dist_to_terminal_end;
+
+  [[nodiscard]] bool is_overlapping() const
+  {
+    if (!ego_dist_to_terminal_end || !object_dist_to_terminal_end) {
+      return false;
+    }
+
+    return ego_dist_to_terminal_end->max >= object_dist_to_terminal_end->min &&
+           ego_dist_to_terminal_end->min <= object_dist_to_terminal_end->max;
+  }
+};
 }  // namespace autoware::behavior_path_planner::lane_change
 
 namespace autoware::behavior_path_planner

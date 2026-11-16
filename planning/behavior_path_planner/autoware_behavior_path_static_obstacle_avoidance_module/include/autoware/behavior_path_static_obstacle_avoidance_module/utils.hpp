@@ -220,6 +220,20 @@ void compensateLostTargetObjects(
   const std::shared_ptr<const PlannerData> & planner_data,
   const std::shared_ptr<AvoidanceParameters> & parameters);
 
+// NERO_SOA_FIX_10669=1 (port of upstream #10669): the stored objects are refreshed from a snapshot of the latest
+// detected targets AFTER their avoidance necessity is filled (updateStoredObjects), and the lost-target compensation
+// only reads them (this overload). The old function above refreshed them from the targets before the necessity was
+// filled, so the avoid_required hysteresis read from the stored objects never held. Unset = the old function (the car).
+void compensateLostTargetObjects(
+  AvoidancePlanningData & data, const ObjectDataArray & stored_objects,
+  const std::shared_ptr<const PlannerData> & planner_data);
+
+void updateStoredObjects(
+  ObjectDataArray & stored_objects, const ObjectDataArray & current_objects,
+  const rclcpp::Time & now, const std::shared_ptr<AvoidanceParameters> & parameters);
+
+bool nero_fix_10669();
+
 void filterTargetObjects(
   ObjectDataArray & objects, AvoidancePlanningData & data, const double forward_detection_range,
   const std::shared_ptr<const PlannerData> & planner_data,

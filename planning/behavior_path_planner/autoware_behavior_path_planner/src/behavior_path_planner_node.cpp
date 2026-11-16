@@ -718,6 +718,12 @@ PathWithLaneId::SharedPtr BehaviorPathPlannerNode::getPath(
                                           : planner_data->prev_output_path;
   path->header = planner_data->route_handler->getRouteHeader();
 
+  // NERO_BPP_FIX_10989=1: port of upstream #10989: PlannerManager::run already resampled the path (before the drivable
+  // area): return it as it is. Unset = the car (resampled here).
+  if (nero_bpp_fix_10989()) {
+    return path;
+  }
+
   PathWithLaneId connected_path;
   const auto module_status_ptr_vec = planner_manager->getSceneModuleStatus();
 

@@ -29,6 +29,7 @@
 #include <autoware_utils/math/unit_conversion.hpp>
 
 #include <algorithm>
+#include <cstdlib>
 #include <limits>
 #include <memory>
 #include <queue>
@@ -600,6 +601,24 @@ geometry_msgs::msg::Pose TurnSignalDecider::get_required_end_point(
     autoware::motion_utils::resamplePoseVector(converted_centerline, resampling_arclength);
 
   const double terminal_yaw = tf2::getYaw(resampled_centerline.back().orientation);
+  // NERO_BPP_FIX_11288=1: port of upstream #11288: the required end point is searched from the END of the centreline:
+  // the last point whose yaw still differs from the terminal yaw by the intersection angle (before: the FIRST point
+  // whose yaw is within it, which on a lanelet that turns, straightens and turns again was a point inside the turn).
+  // Unset = the car.
+  static const bool fix_11288 = [] {
+    const char * v = std::getenv("NERO_BPP_FIX_11288");
+    return v != nullptr && std::atoi(v) > 0;
+  }();
+  if (fix_11288) {
+    for (auto itr = resampled_centerline.rbegin(); itr != resampled_centerline.rend(); ++itr) {
+      const double yaw = tf2::getYaw(itr->orientation);
+      const double yaw_diff = autoware_utils::normalize_radian(yaw - terminal_yaw);
+      if (std::fabs(yaw_diff) >= autoware_utils::deg2rad(intersection_angle_threshold_deg_)) {
+        return *itr;
+      }
+    }
+    return resampled_centerline.back();
+  }
   for (size_t i = 0; i < resampled_centerline.size(); ++i) {
     const double yaw = tf2::getYaw(resampled_centerline.at(i).orientation);
     const double yaw_diff = autoware_utils::normalize_radian(yaw - terminal_yaw);

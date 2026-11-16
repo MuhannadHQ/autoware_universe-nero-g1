@@ -211,8 +211,23 @@ void AvoidanceByLaneChange::updateSpecialData()
                    : Direction::RIGHT;
   }
 
-  utils::static_obstacle_avoidance::compensateLostTargetObjects(
-    registered_objects_, avoidance_data_, clock_.now(), planner_data_, p);
+  // NERO_ABLC_FIX_10669=1: port of upstream #10669's avoidance-by-lane-change half: compensate lost targets from the
+  // stored objects without touching them, then refresh the stored objects from this cycle's detected targets (their
+  // necessity already filled by calcAvoidancePlanningData). Unset = the car (one call that refreshes, then compensates).
+  static const bool fix_10669 = [] {
+    const char * v = std::getenv("NERO_ABLC_FIX_10669");
+    return v != nullptr && std::atoi(v) > 0;
+  }();
+  if (fix_10669) {
+    auto current_target_objects = avoidance_data_.target_objects;
+    utils::static_obstacle_avoidance::compensateLostTargetObjects(
+      avoidance_data_, registered_objects_, planner_data_);
+    utils::static_obstacle_avoidance::updateStoredObjects(
+      registered_objects_, current_target_objects, clock_.now(), p);
+  } else {
+    utils::static_obstacle_avoidance::compensateLostTargetObjects(
+      registered_objects_, avoidance_data_, clock_.now(), planner_data_, p);
+  }
 
   std::sort(
     avoidance_data_.target_objects.begin(), avoidance_data_.target_objects.end(),

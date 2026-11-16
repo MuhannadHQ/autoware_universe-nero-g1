@@ -695,7 +695,27 @@ AvoidOutlines ShiftLineGenerator::generateAvoidOutline(
       al_avoid.start_shift_length = helper_->getLinearShift(al_avoid.start.position);
 
       // end point
-      al_avoid.end_shift_length = feasible_shift_profile.value().first;
+      // NERO_SOA_FIX_11302=1: port of upstream #11302: a best-effort (feasible) end shift never moves ego back toward
+      // the object: the avoid line ends at least at the shift the path already has at its end point (the larger shift
+      // away from the object), and the return line starts from that shift. Unset = the car.
+      static const bool fix_11302 = [] {
+        const char * v = std::getenv("NERO_SOA_FIX_11302");
+        return v != nullptr && std::atoi(v) > 0;
+      }();
+      if (fix_11302) {
+        const auto end_idx = utils::static_obstacle_avoidance::findPathIndexFromArclength(
+          data.arclength_from_ego, to_shift_end);
+        const auto end = data.reference_path.points.at(end_idx).point.pose;
+        if (utils::static_obstacle_avoidance::isOnRight(o)) {
+          al_avoid.end_shift_length =
+            std::max(feasible_shift_profile.value().first, helper_->getLinearShift(end.position));
+        } else {
+          al_avoid.end_shift_length =
+            std::min(feasible_shift_profile.value().first, helper_->getLinearShift(end.position));
+        }
+      } else {
+        al_avoid.end_shift_length = feasible_shift_profile.value().first;
+      }
       al_avoid.end_longitudinal = to_shift_end;
 
       // misc
@@ -710,7 +730,7 @@ AvoidOutlines ShiftLineGenerator::generateAvoidOutline(
       const auto to_shift_start = o.longitudinal + constant_distance;
 
       // start point
-      al_return.start_shift_length = feasible_shift_profile.value().first;
+      al_return.start_shift_length = al_avoid.end_shift_length;  // NERO_SOA_FIX_11302 (unset: the same value as before)
       al_return.start_longitudinal = to_shift_start;
 
       // end point

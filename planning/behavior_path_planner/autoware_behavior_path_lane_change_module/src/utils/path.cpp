@@ -21,6 +21,7 @@
 #include "autoware/behavior_path_planner_common/utils/utils.hpp"
 
 #include <autoware/motion_utils/trajectory/path_shift.hpp>
+#include <autoware/motion_utils/trajectory/trajectory.hpp>
 #include <autoware_frenet_planner/frenet_planner.hpp>
 #include <autoware_utils/system/stop_watch.hpp>
 #include <range/v3/action/insert.hpp>
@@ -105,13 +106,41 @@ PathWithLaneId get_reference_path_from_target_lane(
     return std::min(dist_from_lc_start, target_lane_length - next_lc_buffer);
   });
 
+  // NERO_LC_FIX_13566=1: port of upstream #13566: no target-lane reference path (an empty one, as for a too-short lane)
+  // when the lane-changing length is <= 0 or longer than the centreline path, and a resampling exception is caught
+  // (logged) instead of escaping into the candidate search. Unset = the car.
+  static const bool fix_13566 = [] {
+    const char * v = std::getenv("NERO_LC_FIX_13566");
+    return v != nullptr && std::atoi(v) > 0;
+  }();
+
   constexpr double epsilon = 1e-4;
-  if (s_end - s_start + epsilon < lane_changing_length) {
+  if ((fix_13566 && lane_changing_length <= 0.0) || s_end - s_start + epsilon < lane_changing_length) {
     return PathWithLaneId();
   }
 
   const auto lane_changing_reference_path =
     route_handler.getCenterLinePath(target_lanes, s_start, s_end);
+
+  if (fix_13566) {
+    // the resampling below needs lane_changing_length within the arc length of the centerline path
+    if (
+      lane_changing_reference_path.points.size() < 2 ||
+      autoware::motion_utils::calcArcLength(lane_changing_reference_path.points) + epsilon <
+        lane_changing_length) {
+      return PathWithLaneId();
+    }
+
+    try {
+      return autoware::behavior_path_planner::utils::resamplePathWithSpline(
+        lane_changing_reference_path, resample_interval, true, {0.0, lane_changing_length});
+    } catch (const std::exception & e) {
+      RCLCPP_WARN(
+        autoware::behavior_path_planner::utils::lane_change::get_logger(),
+        "failed to resample the target lane reference path: %s", e.what());
+      return PathWithLaneId();
+    }
+  }
 
   return autoware::behavior_path_planner::utils::resamplePathWithSpline(
     lane_changing_reference_path, resample_interval, true, {0.0, lane_changing_length});

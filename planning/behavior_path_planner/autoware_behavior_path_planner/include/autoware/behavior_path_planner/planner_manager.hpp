@@ -41,6 +41,9 @@
 namespace autoware::behavior_path_planner
 {
 
+// NERO_BPP_FIX_10989 (port of upstream #10989, planner_manager.cpp): read once. Unset = the car.
+bool nero_bpp_fix_10989();
+
 using autoware_internal_planning_msgs::msg::PathWithLaneId;
 using autoware_utils::StopWatch;
 using SceneModulePtr = std::shared_ptr<SceneModuleInterface>;

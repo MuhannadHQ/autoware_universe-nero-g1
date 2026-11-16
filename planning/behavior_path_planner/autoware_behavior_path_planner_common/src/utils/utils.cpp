@@ -34,6 +34,7 @@
 #include <lanelet2_routing/RoutingGraphContainer.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <limits>
 #include <memory>
 #include <set>
@@ -1111,6 +1112,18 @@ lanelet::ConstLanelets getCurrentLanesFromPath(
              front_lane_ids.end();
     });
   };
+
+  // NERO_BPP_FIX_12039=1: port of upstream #12039's planner_common half: if the current lanes already have the path's
+  // front lanes, return them as they are (no backward extension). Used by every module's current lanes. Upstream ships it
+  // with the lane change's target-lane half (NERO_LC_FIX_12039). Unset = the car.
+  static const bool fix_12039 = [] {
+    const char * v = std::getenv("NERO_BPP_FIX_12039");
+    return v != nullptr && std::atoi(v) > 0;
+  }();
+  if (fix_12039 && have_front_lanes(current_lanes)) {
+    return current_lanes;
+  }
+
   auto extended_lanes = current_lanes;
   while (rclcpp::ok()) {
     const size_t pre_extension_size = extended_lanes.size();  // Get existing size before extension

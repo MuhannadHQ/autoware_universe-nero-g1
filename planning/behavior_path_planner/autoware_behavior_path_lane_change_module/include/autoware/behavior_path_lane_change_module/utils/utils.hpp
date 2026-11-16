@@ -54,8 +54,10 @@ using autoware_perception_msgs::msg::PredictedPath;
 using autoware_utils::LineString2d;
 using autoware_utils::Polygon2d;
 using behavior_path_planner::lane_change::CommonDataPtr;
+using behavior_path_planner::lane_change::EgoObjectProximity;
 using behavior_path_planner::lane_change::LanesPolygon;
 using behavior_path_planner::lane_change::LCParamPtr;
+using behavior_path_planner::lane_change::MinMaxValue;
 using behavior_path_planner::lane_change::ModuleType;
 using behavior_path_planner::lane_change::PathSafetyStatus;
 using behavior_path_planner::lane_change::TargetLaneLeadingObjects;
@@ -116,9 +118,21 @@ CandidateOutput assignToCandidate(
 std::optional<lanelet::ConstLanelet> get_lane_change_target_lane(
   const CommonDataPtr & common_data_ptr, const lanelet::ConstLanelets & current_lanes);
 
+// NERO_LC_FIX_12039 (port of upstream #12039): the target lane from the first current lane not behind ego.
+std::optional<lanelet::ConstLanelet> get_target_lane(
+  const CommonDataPtr & common_data_ptr, const lanelet::ConstLanelets & current_lanes,
+  const bool is_mandatory_lc = false);
+
 std::vector<PoseWithVelocityStamped> convert_to_predicted_path(
   const CommonDataPtr & common_data_ptr, const LaneChangePath & lane_change_path,
   const double lane_changing_acceleration);
+
+// NERO_LC_FIX_11360 (port of upstream #11360): the approved path's ego prediction at ego's measured acceleration,
+// clipped at the lane changing end.
+std::vector<PoseWithVelocityStamped> convert_to_predicted_path(
+  const CommonDataPtr & common_data_ptr, const LaneChangePath & lane_change_path);
+
+bool nero_lc_fix_11360();
 
 bool isParkedObject(
   const PathWithLaneId & path, const RouteHandler & route_handler,
@@ -256,6 +270,19 @@ bool is_ahead_of_ego(
   const CommonDataPtr & common_data_ptr, const PathWithLaneId & path,
   const ExtendedPredictedObject & object);
 
+// NERO_LC_FIX_11342 (port of upstream #11342): used only when the switch is set.
+bool nero_lc_fix_11342();
+
+MinMaxValue calc_polygon_dist_range_from_terminal_end(
+  const PathWithLaneId & path, const Polygon2d & polygon);
+
+EgoObjectProximity calc_ego_object_proximity(
+  const CommonDataPtr & common_data_ptr, const PathWithLaneId & path,
+  const ExtendedPredictedObject & object);
+
+bool is_moving_object(
+  const CommonDataPtr & common_data_ptr, const ExtendedPredictedObject & object);
+
 bool is_before_terminal(
   const CommonDataPtr & common_data_ptr, const PathWithLaneId & path,
   const ExtendedPredictedObject & object);
@@ -382,7 +409,8 @@ bool filter_target_lane_objects(
   const CommonDataPtr & common_data_ptr, const ExtendedPredictedObject & object,
   const double dist_ego_to_current_lanes_center, const bool ahead_of_ego,
   const bool before_terminal, TargetLaneLeadingObjects & leading_objects,
-  ExtendedPredictedObjects & trailing_objects);
+  ExtendedPredictedObjects & trailing_objects,
+  const bool overlapping_with_ego = false);  // NERO_LC_FIX_11342: EgoObjectProximity::is_overlapping()
 
 /**
  * @brief Retrieves the preceding lanes for the target lanes while removing overlapping and
@@ -434,7 +462,8 @@ bool object_path_overlaps_lanes(
  */
 std::vector<std::vector<PoseWithVelocityStamped>> convert_to_predicted_paths(
   const CommonDataPtr & common_data_ptr, const LaneChangePath & lane_change_path,
-  const size_t deceleration_sampling_num);
+  const size_t deceleration_sampling_num,
+  const bool is_approved = false);  // NERO_LC_FIX_11360: only read when the switch is set
 
 /**
  * @brief Validates whether a given pose is a valid starting point for a lane change.
@@ -468,5 +497,18 @@ bool is_valid_start_point(const lane_change::CommonDataPtr & common_data_ptr, co
 std::vector<PoseWithVelocityStamped> convert_to_predicted_path(
   const CommonDataPtr & common_data_ptr, const lane_change::TrajectoryGroup & frenet_candidate,
   [[maybe_unused]] const size_t deceleration_sampling_num);
+
+/**
+ * @brief Check whether a given lanelet exists in a specified collection of lanelets.
+ *        (NERO_LC_FIX_11599: port of upstream #11599)
+ *
+ * @param lanelet_collections  Lanelets that define the lookup range.
+ * @param lanelet          Lanelet to check for membership in the target set.
+ * @return true            The lanelet is an element of target_lanelets.
+ *
+ * @note Comparison is performed by lanelet ID, not by geometric or semantic equality.
+ */
+bool is_lanelet_in_lanelet_collections(
+  const lanelet::ConstLanelets & lanelet_collections, const lanelet::ConstLanelet & lanelet);
 }  // namespace autoware::behavior_path_planner::utils::lane_change
 #endif  // AUTOWARE__BEHAVIOR_PATH_LANE_CHANGE_MODULE__UTILS__UTILS_HPP_

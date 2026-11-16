@@ -138,6 +138,9 @@ public:
 
   bool hasFinishedLaneChange() const override;
 
+  // NERO_LC_FIX_12280 (port of upstream #12280)
+  bool hasMissedLaneChangePath() const override;
+
   bool isAbleToReturnCurrentLane() const override;
 
   bool is_near_terminal() const final;
@@ -203,7 +206,10 @@ protected:
     const std::vector<std::vector<PoseWithVelocityStamped>> & ego_predicted_paths,
     const lane_change::TargetObjects & collision_check_objects,
     const utils::path_safety_checker::RSSparams & rss_params,
-    CollisionCheckDebugMap & debug_data) const;
+    CollisionCheckDebugMap & debug_data,
+    const bool is_approved = false,  // NERO_LC_FIX_11360: only read when the switch is set
+    // NERO_LC_FIX_11360: the predictions the NERO_LC_R79_* block judges on (nullptr = ego_predicted_paths)
+    const std::vector<std::vector<PoseWithVelocityStamped>> * r79_ego_predicted_paths = nullptr) const;
 
   bool is_colliding(
     const LaneChangePath & lane_change_path, const ExtendedPredictedObject & obj,
@@ -230,6 +236,15 @@ protected:
   }
 
   void update_dist_from_intersection();
+
+  /**
+   * @brief Check whether the ego vehicle is currently located in either the
+   *        current lanes or the target lanes used for lane change planning.
+   *        (NERO_LC_FIX_11599: port of upstream #11599)
+   *
+   * @return true   ego vehicle is on one of the current or target lanelets.
+   */
+  bool is_ego_in_current_or_target_lanes() const final;
 
   std::vector<PathPointWithLaneId> path_after_intersection_;
   double stop_time_{0.0};
