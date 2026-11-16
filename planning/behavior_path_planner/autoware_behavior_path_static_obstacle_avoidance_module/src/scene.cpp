@@ -17,6 +17,7 @@
 #include "autoware/behavior_path_planner_common/utils/nero_mu.hpp"  // NERO_BPP_PROJ_FAST
 
 #include "nero_proj.hpp"
+#include "nero_squeeze.hpp"  // NERO_SOA_SQUEEZE (mainlane-12)
 
 #include "autoware/behavior_path_planner_common/interface/scene_module_visitor.hpp"
 #include "autoware/behavior_path_planner_common/utils/drivable_area_expansion/static_drivable_area.hpp"
@@ -50,6 +51,7 @@
 #include <cstring>
 #include <iomanip>
 #include <limits>
+#include <map>
 #include <memory>
 #include <optional>
 #include <set>
@@ -1115,7 +1117,32 @@ AvoidanceState StaticObstacleAvoidanceModule::getCurrentModuleState(
     data.target_objects.begin(), data.target_objects.end(),
     [this](const auto & o) { return !helper_->isAbsolutelyNotAvoidable(o); });
 
+  // NERO_SOA_SQUEEZE v7 (mainlane-14, with field 12 <hold_s>): in a recognised squeeze one cycle in which every target reads "absolutely not
+  // avoidable" (a one-frame outline of the corner reaching -0.30 m) must not CANCEL the not-yet-started centring line: the re-plan needed a
+  // new approval, ~0.3 s without an approved shift, obstacle_stop planned at the corner 9-10 m ahead (m14g run 4, m14j runs 1 / 3). The
+  // registered plan stays through such a gap of up to hold_s; obstacle_stop / AEB still stop for anything really in the way
+  static double nero_sq_avoidable_t = -1.0;
+  const double nero_now = clock_->now().seconds();
+  const auto & sqe = nero_squeeze::env();
+  const bool nero_in_squeeze =
+    sqe.on && sqe.hold > 0.0 && sqe.pair > 0.0 &&
+    !nero_squeeze::squeezeVehicles(
+       data.target_objects, data.other_objects, planner_data_->dynamic_object.get(), data.reference_path.points, getEgoPose(),
+       planner_data_->parameters.base_link2front, planner_data_->parameters.base_link2rear, planner_data_->parameters.vehicle_width,
+       parameters_->object_parameters.at(ObjectClassification::UNKNOWN).lateral_hard_margin)
+       .empty();
   if (has_avoidance_target) {
+    if (nero_in_squeeze) nero_sq_avoidable_t = nero_now;
+    return AvoidanceState::RUNNING;
+  }
+  if (
+    nero_in_squeeze && nero_sq_avoidable_t > 0.0 && nero_now >= nero_sq_avoidable_t && nero_now - nero_sq_avoidable_t <= sqe.hold &&
+    !path_shifter_.getShiftLines().empty() && !helper_->isShifted()) {
+    static rclcpp::Clock nero_sqc2_clock(RCL_STEADY_TIME);
+    RCLCPP_INFO_THROTTLE(
+      getLogger(), nero_sqc2_clock, 500,
+      "[NERO_SOA_SQUEEZE] hold: no target avoidable this cycle (%.2f s after the last); the registered plan is kept, not cancelled",
+      nero_now - nero_sq_avoidable_t);
     return AvoidanceState::RUNNING;
   }
 
@@ -1428,6 +1455,68 @@ void StaticObstacleAvoidanceModule::fillFundamentalData(
 
   // calculate various data for each target objects.
   fillAvoidanceTargetData(data.target_objects);
+  // NERO_SOA_SQUEEZE (nero_squeeze.hpp (5), field 9): in a squeeze, still barrier pieces within the gate ask for the centre of the
+  // room left to the squeeze's bound (never less than stock) and need avoiding: the robot centres in the gap early
+  if (nero_squeeze::env().on && nero_squeeze::env().centre > 0.0) {
+    const double vw = planner_data_->parameters.vehicle_width;
+    const double hard_unknown = parameters_->object_parameters.at(ObjectClassification::UNKNOWN).lateral_hard_margin;
+    const auto sqv = nero_squeeze::squeezeVehicles(
+      data.target_objects, data.other_objects, planner_data_->dynamic_object.get(), data.reference_path.points, getEgoPose(),
+      planner_data_->parameters.base_link2front, planner_data_->parameters.base_link2rear, vw, hard_unknown);
+    if (!sqv.empty()) {
+      static rclcpp::Clock nero_sqc_clock(RCL_STEADY_TIME);
+      for (auto & o : data.target_objects) {
+        if (!nero_squeeze::inGate(o, vw) || !o.avoid_margin.has_value()) continue;
+        const double ovh = o.overhang_points.front().first;  // signed (left +)
+        const bool right = utils::static_obstacle_avoidance::isOnRight(o);
+        const auto side = nero_squeeze::vehicleSide(sqv, planner_data_->dynamic_object.get(), data.reference_path.points, right);
+        if (!side) continue;
+        const double gap = *side + std::abs(ovh) * (right == (ovh < 0.0) ? 1.0 : -1.0);  // barrier edge -> the vehicles' near side
+        const double min_m = hard_unknown * o.distance_factor + 0.5 * vw;
+        const double max_m = std::min(
+          o.to_road_shoulder_distance - parameters_->hard_drivable_bound_margin - 0.5 * vw, gap - 0.5 * vw - nero_squeeze::env().veh_clear);
+        if (max_m < min_m) continue;
+        const double centre = std::clamp(0.5 * gap, min_m, max_m);
+        const double before = o.avoid_margin.value();
+        // v3 (mainlane-14): never MORE than keeps veh_clear to the squeeze's vehicles either: stock's own margin (e.g. on a
+        // one-pose box that jumped toward the lane centre) made a candidate pass a queued car within 0.3 m -> "unsafe" ->
+        // overtake v6's start-yield dropped the shift -> obstacle_stop at the corner for good (m14a run 2); such a margin
+        // is lowered to the centre (still >= the stock hard margin to the barrier)
+        const bool too_close = before > max_m + 1.0e-3;
+        double m_final = too_close ? centre : std::max(before, centre);
+        // v6 (mainlane-14): hold the target SHIFT per barrier piece within 0.10 m (the module quantises shifts to 0.1 m): the corner's
+        // outline flickers a few cm a frame, the centring target hovered at the rounding boundary (0.14 / 0.17 m), the rounded line
+        // flipped 0.1 / 0.2 before the shift had started and the registered line was replaced -> ~0.3 s without an approved shift ->
+        // obstacle_stop planned at the corner 9-10 m ahead (m14g run 4, m14j run 1). The held target stays inside [min_m, max_m]
+        // (the hard margin to the barrier, veh_clear to the queued vehicles); a real change of the gap (>= 0.10 m) moves it
+        {
+          static std::map<std::array<uint8_t, 16>, std::pair<double, double>> nero_sqh;  // id -> (target shift, last seen)
+          const double now = clock_->now().seconds();
+          for (auto it = nero_sqh.begin(); it != nero_sqh.end();) {
+            it = (now - it->second.second > 5.0 || now < it->second.second) ? nero_sqh.erase(it) : std::next(it);
+          }
+          const double s_new = right ? ovh + m_final : ovh - m_final;
+          auto it = nero_sqh.find(o.object.object_id.uuid);
+          if (it != nero_sqh.end() && std::abs(s_new - it->second.first) < 0.10) {
+            m_final = std::clamp(right ? it->second.first - ovh : ovh - it->second.first, min_m, max_m);
+            it->second.second = now;
+          } else {
+            nero_sqh[o.object.object_id.uuid] = {s_new, now};
+          }
+        }
+        if (o.avoid_required && std::abs(m_final - before) < 1.0e-3) continue;
+        o.avoid_margin = m_final;
+        const bool was = o.avoid_required;
+        o.avoid_required = true;
+        RCLCPP_INFO_THROTTLE(
+          getLogger(), nero_sqc_clock, 500,
+          "[NERO_SOA_SQUEEZE] centre %02x%02x: overhang %.2f, vehicles' side %.2f (gap %.2f), shoulder %.2f, margin %.2f -> %.2f "
+          "(needed %d -> 1)",
+          o.object.object_id.uuid[0], o.object.object_id.uuid[1], ovh, *side, gap, o.to_road_shoulder_distance, before,
+          o.avoid_margin.value(), was ? 1 : 0);
+      }
+    }
+  }
   if (fix_10669) {
     fillAvoidanceTargetData(current_target_objects_snapshot);
     utils::static_obstacle_avoidance::updateStoredObjects(
@@ -1694,6 +1783,105 @@ void StaticObstacleAvoidanceModule::fillShiftLine(
     }
   }
   data.safe = isSafePath(data.candidate_path, debug);
+  // NERO_SOA_SQUEEZE field 13 (mainlane-14): in a squeeze, new lines that would pass a standing squeeze vehicle under veh_clear (one cycle's
+  // candidate, e.g. a second centre line added on a registered one still rising: 0.49 m at the queued car, m14d) give way to the
+  // REGISTERED plan when that plan alone keeps the clearance: no yield to a car that will not move, the plan re-judged next cycle
+  if (
+    !data.safe && nero_squeeze::env().on && nero_squeeze::env().keep > 0.0 && nero_squeeze::lastUnsafeWasSqueeze() &&
+    !data.new_shift_line.empty()) {
+    ShiftedPath reg = utils::static_obstacle_avoidance::toShiftedPath(data.reference_path);
+    auto reg_shifter = path_shifter_;
+    if (reg_shifter.generate(&reg, true, SHIFT_TYPE::SPLINE)) {
+      DebugData reg_debug;
+      if (isSafePath(reg, reg_debug)) {
+        static rclcpp::Clock nero_sqk_clock(RCL_STEADY_TIME);
+        RCLCPP_INFO_THROTTLE(
+          getLogger(), nero_sqk_clock, 500,
+          "[NERO_SOA_SQUEEZE] keep: %zu new line(s) would pass a queued vehicle under %.2f m; the registered plan (%zu line(s)) keeps it",
+          data.new_shift_line.size(), nero_squeeze::env().veh_clear, path_shifter_.getShiftLines().size());
+        data.new_shift_line.clear();
+        data.candidate_path = reg;
+        data.safe = true;
+      }
+    }
+  }
+  // NERO_SOA_TARGET_DEBUG=1 (mainlane-12 2026-11-14, LOG ONLY): every 0.5 s each target's side / overhang /
+  // road-shoulder distance / avoid margin / verdict / desired shift, the candidate path's shift range, and each object
+  // the safety check finds unsafe with its body-to-body clearance at the expected poses (work-zone squeeze 80325).
+  {
+    static const bool nero_tdbg = [] {
+      const char * v = std::getenv("NERO_SOA_TARGET_DEBUG");
+      return v != nullptr && std::strcmp(v, "1") == 0;
+    }();
+    static double nero_tdbg_last = -1.0;
+    const double now = clock_->now().seconds();
+    if (nero_tdbg && (nero_tdbg_last < 0.0 || now - nero_tdbg_last >= 0.5 || now < nero_tdbg_last)) {
+      nero_tdbg_last = now;
+      double s_max = 0.0;
+      double s_min = 0.0;
+      for (const auto s : data.candidate_path.shift_length) {
+        s_max = std::max(s_max, s);
+        s_min = std::min(s_min, s);
+      }
+      const auto & e = getEgoPosition();
+      RCLCPP_INFO(
+        getLogger(),
+        "[NERO_SOA_TDBG] v %.2f safe %d valid %d targets %zu other %zu new_sl %zu shift [%.2f, %.2f] ego (%.2f, %.2f)",
+        getEgoSpeed(), data.safe ? 1 : 0, data.valid ? 1 : 0, data.target_objects.size(),
+        data.other_objects.size(), data.new_shift_line.size(), s_min, s_max, e.x, e.y);
+      for (const auto & sl : data.new_shift_line) {
+        RCLCPP_INFO(
+          getLogger(), "[NERO_SOA_TDBG]  sl len %.2f start %.2f end %.2f", sl.end_shift_length,
+          sl.start_longitudinal, sl.end_longitudinal);
+      }
+      int n = 0;
+      for (const auto & o : data.target_objects) {
+        if (++n > 16) {
+          break;
+        }
+        const auto & p = o.getPosition();
+        const bool on_right = utils::static_obstacle_avoidance::isOnRight(o);
+        const double ovh = o.overhang_points.empty() ? 0.0 : o.overhang_points.front().first;
+        const double desire =
+          o.avoid_margin.has_value() ? helper_->getShiftLength(o, on_right, o.avoid_margin.value()) : -99.0;
+        const auto & u = o.object.object_id.uuid;
+        double nx = 0.0;
+        double ny = 0.0;
+        if (o.narrowest_place.has_value()) {
+          nx = o.narrowest_place->second.x;
+          ny = o.narrowest_place->second.y;
+        }
+        RCLCPP_INFO(
+          getLogger(),
+          "[NERO_SOA_TDBG]  obj %02x%02x (%.2f, %.2f) lon %.2f %s ovh %.2f shoulder %.2f bound_at (%.2f, %.2f) margin %.2f "
+          "desire %.2f req %d avoidable %d info %s",
+          u[0], u[1], p.x, p.y, o.longitudinal, on_right ? "R" : "L", ovh, o.to_road_shoulder_distance, nx, ny,
+          o.avoid_margin.value_or(-99.0), desire, o.avoid_required ? 1 : 0, o.is_avoidable ? 1 : 0,
+          std::string(magic_enum::enum_name(o.info)).c_str());
+      }
+      for (const auto & [id, c] : debug.collision_check) {
+        if (c.is_safe) {
+          continue;
+        }
+        const auto & ep = c.expected_ego_pose.position;
+        const auto & op = c.expected_obj_pose.position;
+        const double yaw = tf2::getYaw(c.expected_ego_pose.orientation);
+        const double dx = op.x - ep.x;
+        const double dy = op.y - ep.y;
+        const double lon = std::cos(yaw) * dx + std::sin(yaw) * dy;
+        const double lat = -std::sin(yaw) * dx + std::cos(yaw) * dy;
+        const double clear = std::abs(lat) - 0.5 * planner_data_->parameters.vehicle_width -
+                             0.5 * c.obj_shape.dimensions.y;
+        RCLCPP_INFO(
+          getLogger(),
+          "[NERO_SOA_TDBG]  unsafe %s obj (%.2f, %.2f) at ego (%.2f, %.2f): lon %.2f lat %.2f clear %.2f size %.2fx%.2f "
+          "%s rss %.2f ext_lat %.2f fwd %.2f",
+          c.is_front ? "front" : "rear", op.x, op.y, ep.x, ep.y, lon, lat, clear, c.obj_shape.dimensions.x,
+          c.obj_shape.dimensions.y, c.unsafe_reason.c_str(), c.rss_longitudinal, c.lat_offset,
+          c.forward_lon_offset);
+      }
+    }
+  }
   if (nero_soa::env().gap) {
     neroGapTiming(data, debug);  // NERO_SOA_GAP: unsafe now may be safe at a lower approach speed
   }
@@ -2053,6 +2241,124 @@ void StaticObstacleAvoidanceModule::updateEgoBehavior(
   insertPrepareVelocity(path);
   insertAvoidanceVelocity(path);
   neroInsertGapVelocity(path);  // NERO_SOA_GAP (no-op without a plan)
+
+  // NERO_SOA_SQUEEZE (nero_squeeze.hpp (3)): the squeeze speed where the robot's footprint along THIS module's output path comes
+  // within band of BOTH a still UNKNOWN target and a standing vehicle (a cap only, reached at decel before it)
+  const auto nero_sq_veh = nero_squeeze::env().on
+                             ? nero_squeeze::squeezeVehicles(
+                                 avoid_data_.target_objects, avoid_data_.other_objects, planner_data_->dynamic_object.get(),
+                                 avoid_data_.reference_path.points, getEgoPose(), planner_data_->parameters.base_link2front,
+                                 planner_data_->parameters.base_link2rear, planner_data_->parameters.vehicle_width,
+                                 parameters_->object_parameters.at(ObjectClassification::UNKNOWN).lateral_hard_margin)
+                             : std::vector<unique_identifier_msgs::msg::UUID>{};
+  if (!nero_sq_veh.empty() && path.path.points.size() > 1) {
+    const auto & sq = nero_squeeze::env();
+    const auto & vp = planner_data_->parameters;
+    auto & pts = path.path.points;
+    struct Bx
+    {
+      double x0, y0, x1, y1;
+      static Bx of(const autoware_utils::Polygon2d & g)
+      {
+        Bx b{1e18, 1e18, -1e18, -1e18};
+        for (const auto & q : g.outer()) {
+          b.x0 = std::min(b.x0, q.x());
+          b.y0 = std::min(b.y0, q.y());
+          b.x1 = std::max(b.x1, q.x());
+          b.y1 = std::max(b.y1, q.y());
+        }
+        return b;
+      }
+      bool apart(const Bx & o, const double m) const
+      {
+        return o.x0 > x1 + m || x0 > o.x1 + m || o.y0 > y1 + m || y0 > o.y1 + m;
+      }
+    };
+    std::vector<std::pair<autoware_utils::Polygon2d, Bx>> barriers;
+    std::vector<std::pair<autoware_utils::Polygon2d, Bx>> vehicles;
+    for (const auto & o : avoid_data_.target_objects) {
+      if (utils::getHighestProbLabel(o.object.classification) != ObjectClassification::UNKNOWN) continue;
+      if (o.longitudinal < -10.0 || o.longitudinal > sq.range) continue;
+      const auto g = autoware_utils::to_polygon2d(o.object);
+      barriers.emplace_back(g, Bx::of(g));
+    }
+    for (const auto & o : planner_data_->dynamic_object->objects) {
+      if (!nero_squeeze::contains(nero_sq_veh, o.object_id)) continue;  // the squeeze's standing vehicles only
+      const auto & op = o.kinematics.initial_pose_with_covariance.pose;
+      const auto g = autoware_utils::to_polygon2d(op, o.shape);
+      vehicles.emplace_back(g, Bx::of(g));
+    }
+    if (!barriers.empty() && !vehicles.empty()) {
+      const size_t ego_idx = planner_data_->findEgoIndex(pts);
+      double s = 0.0;
+      double s_near = -1.0;
+      double s_far = -1.0;
+      double c_b = 1e9;
+      double c_v = 1e9;
+      std::vector<double> arc(pts.size(), 0.0);
+      // the output path's points are a few metres apart: the footprint is sampled every 0.5 m between them (pose
+      // interpolated), and the cap holds through the first point after the squeeze (the smoother interpolates between)
+      const auto sample = [&](const geometry_msgs::msg::Pose & pose, const double s_at) {
+        const auto fp = autoware_utils::to_footprint(pose, vp.base_link2front, vp.base_link2rear, vp.vehicle_width);
+        const auto fb = Bx::of(fp);
+        double db = 1e9;
+        for (const auto & [g, b] : barriers) {
+          if (!fb.apart(b, sq.band)) db = std::min(db, boost::geometry::distance(fp, g));
+        }
+        // field 10 (mainlane-14): the recognised squeeze already pairs these vehicles with the barrier; the barrier's long side beside them is
+        // seen only 10-16 m ahead, so requiring it at the same footprint put the cap 4.7 m ahead at 3.1 m/s (-1.9, m14e run 1): cap where the
+        // body passes within band of a squeeze vehicle
+        if (db >= sq.band && sq.pair <= 0.0) return;
+        double dv = 1e9;
+        for (const auto & [g, b] : vehicles) {
+          if (!fb.apart(b, sq.band)) dv = std::min(dv, boost::geometry::distance(fp, g));
+        }
+        if (dv >= sq.band) return;
+        if (s_near < 0.0) s_near = s_at;
+        s_far = s_at;
+        c_b = std::min(c_b, db);
+        c_v = std::min(c_v, dv);
+      };
+      for (size_t i = ego_idx; i < pts.size() && s <= sq.range; ++i) {
+        if (i > ego_idx) {
+          const auto & pa = pts.at(i - 1).point.pose;
+          const auto & pb = pts.at(i).point.pose;
+          const double len = autoware_utils::calc_distance2d(pa, pb);
+          const int k = std::max(1, static_cast<int>(std::ceil(len / 0.5)));
+          const double ya = tf2::getYaw(pa.orientation);
+          const double dyaw = autoware_utils::normalize_radian(tf2::getYaw(pb.orientation) - ya);
+          for (int j = 1; j < k; ++j) {
+            const double r = static_cast<double>(j) / k;
+            geometry_msgs::msg::Pose q;
+            q.position.x = pa.position.x + r * (pb.position.x - pa.position.x);
+            q.position.y = pa.position.y + r * (pb.position.y - pa.position.y);
+            q.position.z = pa.position.z;
+            q.orientation = autoware_utils::create_quaternion_from_yaw(ya + r * dyaw);
+            sample(q, s + r * len);
+          }
+          s += len;
+        }
+        arc.at(i) = s;
+        sample(pts.at(i).point.pose, s);
+      }
+      if (s_near >= 0.0) {
+        size_t i_end = ego_idx;
+        while (i_end + 1 < pts.size() && arc.at(i_end) < s_far) ++i_end;  // the first point at / after the squeeze end
+        for (size_t i = ego_idx; i <= i_end && i < pts.size(); ++i) {
+          const double d_to = std::max(0.0, s_near - arc.at(i));
+          const double v_allow = std::sqrt(sq.v * sq.v + 2.0 * sq.dec * d_to);
+          auto & v = pts.at(i).point.longitudinal_velocity_mps;
+          v = std::min(v, static_cast<float>(v_allow));
+        }
+        static rclcpp::Clock nero_sqv_clock(RCL_STEADY_TIME);
+        RCLCPP_INFO_THROTTLE(
+          getLogger(), nero_sqv_clock, 500,
+          "[NERO_SOA_SQUEEZE] squeeze %.1f..%.1f m ahead (body %.2f m from the barrier, %.2f m from a standing vehicle): "
+          "cap %.2f m/s (ego %.2f)",
+          s_near, s_far, c_b, c_v, sq.v, getEgoSpeed());
+      }
+    }
+  }
 
   const auto insert_velocity = [this, &data, &path]() {
     if (nero_paused_) {  // NERO_SOA_ONCOMING_PAUSE: stop before the target, the body held inside the lane
@@ -4985,6 +5291,15 @@ bool StaticObstacleAvoidanceModule::isSafePath(
                   ego_predicted_path_params, shifted_path.path.points, getEgoPose(), getEgoSpeed(),
                   ego_seg_idx, false, limit_to_max_velocity);
 
+  // NERO_SOA_SQUEEZE (nero_squeeze.hpp (2)): the planned body's footprints along this candidate path, built on first use
+  nero_squeeze::lastUnsafeWasSqueeze() = false;
+  const auto nero_sq_veh = nero_squeeze::squeezeVehicles(
+    avoid_data_.target_objects, avoid_data_.other_objects, planner_data_->dynamic_object.get(), avoid_data_.reference_path.points,
+    getEgoPose(),
+    p.base_link2front, p.base_link2rear, p.vehicle_width,
+    parameters_->object_parameters.at(ObjectClassification::UNKNOWN).lateral_hard_margin);
+  std::vector<autoware_utils::Polygon2d> nero_sq_fps;
+
   for (const auto & object : safety_check_target_objects) {
     auto current_debug_data = utils::path_safety_checker::createObjectDebug(object);
 
@@ -5009,6 +5324,57 @@ bool StaticObstacleAvoidanceModule::isSafePath(
     const auto & ego_predicted_path = is_object_front && !is_object_oncoming
                                         ? ego_predicted_path_for_front_object
                                         : ego_predicted_path_for_rear_object;
+
+    // NERO_SOA_SQUEEZE (nero_squeeze.hpp (2)): a standing same-way vehicle beside a squeeze is judged by the planned body's
+    // clearance to its box (>= veh_clear), not by RSS's lateral band; moving / oncoming vehicles keep the stock check below
+    if (v_norm < 0.3 && nero_squeeze::contains(nero_sq_veh, object.uuid)) {
+      // the footprints along this candidate path (NERO_SOA_GAP calls isSafePath once per speed step with the same path)
+      thread_local size_t nero_sq_fp_n = 0;
+      thread_local double nero_sq_fp_k[6] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+      thread_local std::vector<autoware_utils::Polygon2d> nero_sq_fp_cache;
+      const auto & sp = shifted_path.path.points;
+      double sl_sum = 0.0;  // the shift profile too: two candidates on the same reference path share size and ends (mainlane-14)
+      for (size_t q = 0; q < shifted_path.shift_length.size(); ++q) sl_sum += shifted_path.shift_length[q] * static_cast<double>(q + 1);
+      const double fk[6] = {
+        sp.front().point.pose.position.x, sp.front().point.pose.position.y, sp.back().point.pose.position.x,
+        sp.back().point.pose.position.y, static_cast<double>(ego_idx), sl_sum};
+      const bool fp_same = nero_sq_fp_n == sp.size() && std::equal(fk, fk + 6, nero_sq_fp_k);
+      if (nero_sq_fps.empty() && fp_same) {
+        nero_sq_fps = nero_sq_fp_cache;
+      }
+      if (nero_sq_fps.empty()) {
+        const auto & vp = planner_data_->parameters;
+        double s = 0.0;
+        for (size_t i = ego_idx; i < shifted_path.path.points.size() && s <= nero_squeeze::env().range; ++i) {
+          if (i > ego_idx) {
+            s += autoware_utils::calc_distance2d(shifted_path.path.points.at(i - 1), shifted_path.path.points.at(i));
+          }
+          nero_sq_fps.push_back(autoware_utils::to_footprint(
+            shifted_path.path.points.at(i).point.pose, vp.base_link2front, vp.base_link2rear, vp.vehicle_width));
+        }
+        nero_sq_fp_cache = nero_sq_fps;
+        nero_sq_fp_n = sp.size();
+        std::copy(fk, fk + 6, nero_sq_fp_k);
+      }
+      double c = std::numeric_limits<double>::max();
+      for (const auto & fp : nero_sq_fps) {
+        c = std::min(c, boost::geometry::distance(fp, obj_polygon));
+      }
+      const bool ok = c >= nero_squeeze::env().veh_clear;
+      static rclcpp::Clock nero_sq_clock(RCL_STEADY_TIME);
+      RCLCPP_INFO_THROTTLE(
+        getLogger(), nero_sq_clock, 1000,
+        "[NERO_SOA_SQUEEZE] standing vehicle %02x%02x %s: planned body %.2f m from it (>= %.2f: %s; RSS band not used)",
+        object.uuid.uuid.at(0), object.uuid.uuid.at(1), is_object_front ? "ahead" : "beside / behind", c,
+        nero_squeeze::env().veh_clear, ok ? "safe" : "unsafe");
+      utils::path_safety_checker::updateCollisionCheckDebugMap(debug.collision_check, current_debug_data, ok);
+      if (!ok) {
+        nero_squeeze::lastUnsafeWasSqueeze() = true;  // field 13: this path failed only on a squeeze vehicle's clearance
+        safe_count_ = 0;
+        return false;
+      }
+      continue;
+    }
 
     for (const auto & obj_path : obj_predicted_paths) {
       if (!utils::path_safety_checker::checkCollision(

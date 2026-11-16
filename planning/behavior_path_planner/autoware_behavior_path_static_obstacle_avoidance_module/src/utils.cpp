@@ -22,6 +22,7 @@
 #include "autoware/behavior_path_planner_common/utils/traffic_light_utils.hpp"
 #include "autoware/behavior_path_static_obstacle_avoidance_module/data_structs.hpp"
 #include "autoware/behavior_path_static_obstacle_avoidance_module/utils.hpp"
+#include "nero_squeeze.hpp"  // NERO_SOA_SQUEEZE (mainlane-12)
 
 #include <mutex>
 #include <Eigen/Dense>
@@ -2613,8 +2614,53 @@ void updateRoadShoulderDistance(
 
     o.avoid_margin = lateral_hard_margin + 0.5 * vehicle_width;
   }
+  // NERO_SOA_SQUEEZE (nero_squeeze.hpp (1)): while a still UNKNOWN target needs room, clip at each object's own hard margin
+  // (the stock argument is halved twice: the clip is a quarter of the robot's width wider than configured)
+  const auto nero_sq_veh = nero_squeeze::squeezeVehicles(
+    data.target_objects, data.other_objects, planner_data->dynamic_object.get(), data.reference_path.points,
+    planner_data->self_odometry->pose.pose, planner_data->parameters.base_link2front,
+    planner_data->parameters.base_link2rear, planner_data->parameters.vehicle_width,
+    parameters->object_parameters.at(autoware_perception_msgs::msg::ObjectClassification::UNKNOWN).lateral_hard_margin);
+  const bool nero_sq = !nero_sq_veh.empty();
+  // NERO_SOA_SQUEEZE (nero_squeeze.hpp (4), field 8): a long still barrier's overhang and bound clip from its own outline, not
+  // stock's one-pose box (o.envelope_poly, which the module stores, stays the box)
+  if (nero_sq && nero_squeeze::env().outline > 0.0) {
+    const double hard_unknown_o =
+      parameters->object_parameters.at(autoware_perception_msgs::msg::ObjectClassification::UNKNOWN).lateral_hard_margin;
+    static rclcpp::Clock nero_sqo_clock(RCL_STEADY_TIME);
+    for (auto & o : data.target_objects) {
+      if (!nero_squeeze::needsRoom(o, planner_data->parameters.vehicle_width, hard_unknown_o)) continue;
+      const auto & op = parameters->object_parameters.at(utils::getHighestProbLabel(o.object.classification));
+      const auto outline = nero_squeeze::outlineEnvelope(o, op.envelope_buffer_margin * o.distance_factor);
+      if (!outline) continue;
+      auto tmp = o;
+      tmp.envelope_poly = *outline;
+      const auto ovh = calcEnvelopeOverhangDistance(tmp, data.reference_path);
+      if (ovh.empty()) continue;
+      const double before = o.overhang_points.empty() ? 0.0 : o.overhang_points.front().first;
+      // the outline must lie further from the path than the box, on the object's own side (right: more negative)
+      if (isOnRight(o) ? ovh.front().first >= before : ovh.front().first <= before) continue;
+      o.overhang_points = ovh;
+      for (auto & c : clip_objects) {
+        if (c.object.object_id == o.object.object_id) c.envelope_poly = *outline;
+      }
+      RCLCPP_INFO_THROTTLE(
+        rclcpp::get_logger("static_obstacle_avoidance"), nero_sqo_clock, 500,
+        "[NERO_SOA_SQUEEZE] outline %02x%02x: overhang %.2f (one-pose box) -> %.2f (own outline)", o.object.object_id.uuid[0],
+        o.object.object_id.uuid[1], before, ovh.front().first);
+    }
+  }
   const auto extract_obstacles = generateObstaclePolygonsForDrivableArea(
-    clip_objects, parameters, planner_data->parameters.vehicle_width / 2.0);
+    clip_objects, parameters,
+    nero_sq ? planner_data->parameters.vehicle_width : planner_data->parameters.vehicle_width / 2.0);
+  if (nero_sq) {
+    static rclcpp::Clock nero_sq_clock(RCL_STEADY_TIME);
+    RCLCPP_INFO_THROTTLE(
+      rclcpp::get_logger("static_obstacle_avoidance"), nero_sq_clock, 1000,
+      "[NERO_SOA_SQUEEZE] squeeze: %zu standing vehicles beside a still barrier; %zu standing objects clip the bound at their "
+      "own hard margin",
+      nero_sq_veh.size(), clip_objects.size());
+  }
 
   auto tmp_path = data.reference_path;
   tmp_path.left_bound = data.left_bound;
@@ -2627,6 +2673,89 @@ void updateRoadShoulderDistance(
   for (auto & o : data.target_objects) {
     o.to_road_shoulder_distance = filtering_utils::getRoadShoulderDistance(o, data, planner_data);
     o.avoid_margin = filtering_utils::getAvoidMargin(o, planner_data, parameters);
+  }
+
+  // NERO_SOA_SQUEEZE (nero_squeeze.hpp (1)): a still UNKNOWN target's room = the narrowest clipped bound over its next window
+  // (its overhang point carried along the reference path at its own lateral offset, a ray to the bound on the shift side)
+  const auto & ref = data.reference_path.points;
+  if (nero_sq && nero_squeeze::env().window > 0.0 && ref.size() > 1) {
+    const double hard_unknown =
+      parameters->object_parameters.at(autoware_perception_msgs::msg::ObjectClassification::UNKNOWN).lateral_hard_margin;
+    static rclcpp::Clock nero_sqw_clock(RCL_STEADY_TIME);
+    // one pass over the reference path (no motion_utils call per target / sample: nero_lint): cumulative arc length
+    std::vector<double> arc(ref.size(), 0.0);
+    for (size_t i = 1; i < ref.size(); ++i) {
+      arc.at(i) = arc.at(i - 1) + calc_distance2d(ref.at(i - 1).point.pose, ref.at(i).point.pose);
+    }
+    for (auto & o : data.target_objects) {
+      if (!nero_squeeze::needsRoom(o, planner_data->parameters.vehicle_width, hard_unknown)) continue;
+      const bool right = isOnRight(o);
+      const auto & bound = right ? data.left_bound : data.right_bound;
+      if (bound.size() < 2) continue;
+      const auto & p0 = o.overhang_points.front().second;
+      // the overhang point's place on the path: nearest segment, arc length and signed lateral offset (left +)
+      size_t k0 = 0;
+      double s_p0 = 0.0;
+      double lat0 = 0.0;
+      double dmin = std::numeric_limits<double>::max();
+      for (size_t i = 1; i < ref.size(); ++i) {
+        const auto & a = ref.at(i - 1).point.pose.position;
+        const auto & b = ref.at(i).point.pose.position;
+        const double sx = b.x - a.x;
+        const double sy = b.y - a.y;
+        const double len = std::hypot(sx, sy);
+        if (len < 1.0e-6) continue;
+        const double t = std::clamp(((p0.x - a.x) * sx + (p0.y - a.y) * sy) / (len * len), 0.0, 1.0);
+        const double dd = std::hypot(p0.x - (a.x + t * sx), p0.y - (a.y + t * sy));
+        if (dd < dmin) {
+          dmin = dd;
+          k0 = i;
+          s_p0 = arc.at(i - 1) + t * len;
+          lat0 = (sx * (p0.y - a.y) - sy * (p0.x - a.x)) / len;
+        }
+      }
+      if (k0 == 0) continue;
+      double best = o.to_road_shoulder_distance;
+      size_t k = k0;
+      for (double d = 1.0; d <= nero_squeeze::env().window + 1.0e-6; d += 1.0) {
+        const double s_d = s_p0 + d;
+        while (k + 1 < ref.size() && arc.at(k) < s_d) ++k;
+        if (arc.at(k) < s_d) break;  // past the path's end
+        const auto & a = ref.at(k - 1).point.pose.position;
+        const auto & b = ref.at(k).point.pose.position;
+        const double len = std::max(arc.at(k) - arc.at(k - 1), 1.0e-6);
+        const double r = (s_d - arc.at(k - 1)) / len;
+        const double yaw = std::atan2(b.y - a.y, b.x - a.x);
+        const double nx = -std::sin(yaw);  // left normal
+        const double ny = std::cos(yaw);
+        const double cx = a.x + r * (b.x - a.x);
+        const double cy = a.y + r * (b.y - a.y);
+        const double far = lat0 + (right ? 100.0 : -100.0);
+        const auto q = autoware_utils::create_point(cx + lat0 * nx, cy + lat0 * ny, a.z);
+        const auto q_far = autoware_utils::create_point(cx + far * nx, cy + far * ny, a.z);
+        double nearest = std::numeric_limits<double>::max();
+        for (size_t i = 1; i < bound.size(); ++i) {
+          // a segment whose every point is farther from q than the best room so far cannot lower it
+          const auto & ba = bound.at(i - 1);
+          const auto & bb = bound.at(i);
+          const double seg = std::hypot(bb.x - ba.x, bb.y - ba.y);
+          const double lo = std::min(std::hypot(ba.x - q.x, ba.y - q.y), std::hypot(bb.x - q.x, bb.y - q.y)) - seg;
+          if (lo >= std::min(best, nearest)) continue;
+          const auto x = autoware_utils::intersect(q, q_far, ba, bb);
+          if (x) nearest = std::min(nearest, calc_distance2d(q, x.value()));
+        }
+        if (nearest < best) best = nearest;
+      }
+      if (best < o.to_road_shoulder_distance - 1.0e-3) {
+        RCLCPP_INFO_THROTTLE(
+          rclcpp::get_logger("static_obstacle_avoidance"), nero_sqw_clock, 1000,
+          "[NERO_SOA_SQUEEZE] barrier %02x%02x room over the next %.0f m: shoulder %.2f -> %.2f m",
+          o.object.object_id.uuid[0], o.object.object_id.uuid[1], nero_squeeze::env().window, o.to_road_shoulder_distance,
+          best);
+        o.to_road_shoulder_distance = best;
+        o.avoid_margin = filtering_utils::getAvoidMargin(o, planner_data, parameters);
+      }
+    }
   }
 }
 
