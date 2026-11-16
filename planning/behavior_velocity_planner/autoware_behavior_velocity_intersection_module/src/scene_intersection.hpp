@@ -402,6 +402,12 @@ private:
     double v{0.0};                                //! approach speed toward the conflict [m/s]
     int misses{0};                                //! cycles without a measurement
     std::deque<std::pair<double, double>> hist;   //! (time [s], d)
+    double hit_last{-1e9};                        //! NERO_IX_SIGHT_EVIDENCE: newest grid message that hit its blob
+    int hit_msgs{0};                              //! NERO_IX_SIGHT_EVIDENCE: grid messages that hit its blob
+    double meas_d0{0.0};                          //! NERO_IX_SIGHT_EVIDENCE: measured distance / time / speed at birth
+    double meas_t0{0.0};
+    double v_born{0.0};
+    bool adv_checked{false};
   };
   struct NeroSightStatus
   {
@@ -422,6 +428,22 @@ private:
   NeroSightStatus nero_sight_;
   //! published objects' boxes swept back along their velocity (outline points), by uuid, with the time last seen
   std::map<std::string, std::pair<double, std::vector<std::pair<double, double>>>> nero_sight_explained_;
+  //! NERO_IX_SIGHT_EVIDENCE (intersections-2, SIGHTPH): the grid history of every division point the sight rule samples
+  struct NeroSightPointHist
+  {
+    int last_v{-1};        //! cell value at the previous grid message
+    double hit_t{-1e9};    //! stamp of the last grid message in which the lidar hit the cell (not decaying)
+    double moving_t{-1e9}; //! stamp of the last grid message in which the cell lay under a MOVING published object
+    std::array<double, 24> t{};       //! ring: grid stamps
+    std::array<uint8_t, 24> occ{};    //! ring: occupied (hit or remembered), no moving published object over it for 2 s
+    uint8_t head{0};
+    uint8_t n{0};
+  };
+  std::vector<std::vector<NeroSightPointHist>> nero_sight_ev_hist_;
+  double nero_sight_ev_stamp_{-1.0};
+  double nero_sight_ev_log_t_{-1.0};
+  //! speed of each remembered explaining object (same keys as nero_sight_explained_)
+  std::map<std::string, double> nero_sight_explained_v_;
 
   //! NERO_IX_CROSSING_HOLD (crosshold, 2026-10-28): see scene_intersection_nero_crossing.cpp (neroCrossingHold)
   struct NeroCrossingCause
