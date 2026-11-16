@@ -3095,6 +3095,130 @@ bool NormalLaneChange::isValidPath(const PathWithLaneId & path) const
   return utils::checkPathRelativeAngle(path, M_PI);
 }
 
+// NERO_LC_ABORT_ROOM=<margin m>,<stall s> (mainlane-6 2026-11-11, Fable design research/mutualwait/DESIGN.md): at 93795 the car's
+// strict hold stopped an approved left change for a target-lane car coming up behind, check_transit_failure then found an abort
+// path (ABORT), the abort returns to the current lane over max(v, min_lc_v) x (cancel.delta_time + cancel.duration) (= 12 m at a
+// stand), a TRUCK stood 6.5 m ahead in that lane: the robot stopped for it and the abort could only end past its shift end
+// (hasFinishedAbort) -> stuck in ABORT for good (sim 1111-183343 / 1111-190201: 30 s, the stuck end; even a safe candidate did not
+// leave ABORT). A) no abort while the hold is latched, something stands within that return length + margin in the current lane and
+// the hold can stop the robot on its approved path with the footprint still in the current lanes (isAbleToStopSafely): the hold
+// then stops it there and resumes after its safe cycles (no exposure: it stays in its lane). B) an abort stalled >= stall s with the
+// footprint inside the current lanes is cancelled (the same exit as "Aborted"): a fresh approval with the full strict check.
+namespace
+{
+struct NeroAbortRoom
+{
+  bool on{false};
+  double margin{4.0};
+  double stall_s{2.0};
+};
+const NeroAbortRoom & nero_abort_room()
+{
+  static const NeroAbortRoom a = [] {
+    NeroAbortRoom r;
+    if (const char * v = std::getenv("NERO_LC_ABORT_ROOM"); v && *v && std::string(v) != "0") {
+      r.on = true;
+      double m = 4.0, st = 2.0;
+      if (std::sscanf(v, "%lf,%lf", &m, &st) >= 1) {
+        r.margin = std::max(0.0, m);
+        r.stall_s = std::max(0.5, st);
+      }
+    }
+    return r;
+  }();
+  return a;
+}
+struct NeroAbortRoomState
+{
+  std::unordered_map<std::string, std::deque<std::array<double, 3>>> hist;  // uuid -> (t, x, y), last ~1.5 s
+  double stall_since{-1.0};
+  double last_log{-1.0};
+};
+std::unordered_map<const void *, NeroAbortRoomState> & nero_abort_room_states()
+{
+  static std::unordered_map<const void *, NeroAbortRoomState> m;
+  return m;
+}
+double nero_now_s()
+{
+  return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+}  // namespace
+
+std::optional<std::string> NormalLaneChange::nero_abort_room_refuse(const bool decide)
+{
+  const auto & cfg = nero_abort_room();
+  if (!cfg.on) return std::nullopt;
+  auto & st = nero_abort_room_states()[this];
+  const double now = nero_now_s();
+  const auto & curr = get_current_lanes();
+  if (curr.empty()) return std::nullopt;
+  const double ego_s = lanelet::utils::getArcCoordinates(curr, getEgoPose()).length;
+  const double v_ret = std::max(lane_change_parameters_->trajectory.min_lane_changing_velocity, getEgoVelocity());
+  const double ret = v_ret * (lane_change_parameters_->cancel.delta_time + lane_change_parameters_->cancel.duration);
+  std::optional<std::string> reason;
+  std::unordered_set<std::string> alive;
+  for (const auto & o : filtered_objects_.current_lane) {
+    const std::string uid = autoware_utils::to_hex_string(o.uuid);
+    alive.insert(uid);
+    auto & h = st.hist[uid];
+    const auto & p = o.initial_pose.position;
+    h.push_back({now, p.x, p.y});
+    while (!h.empty() && now - h.front()[0] > 1.5) h.pop_front();
+    if (reason) continue;
+    const double v = std::hypot(o.initial_twist.linear.x, o.initial_twist.linear.y);
+    if (v > 0.3 || h.size() < 2 || now - h.front()[0] < 1.0) continue;
+    if (std::hypot(p.x - h.front()[1], p.y - h.front()[2]) >= 0.3) continue;  // standing by its positions, not only its speed
+    const double rear = lanelet::utils::getArcCoordinates(curr, o.initial_pose).length - o.shape.dimensions.x / 2.0 - ego_s;
+    if (rear < 0.0 || rear >= ret + cfg.margin) continue;
+    if (decide && !isAbleToStopSafely()) return std::nullopt;  // the stop would end across the line: abort as the car does
+    char buf[200];
+    std::snprintf(
+      buf, sizeof(buf), "%s stands %.1f m ahead in the current lane (< return %.1f + %.1f m): held on the approved path (v %.2f)",
+      uid.substr(0, 6).c_str(), rear, ret, cfg.margin, getEgoVelocity());
+    reason = std::string(buf);
+  }
+  for (auto it = st.hist.begin(); it != st.hist.end();) it = alive.count(it->first) ? std::next(it) : st.hist.erase(it);
+  if (!decide) return std::nullopt;  // history only (called every cycle: the standing test needs >= 1 s of positions)
+  const auto hit = nero_hold_states().find(this);
+  if (hit == nero_hold_states().end() || !hit->second.holding) return std::nullopt;
+  if (reason && now - st.last_log > 1.0) {
+    st.last_log = now;
+    RCLCPP_INFO(logger_, "[NERO_LC_ABORT_ROOM] no abort: %s", reason->c_str());
+  }
+  return reason;
+}
+
+bool NormalLaneChange::nero_abort_stalled()
+{
+  const auto & cfg = nero_abort_room();
+  if (!cfg.on || !isAbortState() || hasFinishedAbort()) {
+    if (cfg.on) nero_abort_room_states()[this].stall_since = -1.0;
+    return false;
+  }
+  auto & st = nero_abort_room_states()[this];
+  const double now = nero_now_s();
+  if (std::abs(getEgoVelocity()) >= 0.1) {
+    st.stall_since = -1.0;
+    return false;
+  }
+  if (st.stall_since < 0.0) st.stall_since = now;
+  if (now - st.stall_since < cfg.stall_s) return false;
+  const auto & curr_lanes_poly = common_data_ptr_->lanes_polygon_ptr->current;
+  if (curr_lanes_poly.empty() || !utils::isEgoWithinOriginalLane(curr_lanes_poly, getEgoPose(), planner_data_->parameters, 0.0)) {
+    if (now - st.last_log > 1.0) {
+      st.last_log = now;
+      RCLCPP_INFO(logger_, "[NERO_LC_ABORT_ROOM] abort stalled %.1f s but the footprint is not inside the current lanes: no action",
+                  now - st.stall_since);
+    }
+    return false;
+  }
+  RCLCPP_INFO(logger_, "[NERO_LC_ABORT_ROOM] abort stalled %.1f s before its end: cancelled (footprint inside the current lanes)",
+              now - st.stall_since);
+  st.stall_since = -1.0;
+  return true;
+}
+
 bool NormalLaneChange::isRequiredStop(const bool is_trailing_object)
 {
   autoware_utils::ScopedTimeTrack st(__func__, *time_keeper_);

@@ -495,9 +495,17 @@ bool LaneChangeInterface::canTransitFailureState()
 
 std::pair<LaneChangeStates, std::string_view> LaneChangeInterface::check_transit_failure()
 {
+  // NERO_LC_ABORT_ROOM: the current-lane objects' positions every cycle (gate A's standing test needs >= 1 s of them)
+  if (auto * nlc = dynamic_cast<NormalLaneChange *>(module_type_.get()); nlc != nullptr) {
+    nlc->nero_abort_room_refuse(false);
+  }
   if (module_type_->isAbortState()) {
     if (module_type_->hasFinishedAbort()) {
       return {LaneChangeStates::Cancel, "Aborted"};
+    }
+    // NERO_LC_ABORT_ROOM (gate B): an abort that cannot finish (stalled, footprint inside the current lanes) is cancelled
+    if (auto * nlc = dynamic_cast<NormalLaneChange *>(module_type_.get()); nlc != nullptr && nlc->nero_abort_stalled()) {
+      return {LaneChangeStates::Cancel, "NeroAbortStalled"};
     }
     return {LaneChangeStates::Abort, "Aborting"};
   }
@@ -572,6 +580,13 @@ std::pair<LaneChangeStates, std::string_view> LaneChangeInterface::check_transit
   // abort maneuver to cases where the ego vehicle is still in the current lane.
   if (!can_return_to_current) {
     return {LaneChangeStates::Warning, "TooLateToAbort"};
+  }
+
+  // NERO_LC_ABORT_ROOM (gate A): no abort into a current lane blocked within the abort's return length while the hold can stop
+  // the robot on its approved path inside the current lanes (the hold stops it there; see NormalLaneChange::nero_abort_room_refuse)
+  if (auto * nlc = dynamic_cast<NormalLaneChange *>(module_type_.get());
+      nlc != nullptr && nlc->nero_abort_room_refuse()) {
+    return {LaneChangeStates::Warning, "NeroAbortRoom"};
   }
 
   const auto found_abort_path = module_type_->calcAbortPath();

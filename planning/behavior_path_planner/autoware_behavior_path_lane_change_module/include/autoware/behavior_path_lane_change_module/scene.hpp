@@ -102,6 +102,12 @@ public:
   // NERO_LC_MULTI_STOP_OFFSET (routelc job): the waiting stop's offset before the terminal start. Non-virtual.
   double nero_stop_offset() const;
   bool nero_two_or_more_due() const;  // the distance buffer holds two or more changes (non-virtual)
+  // NERO_LC_ABORT_ROOM=<margin m>,<stall s> (mainlane-6): A) a reason string when an abort should be refused (the NERO hold is
+  // latched, something stands in the current lane within the abort's return length + margin, the hold can stop the robot on its
+  // approved path with the footprint still in the current lanes); B) true when an abort has stalled (robot standing >= stall s,
+  // abort not finished, footprint inside the current lanes) -> cancel. Both empty / false when the switch is unset (non-virtual).
+  std::optional<std::string> nero_abort_room_refuse(bool decide = true);  // decide false: record positions only (every cycle)
+  bool nero_abort_stalled();
   // streamjoin job: the car's rolling wait acts for this direction; this change starts from the robot standing at its
   // waiting stop with two or more changes due (NERO_LC_MULTI_STAND_*). Non-virtual.
   bool nero_rolling_wait_dir() const;
