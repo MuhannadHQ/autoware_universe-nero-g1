@@ -36,6 +36,7 @@
 
 #include <autoware/interpolation/linear_interpolation.hpp>
 #include <autoware/motion_utils/trajectory/path_shift.hpp>
+#include <autoware/motion_utils/trajectory/interpolation.hpp>  // NERO_LC_APPROVED_PRED_FIX: calcInterpolatedPose
 #include <autoware/motion_utils/trajectory/trajectory.hpp>
 #include <autoware_frenet_planner/frenet_planner.hpp>
 #include <autoware_frenet_planner/structures.hpp>
@@ -99,6 +100,48 @@ bool nero_lc_debug_every(const std::string & key, const int period_ms)
   return true;
 }
 
+namespace
+{
+// NERO_LC_GAP_AHEAD_PACE=<v_min m/s>,<t_max s>,<ease m/s2> (mainlane-9 2026-11-12, LCSTAND; Ahmed 11-11 ~20:2x "plan it before the car is beside so
+// you are ready to execute when the car is beside you"). An approved change behind a passer X (a car the candidate check left out of the RSS
+// because it passes ahead of the gap) is re-checked every cycle with the robot's earliest leave; a robot that launches faster than that model
+// (kstand2 r_h7 1112-042739: approved from the stand with X's rear 7.6 m ahead at the leave vs 4.0 needed, 1.7 s later 5.3 / short) put X
+// back into the strict RSS -> hold -> a 14 s stand while X1 and the rest went by. With the switch, while the footprint is still in its lane
+// and the planned passer X is steady (the GAP_AHEAD tests: four-wheeler, measured speed, not braking, off the line), the robot is PACED:
+// its speed up to the lane-leave point is capped so it reaches that point no earlier than X's rear has its margin (s_leave / T), eased at
+// <ease>; X stays out of the RSS only while that is feasible (cap >= v_min, T <= t_max, the robot can slow to the cap before the leave).
+// Every other car stays in the check (R79 for the car behind X at the robot's own predicted leave). Unset = the car.
+struct NeroPace
+{
+  double t{-1e9};        // clock time of the last paced verdict
+  double v_cap{-1.0};    // m/s (the uniform cap that reaches the leave at T)
+  double s_leave{0.0};   // arc length from ego to the lane-leave point on the approved path
+  double s_lc{0.0};      // v2: arc length from ego to the lane-changing start (0 = already sideways)
+  double v1{-1.0}, v2{-1.0};  // v2: slow on the straight part (v1), cross the sideways part at v2
+  std::string who;
+};
+std::unordered_map<const void *, NeroPace> & nero_pace_map()
+{
+  static std::unordered_map<const void *, NeroPace> m;
+  return m;
+}
+std::unordered_map<const void *, std::unordered_map<std::string, double>> & nero_planned_passers()
+{
+  static std::unordered_map<const void *, std::unordered_map<std::string, double>> m;  // instance -> passer id -> last time planned
+  return m;
+}
+const std::array<double, 4> & nero_pace_params()
+{
+  static const std::array<double, 4> p = [] {
+    std::array<double, 4> q{-1.0, 8.0, 0.8, -1.0};  // 4th field (v2) <v_lat m/s>: the sideways part at >= this (-1 = one uniform cap)
+    if (const char * e = std::getenv("NERO_LC_GAP_AHEAD_PACE")) std::sscanf(e, "%lf,%lf,%lf,%lf", &q[0], &q[1], &q[2], &q[3]);
+    if (std::getenv("NERO_LC_GAP_AHEAD") == nullptr) q[0] = -1.0;
+    return q;
+  }();
+  return p;
+}
+}  // namespace
+
 // NERO_LC_DEBUG (log only, lca job 2026-10-28): what became of every candidate of one search (path shifter or frenet),
 // printed once per 0.5 s per module and direction: the 10-27 #6 phase-A question (why no change into a gap) had no
 // record on the car. Counts: prepare samples used / failed, lane-changing samples, candidates rejected while built,
@@ -133,6 +176,95 @@ std::string nero_first_unsafe(
   }
   return "?";
 }
+
+// NERO_LC_APPROVED_PRED_FIX=1 (mainlane-8 2026-11-12): the re-check of an APPROVED FRENET path predicts the robot with the candidate's
+// frozen clock (utils::lane_change::convert_to_predicted_path for a TrajectoryGroup, upstream main the same: the prepare samples again from
+// the robot for the whole prepare time, clamped at the prepare end, then the ORIGINAL lane-changing poses with their planned times; the
+// launch cap NERO_LC_PRED_LAUNCH_ACC then re-places the poses from that first pose). Once the robot is in its lateral phase the prediction
+// starts behind it and runs late: every check of the approved path (the RSS, R79's and NERO_LC_GAP_AHEAD's leave) saw the robot 1-3 m /
+// ~1.3 s behind where it is; an approved change turned 'unsafe' for the car behind with nothing changed and the NERO hold stopped the
+// robot with its corner 0.88 m over the line (sim kstand2 1112-023718: leave estimated 3.6 / 2.5 / 2.3 / 2.0 s at 37.5 / 38.5 / 39.5 /
+// 40.4 s, the corner crossed at 41.1). With the switch, for that re-check only: the prediction is generated along the approved path from
+// the robot (t 0, its speed) at the plan's speeds capped by v0 + a t (NERO_LC_PRED_LAUNCH_ACC, default 0.33) to 2 s past the lane-
+// changing end; is_colliding's stopped-object window uses the prepare time left; GAP_AHEAD keeps the cars in the check when the leave is
+// not found; R79 keeps its +dv x 1 s of closing for a release below 0.5 m/s (the stop goes ~0.8 s before the robot moves). Candidates
+// and shift paths unchanged; unset = the car.
+bool nero_approved_pred_fix()
+{
+  static const bool on = [] {
+    const char * e = std::getenv("NERO_LC_APPROVED_PRED_FIX");
+    return e != nullptr && std::atoi(e) > 0;
+  }();
+  return on;
+}
+double nero_pred_launch_acc()
+{
+  static const double a = [] {
+    const char * e = std::getenv("NERO_LC_PRED_LAUNCH_ACC");
+    return e != nullptr ? std::max(0.05, std::atof(e)) : 0.33;
+  }();
+  return a;
+}
+// thread-local: the prepare time still ahead in the rebuilt prediction while isApprovedPathSafe checks it (is_colliding's
+// stopped-object window: the ORIGINAL prepare duration counted from now is wrong once the robot is sideways); < 0 = none
+thread_local double nero_prep_override = -1.0;
+// v2 (Fable review research/preroll/REVIEW.md 1b / 1c): the prediction is generated ALONG THE APPROVED PATH from the robot's arc, timed in
+// closed form (v = min(plan speed, v0 + a t), integrated at 0.05 s), emitted every `resolution` s, until 2 s past the lane-changing end
+// (and at least as long as the stock prediction): v1 re-timed the already-capped frozen poses and at a near-stand ended before the
+// lane-leave pose -> no leave -> 'no conflict' -> SAFE with a car 31 m behind at 8 m/s (1112-031110: five hold releases).
+// Returns the prepare time left (0 once past the lane-changing start), -1 if nothing was rebuilt.
+double nero_rebuild_approved_prediction(
+  std::vector<autoware::behavior_path_planner::utils::path_safety_checker::PoseWithVelocityStamped> & pp,
+  const autoware::behavior_path_planner::LaneChangePath & lcp, const geometry_msgs::msg::Pose & ego, const double v0_in,
+  const double resolution)
+{
+  const auto & pts = lcp.path.points;
+  if (pts.size() < 2 || resolution <= 0.0) return -1.0;
+  // copy-free projections (nero_mu, NERO_BPP_PROJ_FAST) and a cumulative-arc table for the plan speed: no path copy per sample
+  std::vector<double> cum(pts.size(), 0.0);
+  for (size_t i = 1; i < pts.size(); ++i) cum[i] = cum[i - 1] + autoware_utils::calc_distance2d(pts[i - 1], pts[i]);
+  const double s_ego = nero_mu::calcSignedArcLength(pts, size_t{0}, ego.position);
+  const double s_end = cum.back();
+  const double s_lcs = nero_mu::calcSignedArcLength(pts, size_t{0}, lcp.info.lane_changing_start.position);
+  const double s_lce = nero_mu::calcSignedArcLength(pts, size_t{0}, lcp.info.lane_changing_end.position);
+  const double t_min = pp.empty() ? 0.0 : static_cast<double>(pp.back().time);
+  const double a = nero_pred_launch_acc();
+  const auto v_plan = [&](const double s_q) {  // the speed of the segment's end point (as the stock path's segment speed)
+    const size_t k = static_cast<size_t>(std::distance(cum.begin(), std::upper_bound(cum.begin(), cum.end(), s_q)));
+    return std::max(0.0, static_cast<double>(pts.at(std::min(k, pts.size() - 1)).point.longitudinal_velocity_mps));
+  };
+  if (pp.empty()) return -1.0;
+  auto proto = pp.front();
+  std::vector<autoware::behavior_path_planner::utils::path_safety_checker::PoseWithVelocityStamped> out;
+  proto.time = 0.0;
+  proto.pose = ego;
+  proto.velocity = static_cast<float>(std::max(0.0, v0_in));
+  out.push_back(proto);
+  double s = std::max(0.0, s_ego), v = std::max(0.0, v0_in), t = 0.0, next = resolution, t_prep = s >= s_lcs ? 0.0 : -1.0, t_lce = -1.0;
+  constexpr double dt = 0.05;
+  double vp = v_plan(s), s_vp = s;
+  while (s < s_end - 0.01 && t < 20.0) {
+    if (s - s_vp > 0.5) { vp = v_plan(s); s_vp = s; }
+    v = std::min(vp > 0.05 ? vp : 0.0, v + a * dt);
+    if (v <= 1e-3 && vp <= 0.05) break;  // the plan stops here: so does the prediction
+    s += v * dt;
+    t += dt;
+    if (t_prep < 0.0 && s >= s_lcs) t_prep = t;
+    if (t_lce < 0.0 && s >= s_lce) t_lce = t;
+    if (t + 1e-6 >= next) {
+      auto q = proto;
+      q.time = t;
+      q.pose = autoware::motion_utils::calcInterpolatedPose(pts, s);
+      q.velocity = static_cast<float>(v);
+      out.push_back(q);
+      next += resolution;
+    }
+    if (t_lce >= 0.0 && t >= t_lce + 2.0 && t >= t_min) break;
+  }
+  pp = std::move(out);
+  return std::max(0.0, t_prep < 0.0 ? t : t_prep);
+}
+
 
 // streamjoin (2026-10-27): per module instance, "this change starts from the robot standing at its waiting stop with two
 // or more changes due" (set while waiting, kept from the approval on until the instance ends). Kept outside the class so
@@ -809,8 +941,32 @@ void NormalLaneChange::updateLaneChangeStatus()
       }
     }
   }
+  // NERO_LC_GAP_AHEAD_PREP 3rd field <commit s> (mainlane-7, Fable research/gapahead/DESIGN.md sec. 2.4): decide early, commit late. The
+  // safe cycles are counted on the candidates while the passing car comes (shortest prepare first), but the change is approved only
+  // once the shortest safe candidate's prepare is <= <commit s>: until then nothing is irreversible, the robot stays in the waiting
+  // state and every cycle re-times the change from the cars' actual motion; it commits as the passing car comes beside.
+  // 4th field = 1 (mainlane-8): wait to commit only while a gap behind a passer is being planned (nero_gap_picked) and the robot moves
+  // (> 0.5 m/s): standing, the prepare never shrinks, and with no passer there is nothing to time: kstand2 1112-033252 stood 30 s at a clear
+  // target lane 'safe in 2.0 s of prepare (> commit 1.5 s): waiting to commit (safe cycles 108)'. Default 0 = the package.
+  bool nero_commit_wait = false;
+  {
+    static const std::array<double, 2> commit = [] {
+      double a = -1.0, b = 0.5, c3 = -1.0, d4 = 0.0;
+      if (const char * e = std::getenv("NERO_LC_GAP_AHEAD_PREP")) std::sscanf(e, "%lf,%lf,%lf,%lf", &a, &b, &c3, &d4);
+      return std::array<double, 2>{a >= 0.0 ? c3 : -1.0, d4};
+    }();
+    const bool commit_applies = commit[1] < 0.5 || (nero_gap_picked() && getEgoVelocity() > 0.5);
+    if (commit[0] > 0.0 && commit_applies && found_safe_path && status_.lane_change_path.info.duration.prepare > commit[0] + 1e-3) {
+      nero_commit_wait = true;
+      if (nero_lc_debug_every("commit_wait", 500)) {
+        RCLCPP_INFO(
+          logger_, "[NERO_LC_GAP_AHEAD] safe in %.1f s of prepare (> commit %.1f s): waiting to commit (safe cycles %d)",
+          status_.lane_change_path.info.duration.prepare, commit[0], c.n + 1);
+      }
+    }
+  }
   c.n = (found_safe_path && !nero_hold_for_passing) ? c.n + 1 : 0;
-  status_.is_safe = found_safe_path && !nero_hold_for_passing && c.n >= min_safe_cycles;
+  status_.is_safe = found_safe_path && !nero_hold_for_passing && !nero_commit_wait && c.n >= min_safe_cycles;
   status_.lane_change_path.path.header = getRouteHeader();
 }
 
@@ -1204,6 +1360,23 @@ BehaviorModuleOutput NormalLaneChange::generateOutput()
       set_stop_pose(stop_dist + current_dist, output.path, "incoming rear object");
     } else {
       insert_stop_point(get_target_lanes(), output.path);
+      // NERO_LC_GAP_AHEAD_PACE (mainlane-9): reach the lane-leave point no earlier than the planned passer's rear has its margin
+      double s_leave = 0.0, s_lc = 0.0, v_lat = -1.0;
+      const double v_cap = nero_pace_cap(s_leave, s_lc, v_lat);
+      if (v_cap > 0.0 && output.path.points.size() >= 2) {
+        const double ease = std::max(0.1, nero_pace_params()[2]);
+        const double v0 = std::max(0.0, getEgoVelocity());
+        const size_t ego_idx = autoware::motion_utils::findNearestIndex(output.path.points, getEgoPosition());
+        double s_acc = 0.0;
+        for (size_t i = ego_idx; i < output.path.points.size(); ++i) {
+          if (i > ego_idx) s_acc += autoware_utils::calc_distance2d(output.path.points.at(i - 1), output.path.points.at(i));
+          if (s_acc > s_leave + 1.0) break;
+          const double seg = (v_lat > 0.0 && s_acc >= s_lc) ? v_lat : v_cap;  // v2: the sideways part at v_lat
+          const double lim = std::max(seg, std::sqrt(std::max(0.0, v0 * v0 - 2.0 * ease * s_acc)));
+          auto & pv = output.path.points.at(i).point.longitudinal_velocity_mps;
+          pv = std::min(pv, static_cast<float>(lim));
+        }
+      }
     }
   }
 
@@ -2013,6 +2186,22 @@ std::vector<LaneChangePhaseMetrics> NormalLaneChange::get_prepare_metrics() cons
   const auto dist_to_target_start =
     calculation::calc_ego_dist_to_lanes_start(common_data_ptr_, current_lanes, target_lanes);
   const double max_prepare_length = common_data_ptr_->transient_data.dist_to_terminal_start;
+  // NERO_LC_GAP_AHEAD_PREP v8: a target-lane vehicle behind (within 40 m) faster than ego by >= 1 m/s -> the long prepares are sampled too
+  {
+    static const bool gp_on = std::getenv("NERO_LC_GAP_AHEAD_PREP") != nullptr;
+    bool coming = false;
+    if (gp_on) {
+      const double v_e = std::max(0.0, current_velocity);
+      for (const auto & o : filtered_objects_.target_lane_trailing) {
+        const double v_o = std::hypot(o.initial_twist.linear.x, o.initial_twist.linear.y);
+        if (v_o >= v_e + 1.0 && o.dist_from_ego > -40.0) {
+          coming = true;
+          break;
+        }
+      }
+    }
+    calculation::nero_prep_long() = coming;
+  }
   auto nero_metrics = calculation::calc_prepare_phase_metrics(
     common_data_ptr_, current_velocity, max_path_velocity, dist_to_target_start,
     max_prepare_length);
@@ -2053,6 +2242,12 @@ std::vector<LaneChangePhaseMetrics> NormalLaneChange::get_prepare_metrics() cons
         return a.duration < b.duration;
       });
     }
+  }
+  // NERO_LC_GAP_AHEAD_PREP (calculation::calc_prepare_durations): the shortest prepare first, so the first safe candidate starts soonest
+  if (std::getenv("NERO_LC_GAP_AHEAD_PREP") != nullptr) {
+    std::stable_sort(nero_metrics.begin(), nero_metrics.end(), [](const auto & a, const auto & b) {
+      return a.duration < b.duration;
+    });
   }
   if (nero_lc_debug_tick("prep")) {
     RCLCPP_INFO(
@@ -2968,21 +3163,41 @@ PathSafetyStatus NormalLaneChange::isApprovedPathSafe() const
 
   const auto decel_sampling_num =
     static_cast<size_t>(lane_change_parameters_->cancel.deceleration_sampling_num);
-  // NERO_LC_FIX_11360=1 (port of upstream #11360): the approved path's prediction at ego's measured acceleration, clipped
-  // at the lane changing end, for the RSS checks; the NERO_LC_R79_* block keeps judging on the sampled predictions
-  // (r79_paths: computed only when the switch is set). Unset = the car (the sampled predictions for both).
-  const auto ego_predicted_paths = utils::lane_change::convert_to_predicted_paths(
-    common_data_ptr_, path, decel_sampling_num, true);
+  // gapahead_1112u (mainlane-10, QUEUE GAPU): mainlane_1111u's NERO_LC_FIX_11360 + gapahead_1112b's NERO_LC_APPROVED_PRED_FIX.
+  // An approved FRENET path rebuilt by PRED_FIX (from the robot, the plan's speeds capped by v0 + a t) feeds BOTH the RSS and the
+  // NERO_LC_R79_* block: its sampled prediction is the frozen clock PRED_FIX removes, and the rebuild starts from the same sampled
+  // prediction as in gapahead_1112c. Every other approved path: #11360 exactly as in mainlane_1111u (clipped for the RSS, sampled for
+  // R79). PRED_FIX unset = mainlane_1111u; 11360 unset = gapahead_1112c; both unset = the car.
+  const bool nero_pf_rebuild = nero_approved_pred_fix() && path.type == lane_change::PathType::FrenetPlanner;
+  auto ego_predicted_paths = utils::lane_change::convert_to_predicted_paths(
+    common_data_ptr_, path, decel_sampling_num, !nero_pf_rebuild);
   std::vector<std::vector<PoseWithVelocityStamped>> r79_paths;
-  if (utils::lane_change::nero_lc_fix_11360()) {
+  if (utils::lane_change::nero_lc_fix_11360() && !nero_pf_rebuild) {
     r79_paths =
       utils::lane_change::convert_to_predicted_paths(common_data_ptr_, path, decel_sampling_num);
   }
+  double nero_prep_left = -1.0;
+  if (nero_pf_rebuild) {  // NERO_LC_APPROVED_PRED_FIX
+    const double res = lane_change_parameters_->safety.collision_check.prediction_time_resolution;
+    // a frenet path's 'decel samples' are identical copies (convert_to_predicted_paths ignores the acceleration for frenet): build once
+    if (!ego_predicted_paths.empty()) {
+      nero_prep_left = nero_rebuild_approved_prediction(ego_predicted_paths.front(), path, getEgoPose(), getEgoVelocity(), res);
+      for (size_t k = 1; k < ego_predicted_paths.size(); ++k) ego_predicted_paths[k] = ego_predicted_paths.front();
+    }
+  }
+  nero_prep_override = nero_prep_left;
   const auto safety_status = isLaneChangePathSafe(
     path, ego_predicted_paths, target_objects,
     nero_in_hold_mode() ? lane_change_parameters_->safety.rss_params  // strict while slow and in lane (NERO hold)
                         : lane_change_parameters_->safety.rss_params_for_abort,
-    debug_data, true, utils::lane_change::nero_lc_fix_11360() ? &r79_paths : nullptr);
+    debug_data, true, (utils::lane_change::nero_lc_fix_11360() && !nero_pf_rebuild) ? &r79_paths : nullptr);
+  nero_prep_override = -1.0;
+  // NERO_LC_DEBUG (mainlane-8, log only): a SAFE verdict for an approved path near a stand (Fable review 1b: invisible before)
+  if (nero_prep_left >= 0.0 && safety_status.is_safe && getEgoVelocity() < 0.5 && nero_lc_debug_every("approved_safe_slow", 1000)) {
+    const auto & pk = ego_predicted_paths.front();
+    RCLCPP_INFO(logger_, "[NERO_LC_PRED_FIX] approved frenet path SAFE at v %.2f: %zu poses, end %.1f s, prepare left %.1f s",
+      getEgoVelocity(), pk.size(), pk.empty() ? 0.0 : static_cast<double>(pk.back().time), nero_prep_left);
+  }
   {
     // only for debug purpose
     lane_change_debug_.collision_check_objects.clear();
@@ -2996,6 +3211,13 @@ PathSafetyStatus NormalLaneChange::isApprovedPathSafe() const
 
     if (!safety_status.is_safe) {
       lane_change_debug_.collision_check_objects_after_approval = debug_data;
+      // NERO_LC_DEBUG (mainlane-7, gap-ahead): what makes an APPROVED change unsafe (log only)
+      if (std::getenv("NERO_LC_GAP_AHEAD") != nullptr && nero_lc_debug_every("approved_unsafe", 300)) {
+        RCLCPP_INFO(
+          logger_, "[NERO_LC_GAP_AHEAD] approved path unsafe (%s, %zu ego paths, v %.2f): %s",
+          nero_in_hold_mode() ? "strict" : "abort rss", ego_predicted_paths.size(), getEgoVelocity(),
+          nero_first_unsafe(debug_data).c_str());
+      }
     }
   }
 
@@ -3373,6 +3595,33 @@ bool NormalLaneChange::calcAbortPath()
   return true;
 }
 
+namespace
+{
+// NERO_LC_GAP_AHEAD: per module instance, the last time a candidate check dropped a passer coming from behind (a gap is being planned)
+std::unordered_map<const void *, double> & nero_ga_pick_times()
+{
+  static std::unordered_map<const void *, double> m;
+  return m;
+}
+}  // namespace
+
+bool NormalLaneChange::nero_gap_picked() const
+{
+  const auto it = nero_ga_pick_times().find(this);
+  return it != nero_ga_pick_times().end() && clock_.now().seconds() - it->second < 0.5;
+}
+
+double NormalLaneChange::nero_pace_cap(double & s_leave, double & s_lc, double & v_lat) const
+{
+  if (nero_pace_params()[0] < 0.0) return -1.0;
+  const auto it = nero_pace_map().find(this);
+  if (it == nero_pace_map().end() || clock_.now().seconds() - it->second.t > 0.35) return -1.0;
+  s_leave = it->second.s_leave;
+  s_lc = it->second.s_lc;
+  v_lat = it->second.v2;
+  return it->second.v1 > 0.0 ? it->second.v1 : it->second.v_cap;
+}
+
 PathSafetyStatus NormalLaneChange::isLaneChangePathSafe(
   const LaneChangePath & lane_change_path,
   const std::vector<std::vector<PoseWithVelocityStamped>> & ego_predicted_paths,
@@ -3458,6 +3707,13 @@ PathSafetyStatus NormalLaneChange::isLaneChangePathSafe(
   const auto & r79_ego_paths =
     r79_ego_predicted_paths != nullptr ? *r79_ego_predicted_paths : ego_predicted_paths;
   auto trailing_to_check = collision_check_objects.trailing;
+  // NERO_LC_GAP_AHEAD (v5): the R79 and gap-ahead filters judged per ego predicted path (filled in the R79 block when it runs)
+  static const bool nero_ga_pp_on = [] {
+    const char * e = std::getenv("NERO_LC_GAP_AHEAD");
+    return e != nullptr && std::atof(e) > 0.0;
+  }();
+  std::vector<ExtendedPredictedObject> ga_trailing_all;
+  std::vector<std::vector<char>> r79_pp;
   if (
     (nero_r79[0] > 0.0 || nero_yield[0] > 0.0) && !trailing_to_check.empty() &&
     !r79_ego_paths.empty()) {
@@ -3602,7 +3858,10 @@ PathSafetyStatus NormalLaneChange::isLaneChangePathSafe(
       }
       return nullptr;
     };
-    const auto r79_safe = [&](const ExtendedPredictedObject & o) {
+    const auto r79_safe = [&](const ExtendedPredictedObject & o, const int only = -1) {
+      // gapahead_1112u (Fable review C1): a per-path verdict for a path R79 has no prediction of is "not cleared" (fail closed); today
+      // r79_ego_paths and ego_predicted_paths always hold the same number of samples, so this never acts
+      if (only >= 0 && static_cast<size_t>(only) >= r79_ego_paths.size()) return false;
       double v_r = std::hypot(o.initial_twist.linear.x, o.initial_twist.linear.y);
       if (v_r <= stopped_th || !utils::path_safety_checker::filter::is_vehicle(o.classification)) return false;
       const double obj_front = obj_front_of(o);
@@ -3647,11 +3906,18 @@ PathSafetyStatus NormalLaneChange::isLaneChangePathSafe(
         }
       }
       if (!leaves.empty()) {  // A: at the moment the robot's footprint leaves its lane
-        for (const auto & lv : leaves) {
+        for (size_t k = 0; k < leaves.size(); ++k) {
+          if (only >= 0 && static_cast<int>(k) != only) continue;  // NERO_LC_GAP_AHEAD: judged per ego predicted path
+          const auto & lv = leaves[k];
           if (!lv.found) return false;
           const double gap = (lv.s - vi.rear_overhang_m) - (obj_front + v_r * lv.t);
           const double dv = std::max(v_r - lv.v, 0.0);
-          const double s_crit = dv * t_react + dv * dv / (2.0 * nero_r79[0]) + lv.v * nero_r79[2];
+          // NERO_LC_GAP_AHEAD (v10): while CHOOSING a change, 1 s of closing more (the robot launches later than its prediction:
+          // lc05cz pass approved from a stand on a knife edge, the car behind closed in, hold + ABORT 5 s); kept with the bare value
+          const bool nero_release = nero_approved_pred_fix() && &lane_change_path == &status_.lane_change_path &&
+                                    getEgoVelocity() < 0.5;  // NERO_LC_APPROVED_PRED_FIX: the launch comes ~0.8 s after the release
+          const double s_crit = dv * t_react + dv * dv / (2.0 * nero_r79[0]) + lv.v * nero_r79[2] +
+                                ((nero_ga_pp_on && (&lane_change_path != &status_.lane_change_path || nero_release)) ? dv * 1.0 : 0.0);
           if (gap < s_crit) return false;
         }
         return true;
@@ -3659,7 +3925,9 @@ PathSafetyStatus NormalLaneChange::isLaneChangePathSafe(
       // S_critical at the moment the robot starts to move into the target lane (UN R79: "shall not start a lane change if ...");
       // it already contains the rear car's closing and braking, so it is not re-applied to every later step at constant speed
       // (that refused a yielding car 10 m back at +0.8 m/s: sim r45)
-      for (const auto & path : r79_ego_paths) {
+      for (size_t k = 0; k < r79_ego_paths.size(); ++k) {
+        if (only >= 0 && static_cast<int>(k) != only) continue;  // NERO_LC_GAP_AHEAD: judged per ego predicted path
+        const auto & path = r79_ego_paths[k];  // gapahead_1112u: 1111u's r79_ego_paths (= ego_predicted_paths unless #11360 splits them)
         double s_e = 0.0;
         bool checked = false;
         for (size_t i = 0; i < path.size(); ++i) {
@@ -3677,6 +3945,15 @@ PathSafetyStatus NormalLaneChange::isLaneChangePathSafe(
       }
       return true;
     };
+    if (nero_ga_pp_on) {  // NERO_LC_GAP_AHEAD: R79 per ego predicted path (the RSS's own semantics: unsafe only if every path collides)
+      ga_trailing_all = trailing_to_check;
+      r79_pp.assign(ego_predicted_paths.size(), std::vector<char>(trailing_to_check.size(), 0));
+      for (size_t k = 0; k < ego_predicted_paths.size(); ++k) {
+        for (size_t j = 0; j < trailing_to_check.size(); ++j) {
+          r79_pp[k][j] = r79_safe(trailing_to_check[j], static_cast<int>(k)) ? 1 : 0;
+        }
+      }
+    }
     std::vector<ExtendedPredictedObject> kept;
     kept.reserve(trailing_to_check.size());
     for (const auto & o : trailing_to_check) {
@@ -3691,6 +3968,381 @@ PathSafetyStatus NormalLaneChange::isLaneChangePathSafe(
     trailing_to_check = std::move(kept);
   }
 
+  // NERO_LC_GAP_AHEAD=<dv_min m/s>,<min_gap m>,<t_gap s>,<max_brake m/s2>,<side m>,<horizon s> (mainlane-7 2026-11-11, Ahmed ~20:2x:
+  // "the lane changes are too stiff you should plan it before the car is beside so you are ready to execute when the car is beside you"):
+  // a four-wheeled target-lane vehicle that will have passed the robot before the robot's footprint first leaves its lane is the car the
+  // gap opens BEHIND and is left out of this path's RSS check (trailing while it comes, leading once it has passed), so the change is
+  // chosen while it is still coming and the robot goes as it passes. Sim K1103 y (package, drivers v3): the change was accepted 1.5 s
+  // AFTER the passer's tail passed (the RSS keeps a car ahead 3 m + 1 s x its speed = 10.9 m in front of the nose), the robot had stopped,
+  // prepared ~3 s, then ~3 s sideways: 8.9 s from the gap opening to the line. "Passes" (Fable review research/gapahead/DESIGN.md):
+  // - the leave = the first pose of each ego predicted path whose footprint is not within the current lanes, taken SPATIALLY (arc from
+  //   ego) and timed from the robot's speed NOW at 1.0 m/s2 (the earliest it can be there: an approved frenet path's own clock froze);
+  //   a path that never leaves the lane within its horizon (>= 2 s) does not conflict with a passer;
+  // - the passer projected at its MEASURED speed and deceleration (~1 s of its history; braking harder than <max_brake> = not passing):
+  //   its rear >= <min_gap> + v_robot x <t_gap> (+ 0.5 m per second of the leave time while choosing; the bare margin once approved)
+  //   ahead of the robot's nose at the leave, and faster than the robot by >= <dv_min> then; the leave <= <horizon s> away while choosing;
+  // - its footprint >= <side m> from the robot's lanes (no car riding the line, no two-wheeler: they stay in the check).
+  // Every other object (the next car behind: R79 / RSS) as before; re-judged every cycle, the approved path's check included. Unset = the car.
+  // v4 fields 7 / 8: <accept m per s of leave time> (default 0.25) and <a_leave m/s2> (the robot's acceleration that times the leave from
+  // its speed now, the earliest it can be there; default 0.5 = the chassis' launch); K1103 y v3 (0.5 m/s, 1.0 m/s2): B taken 1 s later,
+  // the robot slowed for its waiting stop meanwhile and the next car's S_crit grew past the gap (across 5.1 s after C instead of 2.0 s after B).
+  // field 9 (mainlane-8, Fable research/preroll/REVIEW.md 2.6): 1 = the 'side' test only while the passer's rear is not yet past the robot's
+  // nose (the stream runs 0.60-0.70 m from the current-lanes polygon and dips to 0.41-0.43 m at one spot near the end of 91174: for one
+  // cycle a car already 8-15 m AHEAD went back into the strict RSS as a lead car (3 m + 1 s x 8 m/s) -> an approved change cancelled
+  // (kstand2 1112-022706 39.4 s) / a one-cycle unsafe (1112-030232 40.65 s)); default 0 = the package
+  static const std::array<double, 9> nero_ga = [] {
+    std::array<double, 9> p{-1.0, 3.0, 0.5, 0.5, 0.5, 4.0, 0.25, 0.5, 0.0};
+    if (const char * e = std::getenv("NERO_LC_GAP_AHEAD")) {
+      std::sscanf(e, "%lf,%lf,%lf,%lf,%lf,%lf,%lf,%lf,%lf", &p[0], &p[1], &p[2], &p[3], &p[4], &p[5], &p[6], &p[7], &p[8]);
+    }
+    p[7] = std::max(0.1, p[7]);
+    return p;
+  }();
+  auto leading_to_check = collision_check_objects.leading;
+  std::vector<std::vector<ExtendedPredictedObject>> ga_trailing_pp, ga_leading_pp;
+  bool ga_pp_ready = false;
+  std::vector<std::array<double, 3>> ga_leave_dbg;  // NERO_LC_DEBUG: per ego path (found, t, judgeable)
+  bool ga_approved_dbg = false;
+  if (nero_ga[0] > 0.0 && !ego_predicted_paths.empty() && (!trailing_to_check.empty() || !leading_to_check.empty())) {
+    const auto & vi = common_data_ptr_->bpp_param_ptr->vehicle_info;
+    const double stopped_th = lane_change_parameters_->safety.th_stopped_object_velocity;
+    const double now_s = clock_.now().seconds();
+    const bool approved_check = (&lane_change_path == &status_.lane_change_path);  // isApprovedPathSafe passes the approved path itself
+    static std::unordered_map<std::string, std::deque<std::array<double, 2>>> ga_hist;  // time, measured speed
+    if (ga_hist.size() > 200) {
+      for (auto it = ga_hist.begin(); it != ga_hist.end();) {
+        it = (it->second.empty() || now_s - it->second.back()[0] > 10.0) ? ga_hist.erase(it) : std::next(it);
+      }
+    }
+    struct GaLeave
+    {
+      bool found{false};
+      bool judgeable{true};
+      double t{0.0}, s{0.0}, v{0.0};
+    };
+    std::vector<GaLeave> ga_leaves;
+    const auto & lane_poly = common_data_ptr_->lanes_polygon_ptr->current;
+    {
+      const auto & ego_pose = getEgoPose();
+      const double v0 = std::max(0.0, getEgoVelocity());
+      const double a_fast = nero_ga[7];
+      const double c = std::cos(tf2::getYaw(ego_pose.orientation)), sn = std::sin(tf2::getYaw(ego_pose.orientation));
+      for (const auto & path : ego_predicted_paths) {
+        GaLeave lv;
+        double s_e = 0.0, lon_max = -1e9;
+        const geometry_msgs::msg::Pose * prev = nullptr;
+        for (const auto & q : path) {
+          const double lon = (q.pose.position.x - ego_pose.position.x) * c + (q.pose.position.y - ego_pose.position.y) * sn;
+          if (lon < lon_max - 0.05) continue;  // a pose behind the furthest one taken (frenet restart)
+          lon_max = std::max(lon_max, lon);
+          if (prev != nullptr) s_e += autoware_utils::calc_distance2d(*prev, q.pose);
+          prev = &q.pose;
+          if (lane_poly.empty() || !utils::isEgoWithinOriginalLane(lane_poly, q.pose, planner_data_->parameters, 0.0)) {
+            lv.found = true;
+            lv.s = s_e;
+            lv.t = (-v0 + std::sqrt(v0 * v0 + 2.0 * a_fast * s_e)) / a_fast;  // the earliest it can be there
+            lv.v = std::max(static_cast<double>(q.velocity), std::min(v0 + a_fast * lv.t, 6.0));
+            break;
+          }
+        }
+        if (!lv.found) lv.judgeable = !path.empty() && path.back().time >= 2.0;  // stays in its lane over >= 2 s: no conflict
+        if (!lv.found && approved_check && nero_approved_pred_fix()) lv.judgeable = false;  // NERO_LC_APPROVED_PRED_FIX: keep them checked
+        ga_leaves.push_back(lv);
+      }
+    }
+    const auto four_wheeler = [](const ExtendedPredictedObject & o) {
+      using L = autoware_perception_msgs::msg::ObjectClassification;
+      const auto lb = o.classification.label;
+      return lb == L::CAR || lb == L::TRUCK || lb == L::BUS || lb == L::TRAILER;
+    };
+    // the passer's path-independent tests (history, class, braking, side), then its gap at each path's leave
+    struct GaObj
+    {
+      bool ok{false};
+      double v_o{0.0}, a_eff{0.0}, rear_now{0.0};
+      std::string why;  // NERO_LC_DEBUG: the first test it failed
+    };
+    // per object and input the result is the same for every candidate of a cycle: cached (planner cost)
+    struct GaCache
+    {
+      double x{0.0}, y{0.0}, v{0.0}, t{-1.0};
+      GaObj g;
+    };
+    static std::unordered_map<std::string, GaCache> ga_cache;
+    if (ga_cache.size() > 200) ga_cache.clear();
+    const auto ga_prep = [&](const ExtendedPredictedObject & o) {
+      GaObj g;
+      const double v_o = std::hypot(o.initial_twist.linear.x, o.initial_twist.linear.y);
+      const std::string uid = autoware_utils::to_hex_string(o.uuid);
+      auto & cc = ga_cache[uid];
+      if (
+        cc.t >= 0.0 && now_s - cc.t < 0.05 && cc.x == o.initial_pose.position.x && cc.y == o.initial_pose.position.y &&
+        cc.v == v_o) {
+        g = cc.g;
+        g.rear_now = o.dist_from_ego - 0.5 * o.shape.dimensions.x;
+        return g;
+      }
+      const auto remember = [&](const GaObj & r) {
+        cc = {o.initial_pose.position.x, o.initial_pose.position.y, v_o, now_s, r};
+        return r;
+      };
+      auto & hh = ga_hist[uid];
+      if (!hh.empty() && now_s - hh.back()[0] > 0.5) hh.clear();  // a hole in its history: start again
+      if (hh.empty() || now_s - hh.back()[0] >= 0.09) hh.push_back({now_s, v_o});
+      while (!hh.empty() && now_s - hh.front()[0] > 1.6) hh.pop_front();
+      if (!four_wheeler(o) || v_o <= stopped_th) {
+        g.why = !four_wheeler(o) ? "not a four-wheeler" : "standing";
+        return remember(g);
+      }
+      const std::array<double, 2> * old = nullptr;  // the newest sample at least 0.8 s old
+      for (const auto & e : hh) {
+        if (now_s - e[0] >= 0.8) old = &e;
+      }
+      if (old == nullptr) {  // too young a history: checked as before
+        g.why = "history < 0.8 s";
+        return remember(g);
+      }
+      const double a_m = (v_o - (*old)[1]) / (now_s - (*old)[0]);
+      if (a_m < -nero_ga[3]) {  // braking: not a steady passer
+        g.why = "braking " + std::to_string(a_m).substr(0, 5) + " m/s2";
+        return remember(g);
+      }
+      const bool past_nose = nero_ga[8] > 0.5 &&
+                             o.dist_from_ego - 0.5 * o.shape.dimensions.x > common_data_ptr_->bpp_param_ptr->vehicle_info.max_longitudinal_offset_m;
+      if (!lane_poly.empty() && !past_nose) {        // no car riding the line: the robot drifts beside it before the leave
+        const auto poly = autoware_utils::to_polygon2d(o.initial_pose, o.shape);
+        lanelet::BasicPolygon2d lp;
+        for (const auto & pt : poly.outer()) lp.emplace_back(pt.x(), pt.y());
+        const double side = boost::geometry::distance(lp, lane_poly);
+        if (side < nero_ga[4]) {
+          g.why = "side " + std::to_string(side).substr(0, 4) + " m from the robot's lanes";
+          return remember(g);
+        }
+      }
+      g.ok = true;
+      g.v_o = v_o;
+      g.a_eff = std::min(a_m, 0.0);  // its measured slowing, never a credit for speeding up
+      g.rear_now = o.dist_from_ego - 0.5 * o.shape.dimensions.x;  // along the current lanes, ego base_link = 0
+      return remember(g);
+    };
+    // on ego predicted path k: true = it has passed ahead of the gap when the robot leaves its lane on that path
+    const auto ga_on_path = [&](const GaObj & g, const size_t k, double & gap_out, double & need_out, double & t_out) {
+      if (!g.ok || k >= ga_leaves.size()) return false;
+      const auto & lv = ga_leaves[k];
+      if (!lv.found) return lv.judgeable;  // the path stays in its lane >= 2 s: no merge conflict with him on it
+      if (!approved_check && lv.t > nero_ga[5]) return false;  // too far ahead to commit to (knife edges from a stand)
+      const double t_stop = g.a_eff < -1e-3 ? -g.v_o / g.a_eff : 1e9;
+      const double tt = std::min(lv.t, t_stop);
+      const double x_rear = g.rear_now + g.v_o * tt + 0.5 * g.a_eff * tt * tt;
+      const double v_at = std::max(0.0, g.v_o + g.a_eff * lv.t);
+      gap_out = x_rear - (lv.s + vi.max_longitudinal_offset_m);
+      need_out = nero_ga[1] + lv.v * nero_ga[2] + (approved_check ? 0.0 : nero_ga[6] * lv.t);
+      t_out = lv.t;
+      return v_at - lv.v >= nero_ga[0] && gap_out >= need_out;
+    };
+    const size_t n_paths = ego_predicted_paths.size();
+    // NERO_LC_GAP_AHEAD_PACE (mainlane-9): candidates record their passers; the approved check paces the robot behind a planned passer
+    const auto & pace_p = nero_pace_params();
+    auto & planned = nero_planned_passers()[this];
+    NeroPace pace_new;
+    double s_lc_once = -1e9;
+    const auto try_pace = [&](const ExtendedPredictedObject & o, const GaObj & g, const size_t k, const double need) {
+      if (pace_p[0] < 0.0 || !approved_check || !g.ok || k >= ga_leaves.size() || !ga_leaves[k].found) return false;
+      const auto & lv = ga_leaves[k];
+      if (lv.s < 0.3) return false;  // the footprint is (about to be) out of its lane: the stock check / hold decide
+      const std::string uid = autoware_utils::to_hex_string(o.uuid).substr(0, 6);
+      const auto pit = planned.find(uid);
+      if (pit == planned.end() || now_s - pit->second > 30.0) return false;  // only a car the change was planned behind
+      const double D = lv.s + vi.max_longitudinal_offset_m + need - g.rear_now;  // what its rear must gain on the robot's current nose
+      double T = 0.0;
+      if (D <= 0.0) return false;  // already ahead enough: the normal test passes it
+      if (g.a_eff < -1e-3) {
+        const double disc = g.v_o * g.v_o + 2.0 * g.a_eff * D;
+        if (disc < 0.0) return false;  // it would stop before it gets ahead
+        T = (g.v_o - std::sqrt(disc)) / (-g.a_eff);
+      } else {
+        T = D / std::max(0.1, g.v_o);
+      }
+      const double v0 = std::max(0.0, getEgoVelocity());
+      const double v_cap = lv.s / std::max(0.1, T);
+      if (T > pace_p[1] || v_cap < pace_p[0] || g.v_o + g.a_eff * T - v_cap < nero_ga[0]) return false;
+      if (v0 > v_cap && (v0 * v0 - v_cap * v_cap) / (2.0 * std::max(0.1, pace_p[2])) > 0.6 * lv.s) return false;  // cannot slow in time
+      // v2 (4th field): slow on the straight part, cross the sideways part at >= v_lat: less time near the line when a late car
+      // appears (kstand2 h7_hidden 1112-044456: the uniform 1.4 m/s held the robot with its corner 0.18 m inside), a faster leave for R79
+      double s_lc = 0.0, v1 = -1.0, v2 = -1.0;
+      if (pace_p[3] > 0.0) {
+        if (s_lc_once < -1e8) {  // once per check (copy-free): the arc from ego to the lane-changing start of the approved path
+          s_lc_once = std::max(0.0, nero_mu::calcSignedArcLength(
+                                      lane_change_path.path.points, getEgoPosition(), lane_change_path.info.lane_changing_start.position));
+        }
+        s_lc = std::min(s_lc_once, lv.s);
+        v2 = std::max(v_cap, pace_p[3]);
+        const double t1 = T - (lv.s - s_lc) / v2;
+        if (s_lc > 0.5 && t1 > 0.2) {
+          v1 = std::max(pace_p[0], s_lc / t1);
+          if (v0 > v1 && (v0 * v0 - v1 * v1) / (2.0 * std::max(0.1, pace_p[2])) > 0.8 * s_lc) v1 = -1.0;  // cannot slow there: uniform
+        }
+        if (v1 < 0.0) v2 = -1.0;
+      }
+      if (pace_new.v_cap < 0.0 || v_cap < pace_new.v_cap) pace_new = NeroPace{now_s, v_cap, lv.s, s_lc, v1, v2, uid};
+      if (nero_lc_debug_every("ga_pace_" + uid, 500)) {
+        RCLCPP_INFO(logger_, "[NERO_LC_GAP_AHEAD] PACE behind %s (%.1f m/s, rear %.1f m): leave in >= %.1f s at <= %.2f m/s (%.1f m to the leave, "
+          "earliest %.1f s, v %.2f; straight %.1f m at <= %.2f, sideways at <= %.2f)", uid.c_str(), g.v_o, g.rear_now, T, v_cap, lv.s, lv.t,
+          v0, s_lc, v1, v2);
+      }
+      return true;
+    };
+    // the trailing objects BEFORE R79 when it ran per path, else after it (R79 off: nothing was removed)
+    const auto & trail_src = r79_pp.empty() ? trailing_to_check : ga_trailing_all;
+    std::vector<GaObj> g_tr, g_ld;
+    for (const auto & o : trail_src) g_tr.push_back(ga_prep(o));
+    for (const auto & o : leading_to_check) g_ld.push_back(ga_prep(o));
+    ga_trailing_pp.assign(n_paths, {});
+    ga_leading_pp.assign(n_paths, {});
+    bool picked = false;
+    const auto log_pass = [&](const ExtendedPredictedObject & o, const char * which, const double gap, const double need, const double t) {
+      if (nero_lc_debug_every("gap_ahead_" + autoware_utils::to_hex_string(o.uuid).substr(0, 6), 1000)) {
+        RCLCPP_INFO(
+          logger_,
+          "[NERO_LC_GAP_AHEAD] %s (%s, %.1f m/s) passes ahead of the gap: its rear %.1f m ahead of the robot's nose when the "
+          "robot leaves its lane (in %.1f s; need %.1f m%s): left out of the RSS",
+          autoware_utils::to_hex_string(o.uuid).substr(0, 6).c_str(), which,
+          std::hypot(o.initial_twist.linear.x, o.initial_twist.linear.y), gap, t, need, approved_check ? ", approved" : "");
+      }
+    };
+    if (!approved_check) {  // NERO_LC_DEBUG: why a faster car coming from behind is NOT taken as the passer the gap opens behind
+      for (size_t j = 0; j < trail_src.size(); ++j) {
+        const auto & o = trail_src[j];
+        const double v_o = std::hypot(o.initial_twist.linear.x, o.initial_twist.linear.y);
+        if (v_o < std::max(0.0, getEgoVelocity()) + nero_ga[0] || o.dist_from_ego < -40.0) continue;
+        std::string why = g_tr[j].why;
+        if (g_tr[j].ok) {
+          double gap = 0.0, need = 0.0, t = 0.0;
+          for (size_t k = 0; k < n_paths && k < ga_leaves.size(); ++k) {
+            if (!ga_on_path(g_tr[j], k, gap, need, t)) {
+              char b[160];
+              std::snprintf(b, sizeof(b), "path %zu: leave %s in %.1f s, its rear %.1f m vs need %.1f m", k,
+                ga_leaves[k].found ? "found" : "not found", t, gap, need);
+              why = b;
+              break;
+            }
+          }
+        }
+        if (!why.empty() && nero_lc_debug_every("gap_ahead_no_" + autoware_utils::to_hex_string(o.uuid).substr(0, 6), 1000)) {
+          RCLCPP_INFO(logger_, "[NERO_LC_GAP_AHEAD] %s (behind %.1f m, %.1f m/s) not a passer: %s",
+            autoware_utils::to_hex_string(o.uuid).substr(0, 6).c_str(), -o.dist_from_ego, v_o, why.c_str());
+        }
+      }
+    }
+    for (size_t k = 0; k < n_paths; ++k) {
+      for (size_t j = 0; j < trail_src.size(); ++j) {
+        if (!r79_pp.empty() && r79_pp[k][j]) continue;  // R79 lets it out on this path
+        double gap = 0.0, need = 0.0, t = 0.0;
+        if (ga_on_path(g_tr[j], k, gap, need, t)) {
+          if (!approved_check) picked = true;
+          if (!approved_check && pace_p[0] >= 0.0) planned[autoware_utils::to_hex_string(trail_src[j].uuid).substr(0, 6)] = now_s;
+          if (ga_leaves[k].found) log_pass(trail_src[j], "behind", gap, need, t);
+          continue;
+        }
+        if (try_pace(trail_src[j], g_tr[j], k, need)) continue;
+        ga_trailing_pp[k].push_back(trail_src[j]);
+      }
+      for (size_t j = 0; j < leading_to_check.size(); ++j) {
+        double gap = 0.0, need = 0.0, t = 0.0;
+        if (ga_on_path(g_ld[j], k, gap, need, t)) {
+          // a passer that has just gone by (its rear within 10 m of the nose): the gap behind it is still the one being planned
+          if (!approved_check && g_ld[j].rear_now - vi.max_longitudinal_offset_m < 10.0) picked = true;
+          if (!approved_check && pace_p[0] >= 0.0) planned[autoware_utils::to_hex_string(leading_to_check[j].uuid).substr(0, 6)] = now_s;
+          if (ga_leaves[k].found) log_pass(leading_to_check[j], "ahead", gap, need, t);
+          continue;
+        }
+        if (try_pace(leading_to_check[j], g_ld[j], k, need)) continue;
+        ga_leading_pp[k].push_back(leading_to_check[j]);
+      }
+    }
+    if (picked) nero_ga_pick_times()[this] = now_s;  // a gap behind a passer is being planned (NormalLaneChange::nero_gap_picked)
+    if (approved_check && pace_new.v_cap > 0.0) nero_pace_map()[this] = pace_new;
+    for (const auto & lv : ga_leaves) ga_leave_dbg.push_back({lv.found ? 1.0 : 0.0, lv.t, lv.judgeable ? 1.0 : 0.0});
+    ga_approved_dbg = approved_check;
+    ga_pp_ready = true;
+  }
+
+  if (ga_pp_ready) {
+    // NERO_LC_GAP_AHEAD: unsafe only if EVERY ego predicted path collides with ITS OWN object set (the stock check's semantics)
+    const auto stopped_obj_vel_th = lane_change_parameters_->safety.th_stopped_object_velocity;
+    const auto path_collides = [&](const size_t k, const std::vector<ExtendedPredictedObject> & objs) {
+      return ranges::any_of(objs, [&](const auto & object) {
+        const auto selected_rss_param = (use_parked_rss && object.initial_twist.linear.x <= stopped_obj_vel_th)  // 11360: no parked RSS once approved
+                                          ? lane_change_parameters_->safety.rss_params_for_parked
+                                          : rss_params;
+        return is_colliding(
+          lane_change_path, object, ego_predicted_paths[k], selected_rss_param, is_check_prepare_phase, debug_data);
+      });
+    };
+    bool all_tr = true, all_ld = true;
+    for (size_t k = 0; k < ego_predicted_paths.size(); ++k) {
+      if (!path_collides(k, ga_trailing_pp[k])) all_tr = false;
+      if (!path_collides(k, ga_leading_pp[k])) all_ld = false;
+    }
+    // NERO_LC_DEBUG (mainlane-8, log only): which ego path collides with which object when every path does (kstand2 1112-022706: an
+    // approved change cancelled for a target-lane car already 14.7 m ahead and pulling away)
+    if ((all_tr || all_ld) && nero_lc_debug_every("ga_pp_unsafe", 300)) {
+      for (size_t k = 0; k < ego_predicted_paths.size() && k < ga_leave_dbg.size(); ++k) {
+        std::string ids;
+        const auto add_ids = [&](const std::vector<ExtendedPredictedObject> & objs, const char * tag) {
+          for (const auto & o : objs) {
+            CollisionCheckDebugMap dd;
+            const auto rp = (o.initial_twist.linear.x <= stopped_obj_vel_th) ? lane_change_parameters_->safety.rss_params_for_parked
+                                                                            : rss_params;
+            if (is_colliding(lane_change_path, o, ego_predicted_paths[k], rp, is_check_prepare_phase, dd)) {
+              ids += std::string(" ") + tag + autoware_utils::to_hex_string(o.uuid).substr(0, 6) + "(" + nero_first_unsafe(dd) + ")";
+            }
+          }
+        };
+        add_ids(ga_trailing_pp[k], "T:");
+        add_ids(ga_leading_pp[k], "L:");
+        const auto & pk = ego_predicted_paths[k];
+        RCLCPP_INFO(logger_, "[NERO_LC_GAP_AHEAD] unsafe %s %s, path %zu (%zu poses, end %.1f s, leave %s %.1f s, judgeable %d):%s",
+          ga_approved_dbg ? "approved" : "candidate", lane_change_path.type == lane_change::PathType::FrenetPlanner ? "frenet" : "shift", k, pk.size(), pk.empty() ? 0.0 : pk.back().time,
+          ga_leave_dbg[k][0] > 0.5 ? "found" : "none", ga_leave_dbg[k][1], ga_leave_dbg[k][2] > 0.5 ? 1 : 0, ids.empty() ? " -" : ids.c_str());
+      }
+    }
+    // gapahead_1112u: NERO_LC_FIX_11342 inside the gap-ahead's per-path object sets: the trailing objects of the FIRST ego prediction's own
+    // set (passers / R79-cleared cars left out as on every path) on that prediction only, every one of them, "object behind" only for a
+    // moving one; the leading objects: every prediction must collide with its own set (as above). No prediction = safe (as 1111u).
+    if (utils::lane_change::nero_lc_fix_11342()) {
+      constexpr auto is_moving_object_behind_ego = true;
+      if (ego_predicted_paths.empty()) {
+        return {is_safe, !is_moving_object_behind_ego};
+      }
+      bool any_trailing_colliding = false;
+      bool any_trailing_moving = false;
+      for (const auto & object : ga_trailing_pp.front()) {
+        const auto selected_rss_param =
+          (use_parked_rss && object.initial_twist.linear.x <= stopped_obj_vel_th)
+            ? lane_change_parameters_->safety.rss_params_for_parked
+            : rss_params;
+        if (!is_colliding(
+              lane_change_path, object, ego_predicted_paths.front(), selected_rss_param, is_check_prepare_phase,
+              debug_data)) {
+          continue;
+        }
+        any_trailing_colliding = true;
+        any_trailing_moving =
+          any_trailing_moving || utils::lane_change::is_moving_object(common_data_ptr_, object);
+      }
+      if (any_trailing_colliding) {
+        return {!is_safe, any_trailing_moving};
+      }
+      if (all_ld) {
+        return {!is_safe, !is_moving_object_behind_ego};
+      }
+      return {is_safe, !is_moving_object_behind_ego};
+    }
+    if (all_tr) return {!is_safe, is_object_behind_ego};
+    if (all_ld) return {!is_safe, !is_object_behind_ego};
+    return {is_safe, !is_object_behind_ego};
+  }
   // NERO_LC_FIX_11342=1: port of upstream #11342's isLaneChangePathSafe part, after the NERO_LC_R79_* block (which runs
   // the same with the switch set or not and still decides which trailing objects are left to this check):
   // - no ego prediction: safe (before: all_of over no path = "all collide" = unsafe with an object behind);
@@ -3742,7 +4394,7 @@ PathSafetyStatus NormalLaneChange::isLaneChangePathSafe(
     return {!is_safe, is_object_behind_ego};
   }
 
-  if (all_paths_collide(collision_check_objects.leading)) {
+  if (all_paths_collide(leading_to_check)) {
     return {!is_safe, !is_object_behind_ego};
   }
 
@@ -3782,7 +4434,8 @@ bool NormalLaneChange::is_colliding(
   const auto & bpp_param = *common_data_ptr_->bpp_param_ptr;
 
   const double velocity_threshold = lane_change_parameters_->safety.th_stopped_object_velocity;
-  const double prepare_duration = lane_change_path.info.duration.prepare;
+  // NERO_LC_APPROVED_PRED_FIX: the prepare time left in the rebuilt prediction of an approved frenet path (else the original)
+  const double prepare_duration = nero_prep_override >= 0.0 ? nero_prep_override : lane_change_path.info.duration.prepare;
   const double start_time = check_prepare_phase ? 0.0 : prepare_duration;
 
   // NERO_LC_MULTI_STAND_PREPARE=1 (streamjoin job 2026-10-27): a change that starts from the robot standing at its waiting
@@ -4092,6 +4745,7 @@ double NormalLaneChange::nero_stop_offset() const
   }
   return multi >= 0.0 ? std::min(stock, multi) : stock;
 }
+
 
 // the car's rolling wait (interface.cpp nero_cap_waiting_velocity) acts for this direction
 bool NormalLaneChange::nero_rolling_wait_dir() const

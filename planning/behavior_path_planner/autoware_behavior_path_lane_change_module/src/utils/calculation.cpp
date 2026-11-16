@@ -13,6 +13,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <algorithm>
+#include <array>
 #include <cstdlib>
 #include <autoware/behavior_path_lane_change_module/utils/calculation.hpp>
 #include <autoware/behavior_path_planner_common/utils/utils.hpp>
@@ -569,9 +571,55 @@ double calc_actual_prepare_duration(
   return std::max(params.max_prepare_duration - active_signal_duration, min_prepare_duration);
 }
 
+bool & nero_prep_long()
+{
+  static bool f = false;
+  return f;
+}
+
 std::vector<double> calc_prepare_durations(const CommonDataPtr & common_data_ptr)
 {
   const auto & lc_param_ptr = common_data_ptr->lc_param_ptr;
+  // NERO_LC_GAP_AHEAD_PREP=<min s>,<step s>[,<commit s>] (mainlane-7 2026-11-11, Ahmed ~20:2x "the lane changes are too stiff you should
+  // plan it before the car is beside so you are ready to execute when the car is beside you"): the prepare durations min, min + step,
+  // .. max_prepare_duration everywhere (upstream: ONE duration max(max_prepare - signal time, min_prepare, (min_lc_vel - v) / max_lon_acc)
+  // away from the lane end = 4.7 s at 0.6 m/s and 6.7 s from a stand with the car's 3.0 / 1.0 / 2.0 m/s / 0.3 m/s2; the signal time is
+  // an indicator this robot does not have), tried shortest first (get_prepare_metrics): the change starts as soon as a candidate is
+  // safe instead of driving 4.7-6.7 s straight first (sim soa14 93795: approved 7.7 s, first sideways 13.0 s with the target lane free).
+  // The safety check judges each candidate with the robot's own launch (NERO_LC_PRED_LAUNCH_ACC). Unset = upstream.
+  {
+    static const std::array<double, 3> gp = [] {
+      std::array<double, 3> r{-1.0, 0.5, -1.0};
+      if (const char * e = std::getenv("NERO_LC_GAP_AHEAD_PREP")) {
+        std::sscanf(e, "%lf,%lf,%lf", &r[0], &r[1], &r[2]);
+      }
+      r[1] = std::max(0.1, r[1]);
+      return r;
+    }();
+    // v7 (planner cost: v6 ran 6 durations everywhere, behavior_path_planner p95 6 -> 36 ms, max 109 ms at no load): the stock durations
+    // + the two shortest (min, min + step) only, unique, ascending; near the lane end the stock 3.0 .. 0 already holds them
+    if (gp[0] >= 0.0) {
+      std::vector<double> d;
+      const auto threshold0 = common_data_ptr->bpp_param_ptr->base_link2front + lc_param_ptr->min_length_for_turn_signal_activation;
+      if (common_data_ptr->transient_data.dist_to_terminal_start >= threshold0) {
+        d.push_back(common_data_ptr->transient_data.lane_change_prepare_duration);
+      } else {
+        for (double t = lc_param_ptr->trajectory.max_prepare_duration; t >= 0.0; t -= 0.5) d.push_back(t);
+      }
+      d.push_back(gp[0]);
+      d.push_back(gp[0] + gp[1]);
+      // v8: while a faster target-lane car is coming from behind (nero_prep_long, set by the module each cycle) also the long ones,
+      // so a change that starts as that car goes by can be planned while it is still coming (v7 without them never planned K1103's
+      // gap behind B: the stock duration had shrunk to 1 s)
+      if (nero_prep_long()) {
+        d.push_back(lc_param_ptr->trajectory.max_prepare_duration - 1.0);
+        d.push_back(lc_param_ptr->trajectory.max_prepare_duration);
+      }
+      std::sort(d.begin(), d.end());
+      d.erase(std::unique(d.begin(), d.end(), [](double a, double b) { return std::abs(a - b) < 1e-3; }), d.end());
+      return d;
+    }
+  }
   const auto threshold = common_data_ptr->bpp_param_ptr->base_link2front +
                          lc_param_ptr->min_length_for_turn_signal_activation;
 

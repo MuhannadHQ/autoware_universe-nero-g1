@@ -158,6 +158,9 @@ double calc_actual_prepare_duration(
   const CommonDataPtr & common_data_ptr, const double current_velocity,
   const double active_signal_duration);
 
+// NERO_LC_GAP_AHEAD_PREP v8: set by the module each cycle while a faster target-lane car comes from behind (long prepares sampled too)
+bool & nero_prep_long();
+
 std::vector<PhaseMetrics> calc_prepare_phase_metrics(
   const CommonDataPtr & common_data_ptr, const double current_velocity,
   const double max_path_velocity, const double min_length_threshold = 0.0,

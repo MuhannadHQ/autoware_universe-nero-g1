@@ -289,6 +289,15 @@ BehaviorModuleOutput LaneChangeInterface::planWaitingApproval()
 
   module_type_->insert_stop_point(module_type_->get_current_lanes(), out.path, true);
   const auto * nlc_wait = dynamic_cast<const NormalLaneChange *>(module_type_.get());
+  // NERO_LC_GAP_AHEAD_KEEP=1 (mainlane-7, Fable research/gapahead/DESIGN.md item 5 "keep rolling"): while a gap behind a passing car is
+  // being planned (NormalLaneChange::nero_gap_picked), the waiting cap does not slow the robot toward its waiting stop: a slower robot
+  // needs a longer gap from the next car (S_crit grows with dv) and launches late (K1103 y v3: 4.2 -> 2.9 m/s while B passed, the gap
+  // behind B then refused for C). The waiting stop itself stays (its comfort stop). Unset = the car.
+  static const bool nero_ga_keep = [] {
+    const char * e = std::getenv("NERO_LC_GAP_AHEAD_KEEP");
+    return e != nullptr && std::atoi(e) > 0;
+  }();
+  if (!(nero_ga_keep && nlc_wait != nullptr && nlc_wait->nero_gap_picked()))
   nero_cap_waiting_velocity(
     out.path, module_type_->getStopPose(), module_type_->getDirection(),
     // NERO_LC_MULTI_ROLL: also the change that continues a double change made from the waiting place (the second of two
