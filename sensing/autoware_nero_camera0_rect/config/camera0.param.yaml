@@ -1,20 +1,20 @@
-# [nero camstack 2026-11-10] camera0 (C++ autoware_nero_camera0_rect) = camfront_1109's camera0.param.yaml + the decoder lines. camera0 = the forward wide camera (recorded cross_left). Intrinsics: camfront's targetless calibration
-# (Kannala-Brandt / equidistant, 1920x1536); see /work/vehicle-enhancement/camfront/README.md. The extrinsics are in the sensor kit
+# [nero camstack 2026-11-10] camera0 (C++ autoware_nero_camera0_rect) = camfront_1109's camera0.param.yaml + the decoder lines. camera0 = the forward wide camera (recorded cross_left). Intrinsics: board calibration 2026-11-16
+# (Kannala-Brandt / equidistant, 1920x1536; was camfront's targetless 2026-11-09, fx 921.73). The extrinsics are in the sensor kit
 # (sensor_kit_calibration.yaml camera0/camera_link).
 /**:
   ros__parameters:
     frame_id: camera0/camera_optical_link
-    fisheye:
+    fisheye:            # board calibration 2026-11-16 (AprilGrid session 14:34, 61 views, 0.36 px on unseen shots; nero-jetson-bridge board_calib PR #28)
       width: 1920
       height: 1536
-      fx: 921.73
-      fy: 921.73
-      cx: 961.56
-      cy: 772.15
-      k1: 0.00563
-      k2: -0.01202
-      k3: -0.01960
-      k4: 0.0
+      fx: 1027.867446
+      fy: 1023.906613
+      cx: 960.815080
+      cy: 772.721754
+      k1: -0.058230012
+      k2: -0.021052995
+      k3: 0.011990725
+      k4: -0.003983725
     rectified:          # virtual pinhole camera in the same optical frame (no rotation)
       width: 960
       height: 720
