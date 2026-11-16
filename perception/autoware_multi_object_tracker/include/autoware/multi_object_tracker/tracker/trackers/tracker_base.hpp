@@ -20,6 +20,7 @@
 #include "autoware/multi_object_tracker/object_model/classes.hpp"
 #include "autoware/multi_object_tracker/object_model/object_model.hpp"
 #include "autoware/multi_object_tracker/object_model/uuid.hpp"
+#include "autoware/multi_object_tracker/tracker/nero/nero_stand_hold.hpp"
 #include "autoware/multi_object_tracker/tracker/shape_model/shape_model_base.hpp"
 #include "autoware/multi_object_tracker/tracker/shape_model/unstable_shape_filter.hpp"
 #include "autoware/multi_object_tracker/types.hpp"
@@ -101,6 +102,8 @@ public:
   std::vector<std::array<double, 2>> nero_sb_pred_outline;
   void neroStillBoxRecord(
     const types::DynamicObject & object, const rclcpp::Time & time, const types::InputChannel * channel_info);
+  // NERO_MOT_STAND_HOLD / NERO_MOT_CLASS_HOLD (tracker-1): publication-only state, written by the processor's getTrackedObjects
+  NeroStandHoldState nero_sh;
 
   // tracker probabilities
   void initializeExistenceProbabilities(

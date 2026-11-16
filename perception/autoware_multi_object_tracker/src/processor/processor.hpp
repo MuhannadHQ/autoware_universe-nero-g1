@@ -85,6 +85,10 @@ private:
   std::list<std::shared_ptr<Tracker>> list_tracker_;
   std::optional<geometry_msgs::msg::Pose> getEgoPose() const;
   // NERO_MOT_STILL_BOX (boxyaw, ported): re-align a still vehicle's PUBLISHED box with its measured points
+  // NERO_MOT_STAND_HOLD / NERO_MOT_CLASS_HOLD (tracker-1): hold a standing vehicle's PUBLISHED box and vehicle class
+  void neroStandHold(const std::shared_ptr<Tracker> & tracker, const rclcpp::Time & time, types::DynamicObject & object) const;
+  void neroClassHold(const std::shared_ptr<Tracker> & tracker, const rclcpp::Time & time, types::DynamicObject & object) const;
+  void neroUnknownCamClass(const std::shared_ptr<Tracker> & tracker, const rclcpp::Time & time, types::DynamicObject & object) const;
   void neroStillBox(
     const std::shared_ptr<Tracker> & tracker, const rclcpp::Time & time, types::DynamicObject & object) const;
   void neroStillBoxBirth(

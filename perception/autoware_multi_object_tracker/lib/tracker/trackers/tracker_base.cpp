@@ -214,6 +214,18 @@ bool Tracker::updateWithMeasurement(
   // Select update path: NORMAL / TRY_EXTENSION / CONDITIONED
   const UpdatePath path =
     selectUpdatePath(channel_info.trust_extension, has_significant_shape_change);
+  // NERO_MOT_STAND_HOLD (tracker-1): keep this track's trusted boxes (extent + orientation trusted, a box, the normal path:
+  // CenterPoint through the merger) for the publication-only standing hold; the update itself is untouched
+  if (
+    neroStandHoldParams().enabled && path == UpdatePath::NORMAL && channel_info.trust_orientation &&
+    object.shape.type == autoware_perception_msgs::msg::Shape::BOUNDING_BOX) {
+    const auto & q = object.pose.orientation;
+    const double yaw = std::atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z));
+    nero_sh.cp.push_back(
+      {measurement_time.seconds(), object.pose.position.x, object.pose.position.y, yaw, object.shape.dimensions.x,
+       object.shape.dimensions.y});
+    while (nero_sh.cp.size() > kNeroStandHoldMaxBoxes) nero_sh.cp.pop_front();
+  }
 
   if (path == UpdatePath::NORMAL) {
     unstable_shape_filter_.processNormalMeasurement(object);

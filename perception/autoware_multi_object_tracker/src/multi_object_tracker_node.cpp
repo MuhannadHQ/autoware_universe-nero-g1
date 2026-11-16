@@ -18,6 +18,10 @@
 
 #include "autoware/multi_object_tracker/types.hpp"
 #include "autoware/multi_object_tracker/uncertainty/uncertainty_processor.hpp"
+#include "autoware/multi_object_tracker/tracker/nero/nero_cam_class.hpp"
+
+#include <tf2/LinearMath/Transform.h>
+#include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 
 #include <algorithm>
 #include <array>
@@ -269,6 +273,56 @@ MultiObjectTracker::MultiObjectTracker(const rclcpp::NodeOptions & node_options)
       "~/input/odometry", rclcpp::QoS{10},
       [this](AUTOWARE_MESSAGE_CONST_SHARED_PTR(nav_msgs::msg::Odometry) msg) {
         state_.odometry->updateOdometryBuffer(*msg);
+      });
+  }
+
+  // NERO_MOT_CLASS_CAM (tracker-1): camera0's YOLOX boxes + its rectified calibration; unset = no subscription
+  if (nero_cam_class::params().enabled) {
+    const char * rt = std::getenv("NERO_MOT_CLASS_CAM_ROIS");
+    const char * it = std::getenv("NERO_MOT_CLASS_CAM_INFO");
+    nero_rois_sub_ = create_subscription<tier4_perception_msgs::msg::DetectedObjectsWithFeature>(
+      (rt && *rt) ? rt : "/perception/object_recognition/detection/rois0", rclcpp::SensorDataQoS(),
+      [](AUTOWARE_MESSAGE_CONST_SHARED_PTR(tier4_perception_msgs::msg::DetectedObjectsWithFeature) msg) {
+        std::vector<nero_cam_class::Roi> r;
+        r.reserve(msg->feature_objects.size());
+        for (const auto & f : msg->feature_objects) {
+          const auto & b = f.feature.roi;
+          int label = 0;
+          float best = -1.0F;
+          for (const auto & c : f.object.classification) {
+            if (c.probability > best) {
+              best = c.probability;
+              label = static_cast<int>(c.label);
+            }
+          }
+          r.push_back(
+            {static_cast<double>(b.x_offset), static_cast<double>(b.y_offset), static_cast<double>(b.x_offset + b.width),
+             static_cast<double>(b.y_offset + b.height), label});
+        }
+        nero_cam_class::setRois(rclcpp::Time(msg->header.stamp).seconds(), std::move(r));
+      });
+    nero_info_sub_ = create_subscription<sensor_msgs::msg::CameraInfo>(
+      (it && *it) ? it : "/sensing/camera/camera0/camera_info", rclcpp::SensorDataQoS(),
+      [this](AUTOWARE_MESSAGE_CONST_SHARED_PTR(sensor_msgs::msg::CameraInfo) msg) {
+        nero_cam_class::setIntrinsics(
+          msg->p[0], msg->p[5], msg->p[2], msg->p[6], static_cast<int>(msg->width), static_cast<int>(msg->height));
+        if (nero_cam_class::cameraOk()) return;
+        // base_link <- optical from the tf tree at this stamp (static: once): (map <- base)^-1 (map <- optical)
+        const rclcpp::Time st(msg->header.stamp, this->now().get_clock_type());
+        const auto mo = state_.odometry->getTransform(msg->header.frame_id, st);
+        const auto mb = state_.odometry->getTransform(st);
+        if (!mo || !mb) return;
+        tf2::Transform to, tb;
+        tf2::fromMsg(*mo, to);
+        tf2::fromMsg(*mb, tb);
+        const tf2::Transform bo = tb.inverse() * to;
+        const tf2::Matrix3x3 & R = bo.getBasis();
+        nero_cam_class::setCamera(
+          {R[0][0], R[0][1], R[0][2], R[1][0], R[1][1], R[1][2], R[2][0], R[2][1], R[2][2]},
+          {bo.getOrigin().x(), bo.getOrigin().y(), bo.getOrigin().z()});
+        RCLCPP_INFO(
+          this->get_logger(), "[NERO_MOT_CLASS_CAM] camera %s at base_link (%.3f, %.3f, %.3f)", msg->header.frame_id.c_str(),
+          bo.getOrigin().x(), bo.getOrigin().y(), bo.getOrigin().z());
       });
   }
 
