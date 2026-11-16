@@ -563,6 +563,15 @@ std::pair<LaneChangeStates, std::string_view> LaneChangeInterface::check_transit
     }
   }
 
+  // NERO_LC_QUEUE: while the queue hold is latched the robot stands on its path (in its lane or astride): no cancel (the prepare-
+  // phase cancel made the approve / cancel loop), no abort; isRequiredStop stops it
+  if (NormalLaneChange::nero_queue_on()) {
+    if (const auto * nlc = dynamic_cast<const NormalLaneChange *>(module_type_.get());
+        nlc != nullptr && nlc->nero_queue_hold_latched()) {
+      return {LaneChangeStates::Warning, "NeroQueueHold"};
+    }
+  }
+
   if (post_process_safety_status_.is_safe) {
     return {LaneChangeStates::Normal, "SafeToLaneChange"};
   }

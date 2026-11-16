@@ -140,6 +140,21 @@ public:
   bool nero_keep_right_discretionary() const;
   bool nero_keep_right_gate_blocks() const;
 
+  // NERO_LC_QUEUE (mainlane-19, LCQUEUE step 1, option A; scene.cpp): a change at the lane end beside a slow target-lane queue.
+  // nero_queue_on: the switch is set (static); nero_queue_eval: the per-cycle evaluation (lead L, follower F, histories, phase) and
+  // whether the queue mode is ACTIVE; nero_queue_path_check: the queue verdict of one path (nullopt = not active: the car's check);
+  // the rest: the candidates' log, the approved path's hold, the output speed cap. Non-virtual / static: no layout change.
+  static bool nero_queue_on();
+  bool nero_queue_eval() const;
+  std::optional<PathSafetyStatus> nero_queue_path_check(
+    const LaneChangePath & path, const lane_change::TargetObjects & objects, const bool approved,
+    CollisionCheckDebugMap & debug_data, double * s_stop_out = nullptr) const;
+  void nero_queue_note_candidate() const;
+  void nero_queue_flush_candidates() const;
+  std::optional<PathSafetyStatus> nero_queue_hysteresis(const PathSafetyStatus & approved_path_safety_status);
+  bool nero_queue_hold_latched() const;
+  void nero_queue_cap_output(PathWithLaneId & path) const;
+
   PathSafetyStatus evaluateApprovedPathWithUnsafeHysteresis(
     PathSafetyStatus approved_path_safety_status) override;
 
