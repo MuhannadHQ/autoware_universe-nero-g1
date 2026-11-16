@@ -406,6 +406,47 @@ double nero_adjacent_own()
   }();
   return v;
 }
+// NERO_IX_FOLLOWER_PATH=<max heading deg>[,<log 0|1>] (intersections-1, 2026-11-15, QUEUE IXFOLLOW; port of upstream
+// autoware_universe #11361 "ignore predicted path overtaking ego", 73985b88d, still on upstream main 2026-11-06). A car queued
+// behind ego on its approach that creeps up while ego pulls into its turn (below 0.83 m/s the module registers it on an
+// attention lanelet without any heading test) has predicted paths that follow ego in through ego's own lane; the module
+// reads them as a crossing conflict and stops ego at its own position (11-08 19:19 at 147778: the car 5.5 m behind, 7 UNSAFE
+// cycles, two stops; 15:13, 14:15; 11-04 b8 / b23 / b11; 11-02 #4). With this switch a predicted path is not a crossing
+// conflict when the object's footprint where the path meets ego's lane polygon (or one step on) (a) lies on the ENTRY line
+// of ego's junction lanelet (upstream #11361) or (b) is already inside ego's lane polygon with its front behind ego's rear
+// along the lane (a car queued behind ego in its own lane), AND heads along ego's own path where it is (within <max heading
+// deg> of the direction of ego's path lanelet at that point: ego's approach behind a turning ego, never ego's lane at the
+// entry, which already points into the turn): it reaches ego's way only by following ego in through ego's own lane (the
+// heading guard keeps a car crossing right at the mouth). Only for a car that is NOW behind ego (its front behind ego's rear,
+// along ego's route within 2 m of its centre line or in ego's own frame within 2.5 m of ego's line): a car beside ego in an
+// adjacent lane or ahead is never left out. Every other path of every object is checked as before, every cycle, from its current
+// motion (a follower that swerves out or turns across enters ego's lane elsewhere and is checked). Logs
+// `[NERO_IX] follower path:` per object and cycle in which it leaves a path out (no such line = the car's decision).
+// Unset / 0 = the car.
+struct NeroFollowerPathParam
+{
+  bool on{false};
+  double dyaw{0.0};
+  bool log{true};
+};
+const NeroFollowerPathParam & nero_follower_path()
+{
+  static const NeroFollowerPathParam p = [] {
+    NeroFollowerPathParam r;
+    const char * e = std::getenv("NERO_IX_FOLLOWER_PATH");
+    if (e == nullptr) return r;
+    const std::string s(e);
+    const double deg = std::atof(s.c_str());
+    if (deg <= 0.0) return r;
+    r.on = true;
+    r.dyaw = std::min(deg, 90.0) * M_PI / 180.0;
+    const auto c = s.find(',');
+    if (c != std::string::npos) r.log = std::atoi(s.substr(c + 1).c_str()) != 0;
+    return r;
+  }();
+  return p;
+}
+
 bool nero_adjacent_own_debug()
 {
   static const bool on = [] {
@@ -2609,6 +2650,25 @@ void IntersectionModule::updateObjectInfoManagerCollision(
     }
   }
 
+  // NERO_IX_FOLLOWER_PATH: the entry line of ego's junction lanelet (as upstream #11361), ego's lane polygon and ego's rear
+  // along the lane (arc length)
+  autoware_utils::LineString2d nero_entry_line{};
+  autoware_utils::Polygon2d ego_poly_bg{};
+  double nero_ego_rear_s = 0.0;
+  if (nero_follower_path().on && !ego_lane.leftBound().empty() && !ego_lane.rightBound().empty()) {
+    nero_entry_line.emplace_back(ego_lane.leftBound().front().x(), ego_lane.leftBound().front().y());
+    nero_entry_line.emplace_back(ego_lane.rightBound().front().x(), ego_lane.rightBound().front().y());
+    for (const auto & q : ego_poly) ego_poly_bg.outer().emplace_back(q.x(), q.y());
+    bg::correct(ego_poly_bg);
+    nero_ego_rear_s = lanelet::utils::getArcCoordinates({ego_lane}, planner_data_->current_odometry->pose).length -
+                      planner_data_->vehicle_info_.rear_overhang_m;
+  }
+  lanelet::ConstLanelets nero_own_map_lls{};  // NERO_IX_FOLLOWER_PATH: the map lanelets ego came along + its assigned lanelet
+  if (nero_entry_line.size() == 2) {
+    nero_own_map_lls = path_lanelets.prev;
+    nero_own_map_lls.push_back(planner_data_->route_handler_->getLaneletMapPtr()->laneletLayer.get(lane_id_));
+  }
+
   for (auto & object_info : object_info_manager_.attentionObjects()) {
     const auto & predicted_object = object_info->predicted_object();
     // Nero c3 (wrong_way_watch)
@@ -2772,6 +2832,31 @@ void IntersectionModule::updateObjectInfoManagerCollision(
     // leaves the polygon into ego's next lanelet (or ends inside it)
     const bool nero_adj_own =
       !is_wrong_way_on_ego_lane && nero_adj_own_.count(uuidKey(predicted_object.object_id)) > 0;
+    int nero_fp_skipped = 0;  // NERO_IX_FOLLOWER_PATH
+    double nero_fp_dyaw = 0.0, nero_fp_conf = 0.0;
+    std::pair<double, double> nero_fp_in{0.0, 0.0};
+    // NERO_IX_FOLLOWER_PATH: only a car that is NOW behind ego along ego's route (its front behind ego's rear, within 2 m of the
+    // route's centre line): a car beside ego (an adjacent approach lane) or ahead is never left out
+    bool nero_fp_behind = false;
+    if (nero_entry_line.size() == 2) {
+      geometry_msgs::msg::Pose ofront = predicted_object.kinematics.initial_pose_with_covariance.pose;
+      const double oyw = tf2::getYaw(ofront.orientation);
+      ofront.position.x += 0.5 * predicted_object.shape.dimensions.x * std::cos(oyw);
+      ofront.position.y += 0.5 * predicted_object.shape.dimensions.x * std::sin(oyw);
+      const auto oac = lanelet::utils::getArcCoordinates(concat_lanelets, ofront);
+      nero_fp_behind = oac.length < closest_arc_coords.length - planner_data_->vehicle_info_.rear_overhang_m &&
+                       std::fabs(oac.distance) < 2.0;
+      if (!nero_fp_behind) {
+        // or in ego's own frame: its front behind ego's rear, its centre within 2.5 m of ego's line (the arc length clamps to the
+        // strip's start while ego is still within its rear overhang of its lanelet's start: 11-08 19:18:59 at 147778)
+        const auto & ego_p = planner_data_->current_odometry->pose;
+        const double ey = tf2::getYaw(ego_p.orientation);
+        const auto & oc = predicted_object.kinematics.initial_pose_with_covariance.pose.position;
+        const double fx = (ofront.position.x - ego_p.position.x) * std::cos(ey) + (ofront.position.y - ego_p.position.y) * std::sin(ey);
+        const double cy = -(oc.x - ego_p.position.x) * std::sin(ey) + (oc.y - ego_p.position.y) * std::cos(ey);
+        nero_fp_behind = fx < -planner_data_->vehicle_info_.rear_overhang_m && std::fabs(cy) < 2.5;
+      }
+    }
     int nero_adj_skipped = 0;
     double nero_adj_skip_conf = 0.0;
     std::pair<double, double> nero_adj_skip_in{0.0, 0.0};
@@ -2886,6 +2971,46 @@ void IntersectionModule::updateObjectInfoManagerCollision(
       const auto object_enter_exit_time = object_passage_interval.interval_time;
       const auto object_enter_time = std::get<0>(object_enter_exit_time);
       const auto object_exit_time = std::get<1>(object_enter_exit_time);
+      if (nero_fp_behind && !is_wrong_way_on_ego_lane) {
+        // NERO_IX_FOLLOWER_PATH: the path reaches ego's lane only through its entry, heading along it (follows ego in)
+        const auto & pp = object_passage_interval.path;
+        const size_t b0 = object_passage_interval.interval_position.first;
+        bool follows_in = false;
+        for (size_t i = b0; i <= b0 + 1 && i < pp.size(); ++i) {
+          const auto fp_i = autoware_utils::to_polygon2d(pp.at(i), predicted_object.shape);
+          // (a) it enters ego's lane polygon through the lane's entry (upstream #11361), or (b) it is already inside ego's lane
+          // polygon BEHIND ego (its front behind ego's rear along the lane): a car queued behind ego in its own lane
+          bool via_entry = bg::intersects(nero_entry_line, fp_i);
+          if (!via_entry && bg::intersects(fp_i, ego_poly_bg)) {
+            const double oy = tf2::getYaw(pp.at(i).orientation);
+            geometry_msgs::msg::Pose front = pp.at(i);
+            front.position.x += 0.5 * predicted_object.shape.dimensions.x * std::cos(oy);
+            front.position.y += 0.5 * predicted_object.shape.dimensions.x * std::sin(oy);
+            const double s_front = lanelet::utils::getArcCoordinates({ego_lane}, front).length;
+            via_entry = s_front < nero_ego_rear_s;
+          }
+          if (!via_entry) continue;
+          // heading along the MAP lanelets ego came along where the object is (ego's approach / the start of its assigned
+          // lanelet), not ego's path strips, which already point into the turn (11-08 15:13: 12 vs 70 deg)
+          lanelet::ConstLanelet own_ll = nero_own_map_lls.front();
+          lanelet::utils::query::getClosestLanelet(nero_own_map_lls, pp.at(i), &own_ll);
+          const double lane_yaw = lanelet::utils::getLaneletAngle(own_ll, pp.at(i).position);
+          const double dy = std::fabs(autoware_utils::normalize_radian(tf2::getYaw(pp.at(i).orientation) - lane_yaw));
+          if (dy < nero_follower_path().dyaw) {
+            follows_in = true;
+            if (nero_fp_skipped == 0) {
+              nero_fp_dyaw = dy;
+              nero_fp_conf = predicted_path.confidence;
+              nero_fp_in = {object_enter_time, object_exit_time};
+            }
+            break;
+          }
+        }
+        if (follows_in) {
+          ++nero_fp_skipped;
+          continue;
+        }
+      }
       if (
         nero_adj_own && predicted_path_ptr >= predicted_object.kinematics.predicted_paths.data() &&
         predicted_path_ptr <
@@ -3022,6 +3147,25 @@ void IntersectionModule::updateObjectInfoManagerCollision(
         safe_interval = object_passage_interval;
         object_debug_info = get_object_info();
       }
+    }
+    if (nero_fp_skipped > 0 && nero_follower_path().log) {  // NERO_IX_FOLLOWER_PATH: one line per object and cycle
+      const auto & op = predicted_object.kinematics.initial_pose_with_covariance.pose;
+      const auto & ego_p = planner_data_->current_odometry->pose;
+      const double ey = tf2::getYaw(ego_p.orientation);
+      const double dx = op.position.x - ego_p.position.x, dy = op.position.y - ego_p.position.y;
+      RCLCPP_INFO(
+        logger_,
+        "[NERO_IX] follower path: t %.2f lane %ld obj %s at (%.1f, %.1f) = %.1f ahead %.1f left of ego, v %.2f, "
+        "heading %.0f deg off ego's: %d path(s) follow ego in through its own lane (entry or queued behind it, heading along it: "
+        "%.0f deg; conf %.2f, in it %.1f-%.1f s): no crossing conflict",
+        rclcpp::Time(planner_data_->predicted_objects->header.stamp).seconds(), lane_id_,
+        nero_hex_id(predicted_object).c_str(), op.position.x, op.position.y, dx * std::cos(ey) + dy * std::sin(ey),
+        -dx * std::sin(ey) + dy * std::cos(ey),
+        std::hypot(
+          predicted_object.kinematics.initial_twist_with_covariance.twist.linear.x,
+          predicted_object.kinematics.initial_twist_with_covariance.twist.linear.y),
+        std::fabs(autoware_utils::normalize_radian(tf2::getYaw(op.orientation) - ey)) * 180.0 / M_PI, nero_fp_skipped,
+        nero_fp_dyaw * 180.0 / M_PI, nero_fp_conf, nero_fp_in.first, nero_fp_in.second);
     }
     if (nero_adj_skipped > 0) {  // NERO_IX_ADJACENT_OWN: one line per object and cycle that had paths left out
       const auto & pos = predicted_object.kinematics.initial_pose_with_covariance.pose.position;
