@@ -36,6 +36,7 @@
 #include <boost/geometry/algorithms/convex_hull.hpp>
 #include <boost/geometry/algorithms/correct.hpp>
 #include <boost/geometry/algorithms/distance.hpp>
+#include <boost/geometry/algorithms/intersection.hpp>  // NERO_SOA_ENVELOPE_CAP
 #include <boost/geometry/algorithms/union.hpp>
 #include <boost/geometry/geometries/point_xy.hpp>
 
@@ -487,6 +488,19 @@ bool keepApprovedShortcut(
     "feasibility is checked",
     hexId(o.object.object_id).c_str(), approved_shift, need);
   return false;
+}
+
+// soa-1 (NERO_SOA_FRAG_STAND): does the approved shift at this object keep its class hard margin (without approved_tol_m)?
+bool keepsHardMargin(
+  const ObjectData & o, const double approved_shift, const double vehicle_width,
+  const std::shared_ptr<AvoidanceParameters> & parameters)
+{
+  if (o.overhang_points.empty()) return false;
+  const auto & op = parameters->object_parameters.at(utils::getHighestProbLabel(o.object.classification));
+  const double hard = o.is_parked ? op.lateral_hard_margin_for_parked_vehicle : op.lateral_hard_margin;
+  const double need = calcShiftLength(isOnRight(o), o.overhang_points.front().first, 0.5 * vehicle_width + hard);
+  if (std::abs(need) < 1.0e-3) return true;
+  return approved_shift * need > 0.0 && std::abs(approved_shift) >= std::abs(need);
 }
 
 // update the track table with this cycle's object (after the history decision); an UNKNOWN stops standing only after
@@ -1941,6 +1955,85 @@ void insertDecelPoint(
   p_out = PoseWithDetail(autoware_utils::get_pose(path.points.at(insert_idx.value())));
 }
 
+// nero soa-1: NERO_SOA_ENVELOPE_CAP=<cap_m>[,<debug>] (Area 2 of the 11-15 drive, QUEUE ENVM): the kept envelope of an object
+// (stock: the registered envelope while the new one-shot lies within it, else the union of both, kept while < 5x the box) may
+// reach at most <cap_m> past the CURRENT box plus its class envelope buffer: where stock keeps memory (the "within" branch and
+// the union branch), the kept polygon is cut to the path-aligned box of (current box + buffer + cap) and re-boxed along the
+// path. Never smaller than the one-shot envelope (the cut box contains it). The error-ellipse branch (a badly tracked object)
+// and new objects stay stock. debug 1: one [NERO_SOA_ENVCAP] line per object and cycle where the cap changed the envelope;
+// debug 2: every object every cycle. Unset / 0 = the car.
+namespace nero_env_cap
+{
+struct Cfg
+{
+  bool on{false};
+  double cap{0.5};
+  int debug{0};
+};
+const Cfg & cfg()
+{
+  static const Cfg c = [] {
+    Cfg o;
+    const char * e = std::getenv("NERO_SOA_ENVELOPE_CAP");
+    if (e == nullptr || *e == '\0') return o;
+    double a = 0.0;
+    int d = 0;
+    const int n = std::sscanf(e, "%lf,%d", &a, &d);
+    if (n < 1 || !(a > 0.0)) return o;
+    o.on = true;
+    o.cap = a;
+    if (n >= 2) o.debug = d;
+    RCLCPP_INFO(
+      rclcpp::get_logger("static_obstacle_avoidance"),
+      "[NERO_SOA_ENVELOPE_CAP] on: cap %.2f m past box + buffer, debug %d", o.cap, o.debug);
+    return o;
+  }();
+  return c;
+}
+// lateral extent of a polygon in the frame of the path pose (left +)
+std::pair<double, double> latRange(const Polygon2d & poly, const Pose & pose)
+{
+  const double yaw = tf2::getYaw(pose.orientation);
+  const double c = std::cos(yaw), s = std::sin(yaw);
+  double lo = std::numeric_limits<double>::max(), hi = -std::numeric_limits<double>::max();
+  for (const auto & p : poly.outer()) {
+    const double l = -(p.x() - pose.position.x) * s + (p.y() - pose.position.y) * c;
+    lo = std::min(lo, l);
+    hi = std::max(hi, l);
+  }
+  return {lo, hi};
+}
+// the kept polygon cut to (current box + buffer + cap), path-aligned; the one-shot envelope if the cut is empty
+Polygon2d capKept(
+  const Polygon2d & kept, const ObjectData & object_data, const Pose & closest_pose, const double envelope_buffer,
+  const Polygon2d & one_shot, const char * branch)
+{
+  const auto cap_poly = createEnvelopePolygon(object_data, closest_pose, envelope_buffer + cfg().cap);
+  std::vector<Polygon2d> cut;
+  boost::geometry::intersection(kept, cap_poly, cut);
+  Polygon2d out = one_shot;
+  if (!cut.empty()) {
+    boost::geometry::correct(cut.front());
+    out = createEnvelopePolygon(cut.front(), closest_pose, 0.0);
+  }
+  if (cfg().debug > 0) {
+    const double a_kept = boost::geometry::area(kept), a_out = boost::geometry::area(out);
+    if (cfg().debug >= 2 || a_kept - a_out > 0.01) {
+      const auto & u = object_data.object.object_id.uuid;
+      const auto rk = latRange(kept, closest_pose), ro = latRange(out, closest_pose),
+                 r1 = latRange(one_shot, closest_pose);
+      RCLCPP_INFO(
+        rclcpp::get_logger("static_obstacle_avoidance"),
+        "[NERO_SOA_ENVCAP] id %02x%02x cls %d %s kept %.2f m2 lat [%.2f %.2f] -> %.2f m2 lat [%.2f %.2f] one-shot %.2f m2 "
+        "lat [%.2f %.2f] buf %.2f",
+        u[0], u[1], static_cast<int>(utils::getHighestProbLabel(object_data.object.classification)), branch, a_kept, rk.first,
+        rk.second, a_out, ro.first, ro.second, boost::geometry::area(one_shot), r1.first, r1.second, envelope_buffer);
+    }
+  }
+  return out;
+}
+}  // namespace nero_env_cap
+
 void fillObjectEnvelopePolygon(
   ObjectData & object_data, const ObjectDataArray & registered_objects, const Pose & closest_pose,
   const std::shared_ptr<AvoidanceParameters> & parameters)
@@ -1984,6 +2077,10 @@ void fillObjectEnvelopePolygon(
   // If the one_shot_envelope_poly is within the registered envelope, use the registered one
   if (boost::geometry::within(one_shot_envelope_poly, same_id_obj->envelope_poly)) {
     object_data.envelope_poly = same_id_obj->envelope_poly;
+    if (nero_env_cap::cfg().on) {
+      object_data.envelope_poly = nero_env_cap::capKept(
+        same_id_obj->envelope_poly, object_data, closest_pose, envelope_buffer_margin, one_shot_envelope_poly, "within");
+    }
     return;
   }
 
@@ -2008,6 +2105,10 @@ void fillObjectEnvelopePolygon(
   constexpr double THRESHOLD = 5.0;
   if (envelope_polygon_area < object_polygon_area * THRESHOLD) {
     object_data.envelope_poly = multi_step_envelope_poly;
+    if (nero_env_cap::cfg().on) {
+      object_data.envelope_poly = nero_env_cap::capKept(
+        multi_step_envelope_poly, object_data, closest_pose, envelope_buffer_margin, one_shot_envelope_poly, "union");
+    }
     return;
   }
 

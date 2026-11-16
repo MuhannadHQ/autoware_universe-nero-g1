@@ -37,6 +37,7 @@
 #include <autoware_lanelet2_extension/utility/utilities.hpp>
 #include <autoware_utils/geometry/geometry.hpp>
 #include <autoware_utils/math/normalization.hpp>
+#include <boost/geometry/algorithms/area.hpp>  // NERO_SOA_SIDE_LANE debug
 #include <boost/geometry/algorithms/convex_hull.hpp>
 #include <magic_enum.hpp>
 #include <tf2/utils.h>
@@ -46,6 +47,9 @@
 
 #include <algorithm>
 #include <chrono>
+#include <deque>  // NERO_SOA_SIDE_LANE
+#include <map>  // NERO_SOA_FRAG_STAND
+#include <mutex>  // NERO_SOA_FRAG_STAND
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -72,7 +76,149 @@ bool carried(const ObjectData & o);
 bool keepApprovedShortcut(
   const ObjectData & o, const double approved_shift, const double vehicle_width,
   const std::shared_ptr<AvoidanceParameters> & parameters);
+bool keepsHardMargin(
+  const ObjectData & o, const double approved_shift, const double vehicle_width,
+  const std::shared_ptr<AvoidanceParameters> & parameters);
 }  // namespace utils::static_obstacle_avoidance::nero_frag
+
+// nero soa-1: NERO_SOA_FRAG_STAND=<stand s>[,<debug>] (Area 2 fix 4, 11-15 B2): NERO_SOA_AMBIGUOUS_FRAGMENT's stop holds a
+// carried vehicle until a registered line keeps its hard margin + approved_tol_m. Standing at that stop, the line that would add
+// the missing centimetres is an opposite-direction candidate (from the robot's ~0 shift toward the registered shift), which stock
+// isReady() holds until the robot has moved half-way onto the registered shift - it cannot move sideways while held: a stand for
+// good (B2 with the envelope cap: approved 0.17 m, needs 0.22 m incl. the 0.1 m tolerance, stood 29.5 s). Once the robot has
+// stood >= <stand s> at this stop AND the approved shift keeps the class hard margin without the tolerance, the stop releases
+// (latched for that vehicle while the approved shift keeps the hard margin; the robot then drives the registered line and the
+// generator's extra centimetres follow as it moves). A line that does not keep the hard margin keeps the stop. Unset = the car.
+namespace nero_frag_stand
+{
+struct Cfg
+{
+  bool on{false};
+  double stand_s{1.0};
+  int debug{0};
+};
+const Cfg & cfg()
+{
+  static const Cfg c = [] {
+    Cfg o;
+    const char * e = std::getenv("NERO_SOA_FRAG_STAND");
+    if (e == nullptr || *e == '\0') return o;
+    double a = 0.0;
+    int d = 0;
+    const int n = std::sscanf(e, "%lf,%d", &a, &d);
+    if (n < 1 || !(a >= 0.0)) return o;
+    o.on = true;
+    o.stand_s = a;
+    if (n >= 2) o.debug = d;
+    RCLCPP_INFO(
+      rclcpp::get_logger("static_obstacle_avoidance"),
+      "[NERO_SOA_FRAG_STAND] on: release the fragment stop after %.1f s standing when the approved line keeps the hard margin",
+      o.stand_s);
+    return o;
+  }();
+  return c;
+}
+std::mutex g_mtx;
+std::map<const void *, double> g_stand_since;                         // per module instance: ego standing since (s)
+std::map<const void *, std::set<std::string>> g_released;             // per module instance: released vehicle ids
+std::map<const void *, std::set<std::string>> g_creep;                // per module instance: creeping toward the near end
+}  // namespace nero_frag_stand
+// the id the fragment loop of this cycle lets creep (set and read in the same cycle, same thread)
+thread_local std::string nero_frag_creep_id;
+
+// nero soa-2 (2026-11-16, Area 2 of the 11-15 drive, case B8: a waste container read PEDESTRIAN made a 1.5 m shift in a 3 m
+// lane; the body went 0.41 m into the next lane in front of cars coming from behind at 50-63 km/h).
+// NERO_SOA_SIDE_LANE=<x_out m>[,<in_lane 0|1>[,<pause 0|1>[,<t_hard s>[,<debug>]]]] (unset / x_out <= 0 = the car):
+//  A  the shift-side safety check of a plan whose body LEAVES the lane uses lateral_distance_max_threshold >= x_out (upstream's
+//     default 2.0; the car's 0.4 was tuned 10-18 for in-lane nudges) for every moving, not oncoming object that is not
+//     entirely ahead of ego's front (the cars ego would move out in front of); front / oncoming / standing objects as stock.
+//  B  (in_lane) a plan whose body stays in the lane judges those objects by time-matched bodies + the stock lateral margin
+//     only (no RSS longitudinal distance: it protects a car ego cuts in front of; an in-lane nudge cuts in front of nobody,
+//     and a fast car's ~100 m RSS box along its own heading swept into ego's lane: soa-1's f6 yield on a 0.5 m nudge).
+//  C  (pause) once the move out has begun (isShifted) with the body still in its lane and A's object unsafe: hold the
+//     shift at the in-lane limit (overtake v6's pause machinery), pass at it if it keeps every target's hard margin (max
+//     over t_hard s: label flicker), else stop before the target (gently where possible, never above 2.5 m/s2: else stock);
+//     resume after 1 s with no A-type unsafe object.
+namespace nero_side
+{
+struct Cfg
+{
+  bool on{false};
+  double x_out{2.0};
+  bool in_lane{true};
+  bool pause{true};
+  double t_hard{3.0};
+  int debug{0};
+};
+const Cfg & cfg()
+{
+  static const Cfg c = [] {
+    Cfg o;
+    const char * e = std::getenv("NERO_SOA_SIDE_LANE");
+    if (e == nullptr || *e == '\0') return o;
+    double x = 0.0, t = 3.0;
+    int in = 1, pa = 1, d = 0;
+    const int n = std::sscanf(e, "%lf,%d,%d,%lf,%d", &x, &in, &pa, &t, &d);
+    if (n < 1 || !(x > 0.0)) return o;
+    o.on = true;
+    o.x_out = x;
+    if (n >= 2) o.in_lane = in > 0;
+    if (n >= 3) o.pause = pa > 0;
+    if (n >= 4 && t >= 0.0) o.t_hard = t;
+    if (n >= 5) o.debug = d;
+    RCLCPP_INFO(
+      rclcpp::get_logger("static_obstacle_avoidance"),
+      "[NERO_SOA_SIDE] on: x_out %.2f m (plan leaving the lane, cars behind / alongside), in-lane plans without RSS's "
+      "longitudinal terms %d, pause at the in-lane limit %d, hard margin kept %.1f s, debug %d",
+      o.x_out, o.in_lane, o.pause, o.t_hard, o.debug);
+    return o;
+  }();
+  return c;
+}
+std::mutex g_mtx;
+// per module instance, per object id: (time, |hard-margin shift|) of the last t_hard s
+std::map<const void *, std::map<std::string, std::deque<std::pair<double, double>>>> g_need;
+}  // namespace nero_side
+
+// nero soa-2 (Area 2 B5, 11-15 14:49:58): NERO_SOA_DEFICIT_STOP=<max deficit m>[,<debug>] (unset = the car). A NEED_DECELERATION
+// stop target whose hard-margin deficit (the shift that keeps its class hard margin minus the shift the robot's line already
+// has at it) is at most <max deficit> (0.2 = the vehicle hard margin 0.3 minus obstacle_stop's 0.1: the robot's line still
+// clears what obstacle_stop guards) gets its stop where a nominal stop (-1.0 m/s2, 0.5 m/s3) ends, never harder than the
+// module's hard constraints (-1.5 m/s2, 1.0 m/s3) and never past the target's near end - front - 1.0 m; stock ("reliable":
+// the module's own stop line, comfort ignored) for bigger deficits or when even that does not fit. B5: a standing truck's
+// FALSE-speed rows put its corner 0.13 m into the hard margin 8.7 m ahead -> stop at the module's line 1.2-2.1 m ahead,
+// -2.9 / -4.0 m/s2.
+namespace nero_deficit
+{
+struct Cfg
+{
+  bool on{false};
+  double max_deficit{0.2};
+  int debug{0};
+};
+const Cfg & cfg()
+{
+  static const Cfg c = [] {
+    Cfg o;
+    const char * e = std::getenv("NERO_SOA_DEFICIT_STOP");
+    if (e == nullptr || *e == '\0') return o;
+    double d = 0.0;
+    int dbg = 0;
+    const int n = std::sscanf(e, "%lf,%d", &d, &dbg);
+    if (n < 1 || !(d > 0.0)) return o;
+    o.on = true;
+    o.max_deficit = d;
+    if (n >= 2) o.debug = dbg;
+    RCLCPP_INFO(
+      rclcpp::get_logger("static_obstacle_avoidance"),
+      "[NERO_SOA_DEFICIT] on: a NEED_DECELERATION stop for a hard-margin deficit <= %.2f m is placed where a nominal stop ends "
+      "(<= the module's hard constraints, before the target), debug %d",
+      o.max_deficit, o.debug);
+    return o;
+  }();
+  return c;
+}
+}  // namespace nero_deficit
 
 namespace
 {
@@ -1146,6 +1292,16 @@ AvoidanceState StaticObstacleAvoidanceModule::getCurrentModuleState(
     return AvoidanceState::RUNNING;
   }
 
+  // NERO_SOA_SIDE_LANE: the side wait's target is still ahead (it may read INSUFFICIENT_* for a cycle): keep the module
+  // (and its stop) instead of exiting and re-entering beside the target
+  if (!nero_side_wait_id_.empty()) {
+    for (const auto & o : data.target_objects) {
+      if (to_hex_string(o.object.object_id) == nero_side_wait_id_ && o.longitudinal > 0.0) {
+        return AvoidanceState::RUNNING;
+      }
+    }
+  }
+
   // If the ego is on the shift line, keep RUNNING.
   {
     const size_t idx = planner_data_->findEgoIndex(path_shifter_.getReferencePath().points);
@@ -1909,6 +2065,9 @@ void StaticObstacleAvoidanceModule::fillEgoStatus(
   autoware_utils::ScopedTimeTrack st(__func__, *time_keeper_);
   data.state = getCurrentModuleState(data);
   nero_hold_now_ = false;
+  if (nero_side::cfg().on && nero_side::cfg().pause) {
+    neroSideNeedHard(data, true);  // NERO_SOA_SIDE_LANE: the targets' hard-margin history, every cycle
+  }
 
   /**
    * Find the nearest object that should be avoid. When the ego follows reference path,
@@ -2025,6 +2184,15 @@ void StaticObstacleAvoidanceModule::fillEgoStatus(
       }
       return;
     }
+  }
+
+  // NERO_SOA_SIDE_LANE (C): the move out has begun, the body is still in its lane, and a car behind / alongside makes the
+  // out-of-lane plan unsafe: hold at the in-lane limit (stock: overwritten with "safe" below, the body leaves the lane in
+  // front of the car; NERO_SOA_HOLD_IN_LANE only when a stop before the line is reachable at <= 1 m/s2)
+  if (nero_side::cfg().on && nero_side::cfg().pause && neroSidePause(data)) {
+    data.yield_required = false;
+    data.safe_shift_line.clear();
+    return;
   }
 
   /**
@@ -2366,6 +2534,11 @@ void StaticObstacleAvoidanceModule::updateEgoBehavior(
       return;
     }
 
+    // NERO_SOA_SIDE_LANE: the latched side wait (stock's own wait point while it is still ahead of ego)
+    if (!nero_side_wait_id_.empty() && neroInsertSideWait(data, path)) {
+      return;
+    }
+
     if (data.yield_required) {
       insertWaitPoint(isBestEffort(parameters_->policy_deceleration), path);
       return;
@@ -2396,6 +2569,55 @@ void StaticObstacleAvoidanceModule::updateEgoBehavior(
             o, helper_->getShift(o.getPosition()), planner_data_->parameters.vehicle_width, parameters_)) {
         continue;
       }
+      if (nero_frag_stand::cfg().on) {  // NERO_SOA_FRAG_STAND (soa-1)
+        const auto id = to_hex_string(o.object.object_id);
+        const double approved = helper_->getShift(o.getPosition());
+        const bool keeps_hard = utils::static_obstacle_avoidance::nero_frag::keepsHardMargin(
+          o, approved, planner_data_->parameters.vehicle_width, parameters_);
+        const double now = clock_->now().seconds();
+        std::lock_guard<std::mutex> lk(nero_frag_stand::g_mtx);
+        auto & rel = nero_frag_stand::g_released[this];
+        if (rel.count(id) > 0) {
+          if (keeps_hard) continue;  // released and still keeping the hard margin
+          rel.erase(id);
+        }
+        auto & creep = nero_frag_stand::g_creep[this];
+        auto since_it = nero_frag_stand::g_stand_since.find(this);
+        if (since_it == nero_frag_stand::g_stand_since.end()) {
+          since_it = nero_frag_stand::g_stand_since.emplace(this, -1.0).first;  // not standing yet (a default 0.0 read as "since t=0")
+        }
+        auto & since = since_it->second;
+        if (getEgoSpeed() < 0.1) {
+          if (since < 0.0) since = now;
+        } else {
+          since = -1.0;
+        }
+        if (keeps_hard && since >= 0.0 && now - since >= nero_frag_stand::cfg().stand_s) {
+          rel.insert(id);
+          RCLCPP_INFO(
+            getLogger(),
+            "[NERO_SOA_FRAG_STAND] %s: stood %.1f s at the fragment stop, the approved shift %.2f m keeps the hard margin: "
+            "released",
+            id.substr(0, 8).c_str(), now - since, approved);
+          creep.erase(id);
+          continue;
+        }
+        if (since >= 0.0 && now - since >= nero_frag_stand::cfg().stand_s && creep.count(id) == 0) {
+          // standing held: the module's bigger line can only become ready / grow while ego moves forward: let ego creep
+          // toward the vehicle's near end (the stop moves there) along the registered line; the stop releases as stock
+          // once a line keeps the margin, else ego stops before the vehicle
+          creep.insert(id);
+          RCLCPP_INFO(
+            getLogger(), "[NERO_SOA_FRAG_STAND] %s: stood %.1f s, approved %.2f m < hard margin: creep toward its near end",
+            id.substr(0, 8).c_str(), now - since, approved);
+        }
+        nero_frag_creep_id = creep.count(id) > 0 ? id : std::string();
+        if (nero_frag_stand::cfg().debug > 0) {
+          RCLCPP_INFO_THROTTLE(
+            getLogger(), *clock_, 1000, "[NERO_SOA_FRAG_STAND] %s: hold (stood %.1f s, approved %.2f m, keeps hard %d)",
+            id.substr(0, 8).c_str(), since >= 0.0 ? now - since : 0.0, approved, static_cast<int>(keeps_hard));
+        }
+      }
       // firm, not hard: when the module's own stop line is already inside its max_deceleration (-1.5) stopping
       // distance, stop at -2.0 m/s2 / 2.0 m/s3 (the robot otherwise reached the car's near end at 2.4 m/s when it was
       // classified 10 m out at 16 km/h); a hard brake is <= -2.5
@@ -2406,9 +2628,15 @@ void StaticObstacleAvoidanceModule::updateEgoBehavior(
       const auto firm = autoware::motion_utils::calcDecelDistWithJerkAndAccConstraints(
         getEgoSpeed(), 0.0, planner_data_->self_acceleration->accel.accel.linear.x, FIRM_DECEL, FIRM_JERK,
         -FIRM_JERK);
-      const double stop_distance = std::max(
+      double stop_distance = std::max(
         std::min(o.to_stop_line, to_near),
         firm ? firm.value() : helper_->getFeasibleDecelDistance(0.0, true));
+      if (nero_frag_stand::cfg().on && !nero_frag_creep_id.empty() &&
+          nero_frag_creep_id == to_hex_string(o.object.object_id)) {
+        // NERO_SOA_FRAG_STAND: creeping: the robot's front may reach the vehicle's near end (without the stop buffer: a
+        // forward segment of <= ~1 m never starts on this robot; obstacle_stop / AEB still guard the last metre)
+        stop_distance = std::max(to_near + parameters_->stop_buffer, 0.0);
+      }
       utils::static_obstacle_avoidance::insertDecelPoint(
         getEgoPosition(), stop_distance, 0.0, path.path, stop_pose_);
       if (stop_pose_) nero_frag_stop = NeroFragStop{o.object.object_id, stop_pose_->pose.position};
@@ -2464,6 +2692,43 @@ void StaticObstacleAvoidanceModule::updateEgoBehavior(
 
     if (!data.avoid_required) {
       return;
+    }
+
+    // NERO_SOA_DEFICIT_STOP: a small hard-margin deficit gets a stop that ends before the target, not a firm one at the line
+    if (
+      nero_deficit::cfg().on && data.stop_target_object &&
+      data.stop_target_object->info == ObjectInfo::NEED_DECELERATION &&
+      !data.stop_target_object->overhang_points.empty()) {
+      const auto & o = data.stop_target_object.value();
+      const auto & op = parameters_->object_parameters.at(utils::getHighestProbLabel(o.object.classification));
+      const double hard = o.is_parked ? op.lateral_hard_margin_for_parked_vehicle : op.lateral_hard_margin;
+      const double need = utils::static_obstacle_avoidance::calcShiftLength(
+        utils::static_obstacle_avoidance::isOnRight(o), o.overhang_points.front().first,
+        0.5 * planner_data_->parameters.vehicle_width + hard);
+      const double sg = need >= 0.0 ? 1.0 : -1.0;
+      const double has = std::max(0.0, sg * helper_->getShift(o.getPosition()));
+      const double deficit = std::abs(need) - has;
+      const double d_max = o.longitudinal - planner_data_->parameters.base_link2front - nero_ovl::BESIDE_MARGIN;
+      if (deficit <= nero_deficit::cfg().max_deficit && d_max > 0.0) {
+        const double d_hard = helper_->getFeasibleDecelDistance(0.0, true);
+        if (d_hard <= d_max) {
+          const double line = data.to_stop_line < 1e6 ? data.to_stop_line : -1.0;
+          const double d = std::clamp(std::max(line, helper_->getFeasibleDecelDistance(0.0, false)), d_hard, d_max);
+          utils::static_obstacle_avoidance::insertDecelPoint(getEgoPosition(), d, 0.0, path.path, stop_pose_);
+          RCLCPP_INFO_THROTTLE(
+            getLogger(), *clock_, 500,
+            "[NERO_SOA_DEFICIT] %s needs %.2f m for its hard margin, the line has %.2f (deficit %.2f <= %.2f): stop %.1f m ahead "
+            "(module's line %.1f, its near end %.1f, v %.2f)",
+            to_hex_string(o.object.object_id).substr(0, 4).c_str(), std::abs(need), has, deficit,
+            nero_deficit::cfg().max_deficit, d, line, o.longitudinal, getEgoSpeed());
+          return;
+        }
+      }
+      if (nero_deficit::cfg().debug >= 1) {
+        RCLCPP_INFO_THROTTLE(
+          getLogger(), *clock_, 500, "[NERO_SOA_DEFICIT] %s deficit %.2f m (max %.2f), room %.1f m: stock stop",
+          to_hex_string(o.object.object_id).substr(0, 4).c_str(), deficit, nero_deficit::cfg().max_deficit, d_max);
+      }
     }
 
     if (!data.found_avoidance_path) {
@@ -2793,6 +3058,9 @@ bool StaticObstacleAvoidanceModule::neroOncomingPause(AvoidancePlanningData & da
   const auto & e = nero_ovl::env();
   if (e.pause_margin < 0.0) {
     return false;
+  }
+  if (nero_side_pause_) {
+    return false;  // NERO_SOA_SIDE_LANE's pause (same machinery): neroSidePause keeps / ends it
   }
   const double now = clock_->now().seconds();
   if (nero_paused_) {
@@ -3388,6 +3656,421 @@ void StaticObstacleAvoidanceModule::neroFreezeShift(
   }
   path_shifter_.setShiftLines(lines);
   generator_.reset();
+}
+
+// ---- NERO_SOA_SIDE_LANE (soa-2; namespace nero_side above) ----
+bool StaticObstacleAvoidanceModule::neroPlanLeavesLane(const ShiftedPath & shifted_path, const bool update) const
+{
+  // the planned body leaves ego's lanes somewhere ahead: the vehicle footprint at every shifted path point (with its yaw)
+  // against the current lanes' polygon (the narrowest place counts, not the width at ego); `update` (isSafePath, once a
+  // cycle) keeps a plan "out" until its largest shift is 0.1 m inside the in-lane limit at ego (hysteresis at the line)
+  const auto & pts = shifted_path.path.points;
+  if (pts.empty() || shifted_path.shift_length.size() != pts.size()) return false;
+  const auto ego_idx = planner_data_->findEgoIndex(pts);
+  double max_l = 0.0, max_r = 0.0;
+  for (size_t i = ego_idx; i < pts.size(); ++i) {
+    max_l = std::max(max_l, shifted_path.shift_length.at(i));
+    max_r = std::max(max_r, -shifted_path.shift_length.at(i));
+  }
+  bool out = false;
+  const double th = parameters_->lateral_execution_threshold;
+  if ((max_l > th || max_r > th) && !avoid_data_.current_lanelets.empty()) {
+    // the combined polygon of the current lanes, rebuilt only when the lane set changes (map geometry is fixed: same ids =
+    // the same polygon; the rebuild cost several ms a cycle at junctions with many lanelets)
+    std::vector<lanelet::Id> ids;
+    ids.reserve(avoid_data_.current_lanelets.size());
+    for (const auto & ll : avoid_data_.current_lanelets) ids.push_back(ll.id());
+    if (ids != nero_side_poly_ids_) {
+      nero_side_poly_ = lanelet::utils::combineLaneletsShape(avoid_data_.current_lanelets).polygon2d().basicPolygon();
+      nero_side_poly_ids_ = ids;
+    }
+    const auto & lane_polygon = nero_side_poly_;
+    for (size_t i = ego_idx; i < pts.size() && !out; ++i) {
+      if (std::abs(shifted_path.shift_length.at(i)) <= th) continue;
+      out = !utils::isEgoWithinOriginalLane(
+        lane_polygon, pts.at(i).point.pose, planner_data_->parameters, 0.0);
+    }
+  }
+  if (update) {
+    const auto lim_l = neroInLaneShiftLimit(avoid_data_, true, 0.0);
+    const auto lim_r = neroInLaneShiftLimit(avoid_data_, false, 0.0);
+    if (
+      !out && nero_side_plan_out_ && lim_l && lim_r &&
+      (max_l > lim_l.value() - 0.1 || max_r > lim_r.value() - 0.1)) {
+      out = true;
+    }
+    nero_side_plan_out_ = out;
+  }
+  return out;
+}
+
+const utils::path_safety_checker::RSSparams & StaticObstacleAvoidanceModule::neroSideRss(
+  const utils::path_safety_checker::ExtendedPredictedObject & object, const bool plan_out, int & kind) const
+{
+  kind = 0;
+  const auto & stock = parameters_->rss_params;
+  const auto & c = nero_side::cfg();
+  if (!c.on) return stock;
+  const double v = std::hypot(object.initial_twist.linear.x, object.initial_twist.linear.y);
+  const auto & op = parameters_->object_parameters.at(object.classification.label);
+  if (v <= op.moving_speed_threshold) return stock;  // standing / slow: stock
+  if (utils::path_safety_checker::isTargetObjectOncoming(getEgoPose(), object.initial_pose)) return stock;
+  // entirely ahead of ego's front (a car ego follows or moves in behind): stock
+  const auto poly = autoware_utils::to_polygon2d(object.initial_pose, object.shape);
+  const auto front = autoware_utils::calc_offset_pose(
+    getEgoPose(), planner_data_->parameters.vehicle_info.max_longitudinal_offset_m, 0.0, 0.0);
+  bool all_ahead = true;
+  for (const auto & q : poly.outer()) {
+    if (autoware_utils::calc_longitudinal_deviation(front, autoware_utils::create_point(q.x(), q.y(), 0.0)) <= 0.0) {
+      all_ahead = false;
+      break;
+    }
+  }
+  if (all_ahead) return stock;
+  if (plan_out) {  // A
+    if (!nero_rss_out_) {
+      nero_rss_out_ = stock;
+      nero_rss_out_->lateral_distance_max_threshold = std::max(stock.lateral_distance_max_threshold, c.x_out);
+    }
+    kind = 1;
+    return nero_rss_out_.value();
+  }
+  // B: motor vehicles only (people / bicycles / UNKNOWN keep the car's check)
+  const auto label = object.classification.label;
+  const bool motor = label == ObjectClassification::CAR || label == ObjectClassification::TRUCK ||
+                     label == ObjectClassification::BUS || label == ObjectClassification::TRAILER ||
+                     label == ObjectClassification::MOTORCYCLE;
+  if (c.in_lane && motor) {
+    if (!nero_rss_in_) {
+      // no RSS reaction / braking distance (ego cuts in front of nobody), but the box still reaches 3.0 m + 0.5 s of its
+      // speed ahead along its heading: the check samples every 0.5 s, a fast car must not step over ego between samples
+      auto r = stock;
+      r.rear_vehicle_reaction_time = 0.0;
+      r.rear_vehicle_safety_time_margin = 0.0;
+      r.rear_vehicle_deceleration = -1.0e6;
+      r.longitudinal_distance_min_threshold = std::max(stock.longitudinal_distance_min_threshold, 3.0);
+      r.longitudinal_velocity_delta_time = std::max(stock.longitudinal_velocity_delta_time, 0.5);
+      nero_rss_in_ = r;
+    }
+    kind = 2;
+    return nero_rss_in_.value();
+  }
+  return stock;
+}
+
+double StaticObstacleAvoidanceModule::neroSideNeedHard(const AvoidancePlanningData & data, const bool left) const
+{
+  // per target not yet passed: the signed shift that keeps its class HARD margin (keepsHardMargin's formula), remembered
+  // t_hard s; returns the largest toward `left` (left > 0) over the targets and their last t_hard s
+  const auto & c = nero_side::cfg();
+  const double now = clock_->now().seconds();
+  const double w = planner_data_->parameters.vehicle_width;
+  std::lock_guard<std::mutex> lk(nero_side::g_mtx);
+  auto & H = nero_side::g_need[this];
+  for (const auto & o : data.target_objects) {
+    if (o.overhang_points.empty() || o.longitudinal + o.length < 0.0) continue;
+    const auto & op = parameters_->object_parameters.at(utils::getHighestProbLabel(o.object.classification));
+    const double hard = o.is_parked ? op.lateral_hard_margin_for_parked_vehicle : op.lateral_hard_margin;
+    const double n = utils::static_obstacle_avoidance::calcShiftLength(
+      utils::static_obstacle_avoidance::isOnRight(o), o.overhang_points.front().first, 0.5 * w + hard);
+    auto & q = H[to_hex_string(o.object.object_id)];
+    if (q.empty() || now - q.back().first > 1.0e-3) q.emplace_back(now, n);
+  }
+  double need = 0.0;
+  for (auto it = H.begin(); it != H.end();) {
+    auto & q = it->second;
+    while (!q.empty() && now - q.front().first > c.t_hard) q.pop_front();
+    if (q.empty()) {
+      it = H.erase(it);
+      continue;
+    }
+    for (const auto & tn : q) need = std::max(need, left ? tn.second : -tn.second);
+    ++it;
+  }
+  return need;
+}
+
+bool StaticObstacleAvoidanceModule::neroSidePause(AvoidancePlanningData & data) const
+{
+  const auto & c = nero_side::cfg();
+  if (!c.on || !c.pause) return false;
+  if (nero_paused_ && !nero_side_pause_) return false;  // overtake v6's pause owns the path
+  const double now = clock_->now().seconds();
+  const double front = planner_data_->parameters.base_link2front;
+  const double v = getEgoSpeed();
+  const auto set_stop = [&](const double room) {
+    // the stop before the target (its near end - front - 1.0 m): at the module's own stop line for it when that is
+    // reachable at <= 1.5 m/s2 (room to shift from standstill), else the nearest point a 1.0 m/s2 stop reaches; never if
+    // it needs > 2.5 m/s2 (overtake v6's STOP_DECEL; then stock)
+    const double d_max = room - front - nero_ovl::BESIDE_MARGIN;
+    const double line = data.stop_target_object && data.to_stop_line < 1e6 ? data.to_stop_line : -1.0;
+    const auto dd = neroSideStopDistance(line, d_max);
+    if (!dd) return false;
+    const double d = dd.value();
+    const auto idx = utils::static_obstacle_avoidance::findPathIndexFromArclength(data.arclength_from_ego, d);
+    if (idx >= data.reference_path.points.size()) return false;
+    nero_side_stop_ = data.reference_path.points.at(idx).point.pose.position;
+    return true;
+  };
+
+  if (nero_side_pause_) {
+    if (!nero_paused_) {  // ended elsewhere (a module reset)
+      nero_side_pause_ = false;
+      nero_side_stop_.reset();
+      return false;
+    }
+    const auto td = neroPauseTargetDistance(data);
+    if (!td) {  // a target can drop out for a cycle (a CAR row of a container): end only after 1 s without one
+      if (nero_side_notgt_since_ < 0.0) nero_side_notgt_since_ = now;
+      if (now - nero_side_notgt_since_ < 1.0) return true;
+      RCLCPP_WARN(getLogger(), "[NERO_SOA_SIDE] pause ends: no target ahead for 1 s");
+      nero_paused_ = false;
+      nero_side_pause_ = false;
+      nero_side_stop_.reset();
+      return false;
+    }
+    nero_side_notgt_since_ = -1.0;
+    // pass / stop re-decided each cycle (the hard need is a max over t_hard s: a label change takes t_hard to lower it)
+    const bool left = nero_pause_shift_ > 0.0;
+    const double need = neroSideNeedHard(data, left);
+    // pass while the hold keeps the hard margin; a stop only once the need exceeds the hold by 5 cm (no 1 cm knife edge)
+    const bool pass_now = nero_side_pass_ ? std::abs(nero_pause_shift_) >= need - 0.05 : std::abs(nero_pause_shift_) >= need - 1.0e-3;
+    if (pass_now && !nero_side_pass_) {
+      nero_side_pass_ = true;
+      nero_side_stop_.reset();
+      RCLCPP_WARN(
+        getLogger(), "[NERO_SOA_SIDE] the hold %.2f m now keeps every target's hard margin (need %.2f): pass at it",
+        nero_pause_shift_, need);
+    } else if (!pass_now && nero_side_pass_) {
+      if (set_stop(td.value())) {
+        nero_side_pass_ = false;
+        RCLCPP_WARN(
+          getLogger(), "[NERO_SOA_SIDE] the hold %.2f m no longer keeps the hard margin (need %.2f): stop before the target",
+          nero_pause_shift_, need);
+      } else {
+        RCLCPP_WARN_THROTTLE(
+          getLogger(), *clock_, 500,
+          "[NERO_SOA_SIDE] the hold %.2f m no longer keeps the hard margin (need %.2f) but no stop <= %.1f m/s2 fits "
+          "before the target (%.1f m, v %.2f): passing at the hold",
+          nero_pause_shift_, need, nero_ovl::STOP_DECEL, td.value(), v);
+      }
+    }
+    // the pause ends after 1 s in which no car behind / alongside made the plan unsafe: an out-of-lane candidate must be
+    // safe on those cycles, an in-lane one (the target reads e.g. BICYCLE now) needs nothing more (B judges it once the
+    // module has the path back); the plan may flick between the two from cycle to cycle (label rows)
+    const bool free_now = !nero_side_unsafe_ && !nero_onc_ && nero_corridor_blocker_.empty() && (!nero_side_plan_out_ || data.safe);
+    if (!free_now) {
+      nero_side_clear_since_ = -1.0;
+      if (c.debug >= 1) {
+        RCLCPP_INFO_THROTTLE(
+          getLogger(), *clock_, 1000, "[NERO_SOA_SIDE] paused: hold %.2f m, %s, target %.1f m, need %.2f, %s",
+          nero_pause_shift_, nero_side_pass_ ? "pass at the hold" : "stop before it", td.value(), need,
+          nero_side_unsafe_ ? nero_side_who_.c_str() : (nero_onc_ ? "oncoming" : (!nero_corridor_blocker_.empty() ? "corridor" : "out-of-lane plan not safe yet")));
+      }
+      return true;
+    }
+    if (nero_side_clear_since_ < 0.0) nero_side_clear_since_ = now;
+    if (now - nero_side_clear_since_ < nero_ovl::RESUME_SAFE_S) return true;
+    RCLCPP_WARN(
+      getLogger(), "[NERO_SOA_SIDE] no car behind / alongside makes the plan unsafe for %.1f s (plan %s): the pause ends (ego shift %.2f, v %.2f)",
+      nero_ovl::RESUME_SAFE_S, nero_side_plan_out_ ? "out of the lane" : "in the lane", helper_->getEgoShift(), v);
+    nero_paused_ = false;
+    nero_side_pause_ = false;
+    nero_side_stop_.reset();
+    return false;
+  }
+
+  // trigger
+  if (!nero_side_unsafe_ || !helper_->isShifted() || nero_cgw_active_) return false;
+  const auto td = neroPauseTargetDistance(data);
+  if (!td) return false;
+  // the shift the plan is heading for (largest in the next 50 m of this cycle's candidate path)
+  double desired = 0.0;
+  {
+    const auto & sp = data.candidate_path;
+    if (!sp.path.points.empty() && sp.shift_length.size() == sp.path.points.size()) {
+      const auto idx = planner_data_->findEgoIndex(sp.path.points);
+      double s = 0.0;
+      for (size_t i = idx; i < sp.path.points.size() && s < 50.0; ++i) {
+        if (i > idx) s += autoware_utils::calc_distance2d(sp.path.points.at(i - 1), sp.path.points.at(i));
+        if (std::abs(sp.shift_length.at(i)) > std::abs(desired)) desired = sp.shift_length.at(i);
+      }
+    }
+  }
+  if (std::abs(desired) < 0.1) return false;
+  const double sign = desired > 0.0 ? 1.0 : -1.0;
+  const bool left = desired > 0.0;
+  const auto lim0 = neroInLaneShiftLimit(data, left, 0.0);
+  if (!lim0 || !nero_side_plan_out_) return false;  // the plan stays in the lane: B's business
+  const double actual = sign * nero_mu::calcLateralOffset(data.reference_path.points, getEgoPosition());
+  // ego's front corner on that side with its yaw against the lane (a robot turning out reaches the line with the corner)
+  const auto & rp = data.reference_path.points.at(data.ego_closest_path_index).point.pose;
+  const double dyaw = autoware_utils::normalize_radian(tf2::getYaw(getEgoPose().orientation) - tf2::getYaw(rp.orientation));
+  const double corner = actual + std::abs(std::sin(dyaw)) * front - (1.0 - std::cos(dyaw)) * 0.5 * planner_data_->parameters.vehicle_width;
+  if (!(corner < lim0.value())) return false;  // the body is already over the line: stock
+  const double room = td.value();
+  const double pm = nero_ovl::env().pause_margin >= 0.0 ? nero_ovl::env().pause_margin : 0.5;
+  const double need = neroSideNeedHard(data, left);
+  std::optional<double> hold;
+  double target = 0.0, ease = nero_ovl::MIN_EASE_DISTANCE;
+  bool pass = false;
+  for (const double margin : {pm, std::min(pm, 0.1)}) {
+    const auto h = neroInLaneShiftLimit(data, left, margin);
+    if (!h) return false;
+    const double lim = std::min(h.value(), sign * desired);
+    pass = lim >= need - 1.0e-3;
+    // passing: move to the hold; stopping anyway: no further out than now (+0.05), back to the hold if beyond it
+    const double tg = pass ? lim : (actual < lim ? std::min(actual + 0.05, lim) : lim);
+    ease = std::max(
+      nero_ovl::MIN_EASE_DISTANCE, autoware::motion_utils::calc_longitudinal_dist_from_jerk(
+                                     std::abs(tg - actual), helper_->getLateralMaxJerkLimit(), std::max(v, 1.0)));
+    if (room >= ease + front + nero_ovl::BESIDE_MARGIN) {
+      hold = h;
+      target = tg;
+      break;
+    }
+  }
+  if (!hold) {
+    RCLCPP_WARN_THROTTLE(
+      getLogger(), *clock_, 500, "[NERO_SOA_SIDE] %s unsafe for the move out, but no hold fits before the target (%.1f m): stock",
+      nero_side_who_.c_str(), room);
+    return false;
+  }
+  if (!pass && !set_stop(room)) {
+    RCLCPP_WARN_THROTTLE(
+      getLogger(), *clock_, 500,
+      "[NERO_SOA_SIDE] %s unsafe for the move out; the hold %.2f m does not keep the hard margin (need %.2f) and no stop <= "
+      "%.1f m/s2 fits before the target (%.1f m, v %.2f): stock",
+      nero_side_who_.c_str(), target, need, nero_ovl::STOP_DECEL, room, v);
+    return false;
+  }
+  nero_pause_shift_ = sign * target;
+  nero_pause_ease_ = ease;
+  nero_pause_desired_ = desired;
+  nero_pause_start_ = true;
+  nero_paused_ = true;
+  nero_pause_clear_since_ = -1.0;
+  nero_side_pause_ = true;
+  nero_side_pass_ = pass;
+  nero_side_clear_since_ = -1.0;
+  nero_side_notgt_since_ = -1.0;
+  nero_side_inlane_since_ = -1.0;
+  if (pass) nero_side_stop_.reset();
+  RCLCPP_WARN(
+    getLogger(),
+    "[NERO_SOA_SIDE] %s unsafe for the move out (plan %.2f m, ego %.2f m, corner %.2f m < line %.2f, v %.2f): hold %.2f m "
+    "within %.1f m; hard need %.2f -> %s (target %.1f m ahead%s)",
+    nero_side_who_.c_str(), desired, sign * actual, corner, lim0.value(), v, nero_pause_shift_, ease, need,
+    pass ? "pass at the hold" : "stop before the target", room,
+    pass ? "" : (", stop " + std::to_string(nero_mu::calcSignedArcLength(
+                                 data.reference_path.points, getEgoPosition(), nero_side_stop_.value())).substr(0, 5) +
+                 " m")
+                  .c_str());
+  return true;
+}
+
+std::optional<double> StaticObstacleAvoidanceModule::neroSideStopDistance(const double line, const double d_max) const
+{
+  // the earliest point a stop within the module's hard constraints reaches from ego's current speed AND acceleration
+  // (max_deceleration / max_jerk: -1.5 m/s2, 1.0 m/s3; a robot still accelerating needs more room than v^2 / 2a), no
+  // nearer than the module's own stop line (room to shift from standstill) or, without one, a nominal stop (-1.0 m/s2,
+  // 0.5 m/s3); never past d_max; if only a firm stop (overtake v6's 2.5 m/s2, 2.5 m/s3) fits, at d_max; else none
+  if (d_max <= 0.0) return std::nullopt;
+  const double d_hard = helper_->getFeasibleDecelDistance(0.0, true);
+  if (d_hard <= d_max) {
+    const double base = line > 0.0 ? line : helper_->getFeasibleDecelDistance(0.0, false);
+    return std::clamp(base, d_hard, d_max);
+  }
+  const auto firm = autoware::motion_utils::calcDecelDistWithJerkAndAccConstraints(
+    getEgoSpeed(), 0.0, planner_data_->self_acceleration->accel.accel.linear.x, -nero_ovl::STOP_DECEL,
+    nero_ovl::STOP_DECEL, -nero_ovl::STOP_DECEL);
+  if (firm && firm.value() <= d_max) return d_max;
+  return std::nullopt;
+}
+
+void StaticObstacleAvoidanceModule::neroSideWaitUpdate(const AvoidancePlanningData & data) const
+{
+  const double now = clock_->now().seconds();
+  if (nero_side_wait_id_.empty()) {
+    // latch: this cycle yields (not yet moving sideways) because a car behind / alongside makes the out-of-lane pass unsafe
+    if (data.yield_required && nero_side_unsafe_ && data.stop_target_object) {
+      nero_side_wait_id_ = to_hex_string(data.stop_target_object->object.object_id);
+      nero_side_wait_since_ = now;
+      nero_side_wait_log_ = now;
+      RCLCPP_WARN(
+        getLogger(),
+        "[NERO_SOA_SIDE] wait before %s: its pass is unsafe for %s %s (stop line %.1f m, v %.2f); kept until ego "
+        "has started its shift or passed it",
+        nero_side_wait_id_.substr(0, 4).c_str(), nero_side_who_.c_str(),
+        nero_side_plan_out_ ? "(out of the lane)" : "(in the lane)", data.to_stop_line, getEgoSpeed());
+    }
+    return;
+  }
+  const ObjectData * t = nullptr;
+  for (const auto & o : data.target_objects) {
+    if (to_hex_string(o.object.object_id) == nero_side_wait_id_) {
+      t = &o;
+      break;
+    }
+  }
+  const char * why = nullptr;
+  if (t == nullptr) {
+    why = "no longer a target";
+  } else if (t->longitudinal <= 0.0) {
+    why = "ego is beside it";
+  } else if (helper_->isShifted() && !path_shifter_.getShiftLines().empty()) {
+    why = "ego has started its shift";
+  } else if (nero_paused_) {
+    why = "a pause owns the path";
+  }
+  if (why != nullptr) {
+    RCLCPP_WARN(
+      getLogger(), "[NERO_SOA_SIDE] wait before %s ends after %.1f s: %s (v %.2f, ego shift %.2f)",
+      nero_side_wait_id_.substr(0, 4).c_str(), now - nero_side_wait_since_, why, getEgoSpeed(), helper_->getEgoShift());
+    nero_side_wait_id_.clear();
+    nero_side_wait_since_ = -1.0;
+  } else if (now - nero_side_wait_log_ > 5.0) {
+    nero_side_wait_log_ = now;
+    RCLCPP_WARN(
+      getLogger(), "[NERO_SOA_SIDE] still waiting before %s (%.0f s; %s)", nero_side_wait_id_.substr(0, 4).c_str(),
+      now - nero_side_wait_since_, nero_side_unsafe_ ? nero_side_who_.c_str() : magic_enum::enum_name(t->info).data());
+  }
+}
+
+bool StaticObstacleAvoidanceModule::neroInsertSideWait(
+  const AvoidancePlanningData & data, ShiftedPath & shifted_path) const
+{
+  // a stop before the latched target's near end (front + 1.0 m): at the module's own stop line when that is reachable at
+  // <= 1.5 m/s2, else where a 1.0 m/s2 stop ends; never if it needs > 2.5 m/s2 (then nothing here). Suspended while an
+  // approved line is registered and safe (ego must move forward to move sideways); back the cycle that line is lost.
+  if (data.safe && !data.yield_required && !path_shifter_.getShiftLines().empty()) return false;
+  const ObjectData * t = nullptr;
+  for (const auto & o : data.target_objects) {
+    if (to_hex_string(o.object.object_id) == nero_side_wait_id_) {
+      t = &o;
+      break;
+    }
+  }
+  if (t == nullptr) return false;
+  const double v = getEgoSpeed();
+  const double d_max = t->longitudinal - planner_data_->parameters.base_link2front - nero_ovl::BESIDE_MARGIN;
+  const bool same = data.stop_target_object && to_hex_string(data.stop_target_object->object.object_id) == nero_side_wait_id_;
+  const double line = same && data.to_stop_line < 1e6 ? data.to_stop_line : -1.0;
+  const auto dd = neroSideStopDistance(line, d_max);
+  if (!dd) {
+    RCLCPP_WARN_THROTTLE(
+      getLogger(), *clock_, 1000, "[NERO_SOA_SIDE] wait before %s: no stop <= %.1f m/s2 fits (%.1f m, v %.2f)",
+      nero_side_wait_id_.substr(0, 4).c_str(), nero_ovl::STOP_DECEL, d_max, v);
+    return false;
+  }
+  const double d = dd.value();
+  utils::static_obstacle_avoidance::insertDecelPoint(getEgoPosition(), std::max(d, 0.0), 0.0, shifted_path.path, stop_pose_);
+  if (nero_side::cfg().debug >= 1) {
+    RCLCPP_INFO_THROTTLE(
+      getLogger(), *clock_, 1000, "[NERO_SOA_SIDE] wait before %s: stop %.1f m ahead (its near end %.1f m, %s, v %.2f)",
+      nero_side_wait_id_.substr(0, 4).c_str(), d, t->longitudinal, magic_enum::enum_name(t->info).data(), v);
+  }
+  return true;
 }
 
 std::string StaticObstacleAvoidanceModule::neroReturnBlocker(
@@ -5213,6 +5896,18 @@ void StaticObstacleAvoidanceModule::neroInsertPauseStop(ShiftedPath & shifted_pa
   if (!target_distance) {
     return;
   }
+  if (nero_side_pause_) {  // NERO_SOA_SIDE_LANE: no stop while the hold keeps the hard margin, else at its stop point
+    if (nero_side_pass_ || !nero_side_stop_) {
+      return;
+    }
+    const double d_max =
+      target_distance.value() - planner_data_->parameters.base_link2front - nero_ovl::BESIDE_MARGIN;
+    const double d_pt =
+      nero_mu::calcSignedArcLength(shifted_path.path.points, getEgoPosition(), nero_side_stop_.value());
+    utils::static_obstacle_avoidance::insertDecelPoint(
+      getEgoPosition(), std::max(0.0, std::min(d_pt, d_max)), 0.0, shifted_path.path, stop_pose_);
+    return;
+  }
   const auto stop_distance =
     std::max(0.0, target_distance.value() - planner_data_->parameters.base_link2front - nero_ovl::BESIDE_MARGIN);
   utils::static_obstacle_avoidance::insertDecelPoint(
@@ -5224,6 +5919,7 @@ bool StaticObstacleAvoidanceModule::isSafePath(
 {
   autoware_utils::ScopedTimeTrack st(__func__, *time_keeper_);
   const auto & p = planner_data_->parameters;
+  nero_side_unsafe_ = false;  // NERO_SOA_SIDE_LANE: set below when A's object fails
 
   if (force_deactivated_) {
     return false;
@@ -5258,6 +5954,14 @@ bool StaticObstacleAvoidanceModule::isSafePath(
 
     return false;
   }();
+
+  // NERO_SOA_SIDE_LANE: where the planned body goes decides the side check (A / B); known before any early return
+  const bool nero_side_on = nero_side::cfg().on;
+  if (nero_side_on && !has_left_shift && !has_right_shift) {
+    nero_side_plan_out_ = false;
+  }
+  const bool nero_plan_out =
+    nero_side_on && (has_left_shift || has_right_shift) && neroPlanLeavesLane(shifted_path, true);
 
   if (!has_left_shift && !has_right_shift) {
     return true;
@@ -5300,7 +6004,42 @@ bool StaticObstacleAvoidanceModule::isSafePath(
     parameters_->object_parameters.at(ObjectClassification::UNKNOWN).lateral_hard_margin);
   std::vector<autoware_utils::Polygon2d> nero_sq_fps;
 
+  const double nero_now = clock_->now().seconds();
+  if (nero_side_on && !nero_plan_out && nero_now - nero_side_out_last_ > 1.0) {
+    nero_side_out_safe_ = false;  // no out-of-lane candidate for 1 s: its safe state is stale
+    nero_side_out_count_ = 0;
+  }
+  if (nero_plan_out) nero_side_out_last_ = nero_now;
+  // A's objects after the first unsafe one (isSafePath stops there): is any of them unsafe too (the side pause's trigger)
+  const auto nero_scan_rest = [&](const size_t from) {
+    for (size_t k = from; k < safety_check_target_objects.size() && !nero_side_unsafe_; ++k) {
+      const auto & ob = safety_check_target_objects.at(k);
+      int kk = 0;
+      const auto & rr = neroSideRss(ob, true, kk);
+      if (kk != 1) continue;
+      const auto op = autoware_utils::to_polygon2d(ob.initial_pose, ob.shape);
+      const bool fr = utils::path_safety_checker::isTargetObjectFront(getEgoPose(), op, p.vehicle_info.max_longitudinal_offset_m);
+      const auto & ep = fr ? ego_predicted_path_for_front_object : ego_predicted_path_for_rear_object;
+      for (const auto & opth : utils::path_safety_checker::getPredictedPathFromObj(ob, parameters_->check_all_predicted_path)) {
+        utils::path_safety_checker::CollisionCheckDebug dd;
+        if (!utils::path_safety_checker::checkCollision(
+              shifted_path.path, ep, ob, opth, p, rr, hysteresis_factor, parameters_->collision_check_yaw_diff_threshold, dd)) {
+          nero_side_unsafe_ = true;
+          const auto & q = ob.initial_pose.position;
+          char buf[128];
+          std::snprintf(
+            buf, sizeof(buf), "%s %.1f m %s %.1f m/s", to_hex_string(ob.uuid).substr(0, 4).c_str(),
+            std::hypot(q.x - getEgoPosition().x, q.y - getEgoPosition().y), fr ? "alongside" : "behind",
+            std::hypot(ob.initial_twist.linear.x, ob.initial_twist.linear.y));
+          nero_side_who_ = buf;
+          break;
+        }
+      }
+    }
+  };
+  size_t nero_idx = 0;
   for (const auto & object : safety_check_target_objects) {
+    ++nero_idx;
     auto current_debug_data = utils::path_safety_checker::createObjectDebug(object);
 
     const auto obj_polygon = autoware_utils::to_polygon2d(object.initial_pose, object.shape);
@@ -5370,29 +6109,84 @@ bool StaticObstacleAvoidanceModule::isSafePath(
       utils::path_safety_checker::updateCollisionCheckDebugMap(debug.collision_check, current_debug_data, ok);
       if (!ok) {
         nero_squeeze::lastUnsafeWasSqueeze() = true;  // field 13: this path failed only on a squeeze vehicle's clearance
+        if (nero_plan_out) nero_scan_rest(nero_idx);  // NERO_SOA_SIDE_LANE: a car behind may be unsafe too
         safe_count_ = 0;
         return false;
       }
       continue;
     }
 
+    int nero_kind = 0;
+    const auto & nero_rss =
+      nero_side_on ? neroSideRss(object, nero_plan_out, nero_kind) : parameters_->rss_params;
+    // NERO_SOA_SIDE_LANE debug: would the car's check (stock rss) give another verdict for this object?
+    const auto nero_stock_safe = [&]() {
+      for (const auto & op : obj_predicted_paths) {
+        utils::path_safety_checker::CollisionCheckDebug dd;
+        if (!utils::path_safety_checker::checkCollision(
+              shifted_path.path, ego_predicted_path, object, op, p, parameters_->rss_params, hysteresis_factor,
+              parameters_->collision_check_yaw_diff_threshold, dd)) {
+          return false;
+        }
+      }
+      return true;
+    };
     for (const auto & obj_path : obj_predicted_paths) {
       if (!utils::path_safety_checker::checkCollision(
-            shifted_path.path, ego_predicted_path, object, obj_path, p, parameters_->rss_params,
+            shifted_path.path, ego_predicted_path, object, obj_path, p, nero_rss,
             hysteresis_factor, parameters_->collision_check_yaw_diff_threshold,
             current_debug_data.second)) {
         utils::path_safety_checker::updateCollisionCheckDebugMap(
           debug.collision_check, current_debug_data, false);
+        if (nero_kind == 1 || nero_kind == 2) {  // a car behind / alongside (A: plan out of the lane, B: in the lane)
+          nero_side_unsafe_ = true;
+          const auto & q = object.initial_pose.position;
+          char buf[128];
+          std::snprintf(
+            buf, sizeof(buf), "%s %.1f m %s %.1f m/s", to_hex_string(object.uuid).substr(0, 4).c_str(),
+            std::hypot(q.x - getEgoPosition().x, q.y - getEgoPosition().y), is_object_front ? "alongside" : "behind",
+            v_norm);
+          nero_side_who_ = buf;
+          if (nero_kind == 1 && nero_side::cfg().debug >= 1 && nero_stock_safe()) {
+            RCLCPP_INFO_THROTTLE(
+              getLogger(), *clock_, 500,
+              "[NERO_SOA_SIDE] the plan leaves the lane: %s within %.1f m of it (%s) -> unsafe (the car's %.1f m: safe)",
+              nero_side_who_.c_str(), nero_rss.lateral_distance_max_threshold * hysteresis_factor,
+              current_debug_data.second.unsafe_reason.c_str(), parameters_->rss_params.lateral_distance_max_threshold);
+          }
+        }
+        if (nero_plan_out) {
+          nero_scan_rest(nero_idx);
+          nero_side_out_safe_ = false;
+          nero_side_out_count_ = 0;
+        }
 
         safe_count_ = 0;
         return false;
       }
+    }
+    if (nero_kind == 2 && nero_side::cfg().debug >= 1 && nero_now - nero_side_inlog_t_ > 0.5 && !nero_stock_safe()) {
+      nero_side_inlog_t_ = nero_now;  // the extra stock check runs only when its line would print (<= 2 Hz)
+      RCLCPP_INFO(
+        getLogger(),
+        "[NERO_SOA_SIDE] in-lane plan: %s (%.1f m/s, %s) unsafe only by RSS's longitudinal box (the car: yield), its body "
+        "stays %.2f m+ from ego's: kept",
+        to_hex_string(object.uuid).substr(0, 4).c_str(), v_norm, is_object_front ? "alongside" : "behind",
+        nero_rss.lateral_distance_max_threshold * hysteresis_factor);
     }
     utils::path_safety_checker::updateCollisionCheckDebugMap(
       debug.collision_check, current_debug_data, true);
   }
 
   safe_count_++;
+
+  // NERO_SOA_SIDE_LANE: an out-of-lane plan needs its own safe cycles (in-lane "safe" cycles must not carry it)
+  if (nero_plan_out && !nero_side_out_safe_) {
+    if (++nero_side_out_count_ <= parameters_->hysteresis_factor_safe_count) {
+      return false;
+    }
+    nero_side_out_safe_ = true;
+  }
 
   // NERO_SOA_START_SAFE_CYCLES: from (nearly) standstill the move starts only after N safe cycles in a row (one cycle
   // of "safe" between two cars was enough to start it, the next cycle was unsafe again)
@@ -5529,6 +6323,10 @@ bool StaticObstacleAvoidanceModule::neroIsSafeRaw(
   const auto * bumps = ctx ? &ctx->bumps : nullptr;
   const auto ego_front = neroEgoPredictedPath(shifted_path, true, v_hold, s_hold, bumps);
   const auto ego_rear = neroEgoPredictedPath(shifted_path, false, v_hold, s_hold, bumps);
+  // NERO_SOA_SIDE_LANE: the same side check as isSafePath (A / B), or the gap timing approves what isSafePath rejects
+  const bool nero_side_on = nero_side::cfg().on;
+  const bool nero_plan_out =
+    nero_side_on && (ctx ? ctx->side_plan_out : neroPlanLeavesLane(shifted_path));
   for (const auto & object : targets) {
     auto dbg = utils::path_safety_checker::createObjectDebug(object);
     const auto obj_polygon = autoware_utils::to_polygon2d(object.initial_pose, object.shape);
@@ -5542,9 +6340,12 @@ bool StaticObstacleAvoidanceModule::neroIsSafeRaw(
     const auto obj_predicted_paths = utils::path_safety_checker::getPredictedPathFromObj(
       object, parameters_->check_all_predicted_path);
     const auto & ego_path = is_object_front && !is_object_oncoming ? ego_front : ego_rear;
+    int nero_kind = 0;
+    const auto & nero_rss =
+      nero_side_on ? neroSideRss(object, nero_plan_out, nero_kind) : parameters_->rss_params;
     for (const auto & obj_path : obj_predicted_paths) {
       if (!utils::path_safety_checker::checkCollision(
-            shifted_path.path, ego_path, object, obj_path, p, parameters_->rss_params,
+            shifted_path.path, ego_path, object, obj_path, p, nero_rss,
             hysteresis_factor, parameters_->collision_check_yaw_diff_threshold, dbg.second)) {
         return false;
       }
@@ -5677,6 +6478,7 @@ void StaticObstacleAvoidanceModule::neroGapTiming(
         avoid_data_, planner_data_, parameters_, ctx->has_left_shift, ctx->has_right_shift, tmp);
     }
     ctx->bumps = neroBumpsOnPath(sp);
+    ctx->side_plan_out = nero_side::cfg().on && nero_side_plan_out_;  // NERO_SOA_SIDE_LANE (isSafePath's, same candidate)
     floor_v = neroGapFloor(sp, s_hold, ctx->bumps);
   }
   const NeroGapCtx * c = ctx ? &ctx.value() : nullptr;
@@ -6766,6 +7568,39 @@ void StaticObstacleAvoidanceModule::updateData()
       d.to_stop_line < 1e6 ? d.to_stop_line : -1.0, d.target_objects.size());
   }
 
+  if (nero_side::cfg().on) {
+    neroSideWaitUpdate(avoid_data_);  // NERO_SOA_SIDE_LANE: latch / release the side wait
+  }
+
+  if (nero_side::cfg().on && nero_side::cfg().debug >= 2) {
+    // NERO_SOA_SIDE_LANE debug 2 (log only): every target every cycle (soa-1's [NERO_SOA_TGT] format) + the side state
+    for (const auto & o : avoid_data_.target_objects) {
+      const double ov = o.overhang_points.empty() ? std::numeric_limits<double>::quiet_NaN() : o.overhang_points.front().first;
+      const double m = o.avoid_margin ? o.avoid_margin.value() : std::numeric_limits<double>::quiet_NaN();
+      const double req = (o.overhang_points.empty() || !o.avoid_margin)
+                           ? std::numeric_limits<double>::quiet_NaN()
+                           : helper_->getShiftLength(o, utils::static_obstacle_avoidance::isOnRight(o), m);
+      RCLCPP_INFO(
+        getLogger(), "[NERO_SOA_TGT] %s cls %d info %s req_av %d lon %.1f len %.1f overhang %.2f margin %.2f desired %.2f env %.1f m2 plan %.2f",
+        to_hex_string(o.object.object_id).substr(0, 8).c_str(),
+        static_cast<int>(utils::getHighestProbLabel(o.object.classification)), magic_enum::enum_name(o.info).data(),
+        static_cast<int>(o.avoid_required), o.longitudinal, o.length, ov, m, req, boost::geometry::area(o.envelope_poly),
+        helper_->getShift(o.getPosition()));
+    }
+    const auto & d = avoid_data_;
+    RCLCPP_INFO(
+      getLogger(),
+      "[NERO_SOA_SIDEDBG] v %.2f ego_shift %.2f over %.2f shifted %d plan_out %d safe %d yield %d side_unsafe %d (%s) paused %d "
+      "side %d pass %d stop %.1f stop_line %.1f wait %s",
+      getEgoSpeed(), helper_->getEgoShift(), neroBodyOverLaneBound(), helper_->isShifted(),
+      nero_side_plan_out_, d.safe, d.yield_required, nero_side_unsafe_,
+      nero_side_unsafe_ ? nero_side_who_.c_str() : "-", nero_paused_, nero_side_pause_, nero_side_pass_,
+      nero_side_stop_ ? nero_mu::calcSignedArcLength(d.reference_path.points, getEgoPosition(), nero_side_stop_.value())
+                      : -1.0,
+      d.to_stop_line < 1e6 ? d.to_stop_line : -1.0,
+      nero_side_wait_id_.empty() ? "-" : nero_side_wait_id_.substr(0, 4).c_str());
+  }
+
   if (nero_pause_start_) {  // NERO_SOA_ONCOMING_PAUSE: the pause starts this cycle
     neroFreezeShift(avoid_data_, nero_pause_shift_, nero_pause_ease_);
     nero_pause_start_ = false;
@@ -6846,6 +7681,10 @@ void StaticObstacleAvoidanceModule::initVariables()
   ignore_signal_ids_.clear();
   nero_paused_ = false;
   nero_pause_start_ = false;
+  nero_side_pause_ = false;  // NERO_SOA_SIDE_LANE
+  nero_side_pass_ = false;
+  nero_side_wait_id_.clear();
+  nero_side_stop_.reset();
   nero_stop_now_ = false;
   nero_returning_ = false;
   nero_onc_.reset();

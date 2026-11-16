@@ -400,6 +400,7 @@ private:
     bool has_right_shift{false};
     std::vector<utils::path_safety_checker::ExtendedPredictedObject> targets;
     std::vector<std::pair<double, double>> bumps;  // [start, end] arc length from ego
+    bool side_plan_out{false};  // NERO_SOA_SIDE_LANE: the candidate path's body leaves the lane
   };
   std::vector<utils::path_safety_checker::PoseWithVelocityStamped> neroEgoPredictedPath(
     const ShiftedPath & shifted_path, bool for_front_object, double v_hold, double s_hold,
@@ -499,6 +500,46 @@ private:
   mutable double nero_pause_ease_{0.0};
   mutable double nero_pause_desired_{0.0};  // signed shift ego was heading for when the pause began
   mutable double nero_pause_clear_since_{-1.0};
+  // ---- nero (soa-2, 2026-11-16, Area 2 B8): NERO_SOA_SIDE_LANE. The shift-side check sized by where the planned body
+  // goes (A: x_out for cars behind / alongside when the plan leaves the lane; B: an in-lane plan judged without RSS's
+  // longitudinal terms), and a pause at the in-lane limit once the move out has begun (C). Unset = the car.
+  // which rss params the safety check uses for this object (A / B / stock); kind: 0 stock, 1 out (A), 2 in-lane (B)
+  const utils::path_safety_checker::RSSparams & neroSideRss(
+    const utils::path_safety_checker::ExtendedPredictedObject & object, bool plan_out, int & kind) const;
+  // does the candidate path's body leave the lane (any point from ego beyond the in-lane limit at margin 0)
+  bool neroPlanLeavesLane(const ShiftedPath & shifted_path, bool update = false) const;
+  // C: start / keep / end the side pause; true while paused (shares nero_paused_ with overtake v6's pause)
+  bool neroSidePause(AvoidancePlanningData & data) const;
+  // C: the largest hard-margin shift of the targets ahead on `left`, max over t_hard s per target
+  double neroSideNeedHard(const AvoidancePlanningData & data, bool left) const;
+  mutable bool nero_side_unsafe_{false};   // this cycle's first unsafe object was checked with x_out (A)
+  mutable std::string nero_side_who_;      // that object (debug)
+  mutable bool nero_side_pause_{false};    // the current pause is a side pause (C)
+  mutable bool nero_side_pass_{false};     // the hold keeps every target's hard margin: no stop
+  mutable std::optional<geometry_msgs::msg::Point> nero_side_stop_;  // the side pause's stop point (map)
+  mutable double nero_side_clear_since_{-1.0};
+  // NERO_SOA_SIDE_LANE: a yield for a car behind / alongside (the out-of-lane pass of this target is unsafe) latches a
+  // stop before that target: kept through label / INSUFFICIENT_* flicker and stock's "overran avoidance dead line, do
+  // nothing", until a line is approved while safe, or the target is passed / gone
+  void neroSideWaitUpdate(const AvoidancePlanningData & data) const;
+  bool neroInsertSideWait(const AvoidancePlanningData & data, ShiftedPath & shifted_path) const;
+  // where a side stop goes: clamp(line > 0 ? line : nominal stop, hard-constraint stop, d_max); a firm stop at d_max if
+  // only that fits; nullopt if not even that
+  std::optional<double> neroSideStopDistance(double line, double d_max) const;
+  mutable std::string nero_side_wait_id_;
+  mutable double nero_side_wait_since_{-1.0};
+  mutable double nero_side_wait_log_{-1.0};
+  mutable bool nero_side_plan_out_{false};     // this cycle's candidate leaves the lane (isSafePath, reused by the gap timing)
+  mutable bool nero_side_out_safe_{false};     // out-of-lane plans: own safe state / count (not shared with in-lane plans)
+  mutable size_t nero_side_out_count_{0};
+  mutable double nero_side_out_last_{-1.0};    // last cycle with an out-of-lane candidate
+  mutable double nero_side_notgt_since_{-1.0};  // side pause: no target ahead since
+  mutable double nero_side_inlane_since_{-1.0};  // side pause: the module's plan stays in the lane since
+  mutable double nero_side_inlog_t_{-1.0e9};
+  mutable std::vector<lanelet::Id> nero_side_poly_ids_;  // the current lanes' polygon, kept while the lane set is the same
+  mutable lanelet::BasicPolygon2d nero_side_poly_;      // debug: last "in-lane plan kept" line (its stock re-check runs only then)
+  mutable std::optional<utils::path_safety_checker::RSSparams> nero_rss_out_;  // A: lateral threshold x_out
+  mutable std::optional<utils::path_safety_checker::RSSparams> nero_rss_in_;   // B: no longitudinal terms
   // ---- nero (2026-10-26, returnshift job, QUEUE OLS): NERO_SOA_LANE_BLOCKED. A standing vehicle in ego's own lane that
   // is not an avoidance target (traffic: the module does not pass it), with the planned path still out of the lane
   // where obstacle_stop will stop ego for it (or beside it): (id, distance from ego to its nearest point), or nullopt
