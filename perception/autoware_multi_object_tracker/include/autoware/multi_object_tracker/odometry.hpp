@@ -73,6 +73,13 @@ public:
 
   std::optional<nav_msgs::msg::Odometry> getOdometryFromTf(const rclcpp::Time & time) const;
 
+  /// cam-1: world <- ego at the stamp (odometry buffer or tf, interpolated), never waiting (nullopt when not available yet)
+  std::optional<geometry_msgs::msg::Transform> getEgoTransformNoWait(const rclcpp::Time & time) const;
+
+  /// cam-1: target <- source from the latest tf (static frames), never waiting (nullopt when not available yet)
+  std::optional<geometry_msgs::msg::Transform> getStaticTransform(
+    const std::string & target_frame_id, const std::string & source_frame_id) const;
+
   std::optional<types::DynamicObjectList> transformObjects(
     const types::DynamicObjectList & input_objects) const;
 

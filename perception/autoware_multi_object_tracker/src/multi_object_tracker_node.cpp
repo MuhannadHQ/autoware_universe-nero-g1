@@ -19,6 +19,7 @@
 #include "autoware/multi_object_tracker/types.hpp"
 #include "autoware/multi_object_tracker/uncertainty/uncertainty_processor.hpp"
 #include "autoware/multi_object_tracker/tracker/nero/nero_cam_class.hpp"
+#include "autoware/multi_object_tracker/tracker/nero/nero_person_cam.hpp"
 
 #include <tf2/LinearMath/Transform.h>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
@@ -276,8 +277,22 @@ MultiObjectTracker::MultiObjectTracker(const rclcpp::NodeOptions & node_options)
       });
   }
 
-  // NERO_MOT_CLASS_CAM (tracker-1): camera0's YOLOX boxes + its rectified calibration; unset = no subscription
-  if (nero_cam_class::params().enabled) {
+  // NERO_MOT_CLASS_CAM (tracker-1) / NERO_MOT_PERSON_CAM (cam-1): camera0's YOLOX boxes + its rectified calibration; unset = no subscription
+  if (nero_person_cam::anyCam()) {
+    (void)nero_cam_class::lens();  // prints the lens line at start-up when set
+    // the robot's pose at a camera frame's stamp from the tracker's own odometry / tf, never waiting (cam-1)
+    nero_cam_class::setEgoLookup([this](double t, nero_cam_class::Ego * e) {
+      const rclcpp::Time st(static_cast<int64_t>(std::llround(t * 1e9)), this->now().get_clock_type());
+      const auto tf = state_.odometry->getEgoTransformNoWait(st);
+      if (!tf) return false;
+      e->t = t;
+      e->x = tf->translation.x;
+      e->y = tf->translation.y;
+      e->z = tf->translation.z;
+      const auto & q = tf->rotation;
+      e->yaw = std::atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z));
+      return true;
+    });
     const char * rt = std::getenv("NERO_MOT_CLASS_CAM_ROIS");
     const char * it = std::getenv("NERO_MOT_CLASS_CAM_INFO");
     nero_rois_sub_ = create_subscription<tier4_perception_msgs::msg::DetectedObjectsWithFeature>(
@@ -307,15 +322,12 @@ MultiObjectTracker::MultiObjectTracker(const rclcpp::NodeOptions & node_options)
         nero_cam_class::setIntrinsics(
           msg->p[0], msg->p[5], msg->p[2], msg->p[6], static_cast<int>(msg->width), static_cast<int>(msg->height));
         if (nero_cam_class::cameraOk()) return;
-        // base_link <- optical from the tf tree at this stamp (static: once): (map <- base)^-1 (map <- optical)
-        const rclcpp::Time st(msg->header.stamp, this->now().get_clock_type());
-        const auto mo = state_.odometry->getTransform(msg->header.frame_id, st);
-        const auto mb = state_.odometry->getTransform(st);
-        if (!mo || !mb) return;
-        tf2::Transform to, tb;
-        tf2::fromMsg(*mo, to);
-        tf2::fromMsg(*mb, tb);
-        const tf2::Transform bo = tb.inverse() * to;
+        // base_link <- optical from the STATIC tf, never waiting (cam-1: a lookup at the stamp with a 0.5 s timeout blocked this executor
+        // at start-up and changed the closed loop with no camera vote at all)
+        const auto bo_msg = state_.odometry->getStaticTransform(params_.ego_frame_id, msg->header.frame_id);
+        if (!bo_msg) return;
+        tf2::Transform bo;
+        tf2::fromMsg(*bo_msg, bo);
         const tf2::Matrix3x3 & R = bo.getBasis();
         nero_cam_class::setCamera(
           {R[0][0], R[0][1], R[0][2], R[1][0], R[1][1], R[1][2], R[2][0], R[2][1], R[2][2]},
@@ -326,9 +338,32 @@ MultiObjectTracker::MultiObjectTracker(const rclcpp::NodeOptions & node_options)
       });
   }
 
+  // NERO_MOT_PERSON_CAM (cam-1): camera0's 16-class mask (run-length mono8), only with the switch
+  if (nero_person_cam::params().enabled) {
+    const char * mt = std::getenv("NERO_MOT_PERSON_CAM_MASK");
+    nero_mask_sub_ = create_subscription<sensor_msgs::msg::Image>(
+      (mt && *mt) ? mt : "/perception/object_recognition/detection/mask0", rclcpp::SensorDataQoS(),
+      [](AUTOWARE_MESSAGE_CONST_SHARED_PTR(sensor_msgs::msg::Image) msg) {
+        nero_person_cam::setMask(
+          rclcpp::Time(msg->header.stamp).seconds(), static_cast<int>(msg->width), static_cast<int>(msg->height), msg->data);
+      });
+  }
+
   // publishers
   tracked_objects_pub_ = create_publisher<autoware_perception_msgs::msg::TrackedObjects>(
     "~/output/objects", rclcpp::QoS{1});
+  // NERO_MOT_CAM_SPLIT=<topic> (cam-1; unset = no such topic): the same publish WITHOUT the camera's decisions (NERO_MOT_CLASS_CAM /
+  // NERO_MOT_PERSON_CAM), for detection_by_tracker (its launch reads the same variable): the camera's classes reach planning only and never
+  // feed the tracker back through detection_by_tracker's class-dependent refits / ignore lists (tracker-1's 19:01 camera runs)
+  {
+    const char * sp = std::getenv("NERO_MOT_CAM_SPLIT");
+    if (sp != nullptr && sp[0] == '/') {
+      nero_split_pub_ = create_publisher<autoware_perception_msgs::msg::TrackedObjects>(sp, rclcpp::QoS{1});
+      RCLCPP_INFO(get_logger(), "[NERO_MOT_CAM_SPLIT] on: the publish without the camera's decisions on %s", sp);
+    } else if (sp != nullptr && sp[0] != '\0') {
+      RCLCPP_ERROR(get_logger(), "[NERO_MOT_CAM_SPLIT] '%s' is not a topic: off", sp);
+    }
+  }
   if (params_.publish_merged_objects) {
     // if the input is multi-channel, export fused merged (detected) objects
     merged_objects_pub_ = create_publisher<autoware_perception_msgs::msg::DetectedObjects>(
@@ -442,6 +477,15 @@ void MultiObjectTracker::publish()
       st_get_output_ptr = std::make_unique<ScopedTimeTrack>("get_output", *time_keeper_);
 
     publishing_data = core::prepare_publishing_data(current_time, params_, state_, get_logger());
+  }
+  if (nero_split_pub_) {  // NERO_MOT_CAM_SPLIT (cam-1): the lidar-only copy (no camera stage = the same message)
+    if (nero_person_cam::anyCam()) {
+      auto lidar = state_.processor->neroLidarObjects();
+      lidar.header = publishing_data.tracked_objects.header;
+      nero_split_pub_->publish(lidar);
+    } else {
+      nero_split_pub_->publish(publishing_data.tracked_objects);
+    }
   }
   tracked_objects_pub_->publish(publishing_data.tracked_objects);
 

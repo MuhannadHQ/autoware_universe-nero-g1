@@ -366,6 +366,38 @@ std::optional<geometry_msgs::msg::Transform> Odometry::getTransform(
   }
 }
 
+std::optional<geometry_msgs::msg::Transform> Odometry::getEgoTransformNoWait(const rclcpp::Time & time) const
+{
+  // cam-1: the robot's pose at a camera frame's stamp for projecting objects into it. getTransform(time) waits up to 0.5 s in TF mode;
+  // this returns nullopt instead (the caller skips the frame), and never touches the tf cache
+  if (ego_source_ == EgoSource::ODOMETRY) return getEgoTransformFromOdometry(time);
+  try {
+    std::string errstr;
+    if (!tf_buffer_->canTransform(world_frame_id_, ego_frame_id_, time, rclcpp::Duration::from_seconds(0.0), &errstr)) {
+      return std::nullopt;
+    }
+    return tf_buffer_->lookupTransform(world_frame_id_, ego_frame_id_, time).transform;
+  } catch (tf2::TransformException &) {
+    return std::nullopt;
+  }
+}
+
+std::optional<geometry_msgs::msg::Transform> Odometry::getStaticTransform(
+  const std::string & target_frame_id, const std::string & source_frame_id) const
+{
+  // cam-1: a camera's mounting is static; looking it up at a message stamp with a timeout blocked the tracker's executor up to 0.5 s per
+  // camera_info message at start-up (tracker-1's CLASS_CAM: the 19:01 trip-start static-avoidance episode +76 s with no camera vote)
+  try {
+    std::string errstr;
+    if (!tf_buffer_->canTransform(target_frame_id, source_frame_id, tf2::TimePointZero, tf2::Duration::zero(), &errstr)) {
+      return std::nullopt;
+    }
+    return tf_buffer_->lookupTransform(target_frame_id, source_frame_id, tf2::TimePointZero).transform;
+  } catch (tf2::TransformException &) {
+    return std::nullopt;
+  }
+}
+
 std::optional<nav_msgs::msg::Odometry> Odometry::getOdometryFromTf(const rclcpp::Time & time) const
 {
   // odometry backend: return the real interpolated odometry (with real twist & covariance)

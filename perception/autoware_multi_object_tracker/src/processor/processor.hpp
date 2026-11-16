@@ -61,6 +61,8 @@ public:
   void getTrackedObjects(
     const rclcpp::Time & time,
     autoware_perception_msgs::msg::TrackedObjects & tracked_objects) const;
+  // NERO_MOT_CAM_SPLIT (cam-1): the same publish without the camera's decisions (for detection_by_tracker); filled by getTrackedObjects
+  const autoware_perception_msgs::msg::TrackedObjects & neroLidarObjects() const { return nero_lidar_objects_; }
   void getTentativeObjects(
     const rclcpp::Time & time,
     autoware_perception_msgs::msg::TrackedObjects & tentative_objects) const;
@@ -89,6 +91,11 @@ private:
   void neroStandHold(const std::shared_ptr<Tracker> & tracker, const rclcpp::Time & time, types::DynamicObject & object) const;
   void neroClassHold(const std::shared_ptr<Tracker> & tracker, const rclcpp::Time & time, types::DynamicObject & object) const;
   void neroUnknownCamClass(const std::shared_ptr<Tracker> & tracker, const rclcpp::Time & time, types::DynamicObject & object) const;
+  // cam-1: the camera stage on the published copy (NERO_MOT_CLASS_CAM's vehicle witness, NERO_MOT_PERSON_CAM), after the lidar-only holds
+  void neroCamVehicleClass(const std::shared_ptr<Tracker> & tracker, const rclcpp::Time & time, types::DynamicObject & object) const;
+  void neroPersonCam(
+    const rclcpp::Time & time, std::vector<std::pair<std::shared_ptr<Tracker>, types::DynamicObject>> & objects) const;
+  mutable autoware_perception_msgs::msg::TrackedObjects nero_lidar_objects_;
   void neroStillBox(
     const std::shared_ptr<Tracker> & tracker, const rclcpp::Time & time, types::DynamicObject & object) const;
   void neroStillBoxBirth(

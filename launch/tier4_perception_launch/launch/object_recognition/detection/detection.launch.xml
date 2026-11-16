@@ -50,7 +50,8 @@
   <arg name="input/camera7/rois"/>
   <arg name="image_topic_name"/>
   <arg name="input/radar"/>
-  <arg name="input/tracked_objects" default="/perception/object_recognition/tracking/objects"/>
+  <!-- cam-1 NERO_MOT_CAM_SPLIT=<topic>: detection_by_tracker reads the tracker's publish without the camera's decisions (unset = the car) -->
+  <arg name="input/tracked_objects" default="$(env NERO_MOT_CAM_SPLIT /perception/object_recognition/tracking/objects)"/>
   <arg name="output/objects" default="objects"/>
 
   <!-- internal interfaces -->

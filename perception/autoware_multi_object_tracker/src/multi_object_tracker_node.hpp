@@ -28,6 +28,7 @@
 #include "autoware_perception_msgs/msg/tracked_objects.hpp"
 #include <nav_msgs/msg/odometry.hpp>
 #include <sensor_msgs/msg/camera_info.hpp>
+#include <sensor_msgs/msg/image.hpp>
 #include <tier4_perception_msgs/msg/detected_objects_with_feature.hpp>
 
 #include <memory>
@@ -49,6 +50,9 @@ private:
   // NERO_MOT_CLASS_CAM (tracker-1): camera0's boxes and calibration (only subscribed with the switch)
   AUTOWARE_SUBSCRIPTION_PTR(tier4_perception_msgs::msg::DetectedObjectsWithFeature) nero_rois_sub_ {};
   AUTOWARE_SUBSCRIPTION_PTR(sensor_msgs::msg::CameraInfo) nero_info_sub_ {};
+  // NERO_MOT_PERSON_CAM (cam-1): camera0's 16-class mask; NERO_MOT_CAM_SPLIT: the publish without the camera's decisions
+  AUTOWARE_SUBSCRIPTION_PTR(sensor_msgs::msg::Image) nero_mask_sub_ {};
+  AUTOWARE_PUBLISHER_PTR(autoware_perception_msgs::msg::TrackedObjects) nero_split_pub_;
 
   AUTOWARE_PUBLISHER_PTR(autoware_perception_msgs::msg::TrackedObjects) tracked_objects_pub_;
   AUTOWARE_PUBLISHER_PTR(autoware_perception_msgs::msg::DetectedObjects) merged_objects_pub_;

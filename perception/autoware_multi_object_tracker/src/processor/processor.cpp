@@ -21,6 +21,7 @@
 #include "autoware/multi_object_tracker/tracker/nero/nero_still_box.hpp"
 #include "autoware/multi_object_tracker/tracker/nero/nero_stand_hold.hpp"
 #include "autoware/multi_object_tracker/tracker/nero/nero_cam_class.hpp"
+#include "autoware/multi_object_tracker/tracker/nero/nero_person_cam.hpp"
 #include "autoware/multi_object_tracker/tracker/trackers/static_tracker.hpp"
 #include "autoware/multi_object_tracker/types.hpp"
 
@@ -106,7 +107,7 @@ void TrackerProcessor::updateEgoPose(
 {
   ego_pose_ = ego_pose_stamped;
   // NERO_MOT_CLASS_CAM (tracker-1): the robot's pose history for projecting into camera0 frames
-  if (nero_cam_class::params().enabled && ego_pose_stamped) {
+  if (nero_person_cam::anyCam() && ego_pose_stamped) {
     const auto & q = ego_pose_stamped->pose;
     nero_cam_class::setEgo(
       rclcpp::Time(ego_pose_stamped->header.stamp).seconds(), q.position.x, q.position.y, q.position.z,
@@ -781,7 +782,8 @@ void TrackerProcessor::neroStandHold(
 void TrackerProcessor::neroClassHold(
   const std::shared_ptr<Tracker> & tracker, const rclcpp::Time & time, types::DynamicObject & object) const
 {
-  // NERO_MOT_CLASS_HOLD (tracker-1): while a vehicle track stands, a vehicle <-> vehicle class change waits t_cls
+  // NERO_MOT_CLASS_HOLD (tracker-1): while a vehicle track stands, a vehicle <-> vehicle class change waits t_cls. Lidar only: the camera's
+  // class witness (NERO_MOT_CLASS_CAM) acts afterwards on the published copy (neroCamVehicleClass, cam-1), never on this hold's state.
   const auto & p = neroStandHoldParams();
   auto & st = tracker->nero_sh;
   const double t = time.seconds();
@@ -790,13 +792,7 @@ void TrackerProcessor::neroClassHold(
   const auto reset = [&]() {
     st.cls_init = false;
     st.cls_cand_t = -1.0;
-    st.cam_votes.clear();
-    st.cam_label = 0;
   };
-  if (now == classes::Label::UNKNOWN && nero_cam_class::params().enabled && nero_cam_class::params().iou_unk > 0.0) {
-    neroUnknownCamClass(tracker, time, object);  // NERO_MOT_CLASS_CAM fields 7-8: a standing UNKNOWN camera0 sees clearly as a vehicle
-    return;
-  }
   if (!neroVehicleLabel(now)) {
     reset();  // any non-vehicle class is published at once
     return;
@@ -804,43 +800,6 @@ void TrackerProcessor::neroClassHold(
   if (v > p.v_still) {
     if (st.mv_n >= 2) reset();  // it moves: as the car (a single moving reading keeps the hold's state)
     return;                     // a moving reading publishes the car's class
-  }
-  // NERO_MOT_CLASS_CAM (tracker-1): camera0's class witness for a standing CAR / TRUCK / BUS (nero_cam_class.hpp)
-  const auto & cp = nero_cam_class::params();
-  if (cp.enabled && (now == classes::Label::CAR || now == classes::Label::TRUCK || now == classes::Label::BUS)) {
-    double ft = -1.0;
-    double iou = 0.0;
-    const int vl = nero_cam_class::vote(
-      t, st.cam_t, object.pose.position.x, object.pose.position.y, object.pose.position.z, tf2::getYaw(object.pose.orientation),
-      object.shape.dimensions.x, object.shape.dimensions.y, object.shape.dimensions.z, &ft, &iou);
-    if (ft >= 0.0) {
-      st.cam_t = ft;
-      if (vl > 0) st.cam_votes.emplace_back(ft, vl);
-    }
-    while (!st.cam_votes.empty() && t - st.cam_votes.front().first > cp.t_win) st.cam_votes.pop_front();
-    int n[4] = {0, 0, 0, 0};
-    for (const auto & cv : st.cam_votes) ++n[cv.second];
-    const int nv = n[1] + n[2] + n[3];
-    const int best = n[2] > n[1] ? (n[3] > n[2] ? 3 : 2) : (n[3] > n[1] ? 3 : 1);
-    if (nv >= cp.n_min && n[best] >= cp.agree * nv) st.cam_label = best;
-    if (st.cam_label > 0) {
-      const int best = st.cam_label;  // the camera's decision of this stand (sticky while it stands)
-      const auto cam_label = static_cast<classes::Label>(best);
-      if (cp.debug > 0 && cam_label != now) {
-        const auto & id = object.uuid.uuid;
-        RCLCPP_INFO(
-          rclcpp::get_logger("multi_object_tracker"),
-          "[NERO_MOT_CLASS_CAM] %02x%02x%02x%02x t %.2f camera %d (%d of %d votes now, last IoU %.2f) for the car's %d", id[0], id[1],
-          id[2], id[3], t, best, n[best], nv, iou, static_cast<int>(now));
-      }
-      float prob = 0.0F;
-      for (const auto & c : object.classification) prob = std::max(prob, c.probability);
-      object.classification = {classes::Classification{cam_label, prob}};
-      st.cls_init = true;
-      st.cls_pub = object.classification;
-      st.cls_cand_t = -1.0;
-      return;
-    }
   }
   if (!st.cls_init) {
     st.cls_init = true;
@@ -870,6 +829,182 @@ void TrackerProcessor::neroClassHold(
     return;
   }
   object.classification = st.cls_pub;  // the change waits
+}
+
+void TrackerProcessor::neroCamVehicleClass(
+  const std::shared_ptr<Tracker> & tracker, const rclcpp::Time & time, types::DynamicObject & object) const
+{
+  // NERO_MOT_CLASS_CAM (tracker-1; cam-1: moved after the lidar-only class hold, on the published copy): camera0's class witness for a
+  // standing CAR / TRUCK / BUS (nero_cam_class.hpp); fields 7-8: a standing UNKNOWN camera0 sees clearly as a vehicle
+  const auto & cp = nero_cam_class::params();
+  const auto & sp = neroStandHoldParams();
+  auto & st = tracker->nero_sh;
+  const double t = time.seconds();
+  const auto now = classes::getHighestProbLabel(object.classification);
+  const double v = std::hypot(object.twist.linear.x, object.twist.linear.y);
+  if (now == classes::Label::UNKNOWN && cp.iou_unk > 0.0) {
+    neroUnknownCamClass(tracker, time, object);
+    return;
+  }
+  if (!(now == classes::Label::CAR || now == classes::Label::TRUCK || now == classes::Label::BUS)) {
+    st.cam_votes.clear();
+    st.cam_label = 0;
+    return;
+  }
+  if (v > sp.v_still) {
+    if (st.mv_n >= 2) {
+      st.cam_votes.clear();
+      st.cam_label = 0;
+    }
+    return;
+  }
+  double ft = -1.0;
+  double iou = 0.0;
+  const int vl = nero_cam_class::vote(
+    t, st.cam_t, object.pose.position.x, object.pose.position.y, object.pose.position.z, tf2::getYaw(object.pose.orientation),
+    object.shape.dimensions.x, object.shape.dimensions.y, object.shape.dimensions.z, &ft, &iou);
+  if (ft >= 0.0) {
+    st.cam_t = ft;
+    if (vl > 0) st.cam_votes.emplace_back(ft, vl);
+  }
+  while (!st.cam_votes.empty() && t - st.cam_votes.front().first > cp.t_win) st.cam_votes.pop_front();
+  int n[4] = {0, 0, 0, 0};
+  for (const auto & cv : st.cam_votes) ++n[cv.second];
+  const int nv = n[1] + n[2] + n[3];
+  const int best = n[2] > n[1] ? (n[3] > n[2] ? 3 : 2) : (n[3] > n[1] ? 3 : 1);
+  if (nv >= cp.n_min && n[best] >= cp.agree * nv) st.cam_label = best;
+  if (st.cam_label == 0) return;
+  const auto cam_label = static_cast<classes::Label>(st.cam_label);  // the camera's decision of this stand (sticky while it stands)
+  if (cp.debug > 0 && cam_label != now) {
+    const auto & id = object.uuid.uuid;
+    RCLCPP_INFO(
+      rclcpp::get_logger("multi_object_tracker"),
+      "[NERO_MOT_CLASS_CAM] %02x%02x%02x%02x t %.2f camera %d (%d of %d votes now, last IoU %.2f) for the car's %d", id[0], id[1], id[2],
+      id[3], t, st.cam_label, n[st.cam_label], nv, iou, static_cast<int>(now));
+  }
+  float prob = 0.0F;
+  for (const auto & c : object.classification) prob = std::max(prob, c.probability);
+  object.classification = {classes::Classification{cam_label, prob}};
+}
+
+void TrackerProcessor::neroPersonCam(
+  const rclcpp::Time & time, std::vector<std::pair<std::shared_ptr<Tracker>, types::DynamicObject>> & objects) const
+{
+  // NERO_MOT_PERSON_CAM (cam-1): a standing PEDESTRIAN / BICYCLE that camera0 sees clearly as no person -> UNKNOWN, shape kept
+  // (nero_person_cam.hpp has the rule)
+  namespace pc = nero_person_cam;
+  const auto & q = pc::params();
+  const double t = time.seconds();
+  const auto is_vru = [](classes::Label l) {
+    return l == classes::Label::PEDESTRIAN || l == classes::Label::BICYCLE || l == classes::Label::MOTORCYCLE;
+  };
+  bool any = false;
+  for (const auto & o : objects) any = any || is_vru(classes::getHighestProbLabel(o.second.classification));
+  if (!any) return;  // no candidate: the frame is not even decoded
+  // camera0 freshness (boxes) and the newest complete frame (boxes + mask of one YOLOX call)
+  double rois_t = -1.0;
+  {
+    auto & s = nero_cam_class::state();
+    std::lock_guard<std::mutex> lk(s.mtx);
+    rois_t = s.rois_t;
+  }
+  const bool fresh = rois_t >= 0.0 && t - rois_t <= q.t_stale;
+  pc::Frame f;
+  std::vector<pc::Proj> proj;
+  bool f_tried = false;
+  const auto footprint = [](const types::DynamicObject & o) {
+    std::vector<std::array<double, 2>> fp;
+    const auto & sh = o.shape;
+    if (sh.type == autoware_perception_msgs::msg::Shape::POLYGON && sh.footprint.points.size() >= 3) {
+      for (const auto & p : sh.footprint.points) fp.push_back({static_cast<double>(p.x), static_cast<double>(p.y)});
+    } else if (sh.type == autoware_perception_msgs::msg::Shape::CYLINDER) {
+      const double r = 0.5 * sh.dimensions.x;
+      for (int k = 0; k < 8; ++k) fp.push_back({r * std::cos(k * M_PI / 4.0), r * std::sin(k * M_PI / 4.0)});
+    } else {
+      for (const double a : {-0.5, 0.5})
+        for (const double b : {-0.5, 0.5}) fp.push_back({a * sh.dimensions.x, b * sh.dimensions.y});
+    }
+    return fp;
+  };
+  for (size_t i = 0; i < objects.size(); ++i) {
+    auto & obj = objects[i].second;
+    auto & st = objects[i].first->nero_pc;
+    const auto lab = classes::getHighestProbLabel(obj.classification);
+    if (!is_vru(lab)) {  // any other class ends the stand and its relabel (an object first called CAR then PEDESTRIAN starts afresh)
+      st.stand_t0 = -1.0;
+      st.win.clear();
+      st.latched = false;
+      continue;
+    }
+    const double v = std::hypot(obj.twist.linear.x, obj.twist.linear.y);
+    const bool cand = (lab == classes::Label::PEDESTRIAN || lab == classes::Label::BICYCLE) && v <= q.v_still;
+    if (!cand) {
+      if (st.latched && q.debug > 0) {
+        const auto & id = obj.uuid.uuid;
+        RCLCPP_INFO(
+          rclcpp::get_logger("multi_object_tracker"), "[NERO_MOT_PERSON_CAM] %02x%02x%02x%02x t %.2f relabel ends: class %d at %.2f m/s", id[0],
+          id[1], id[2], id[3], t, static_cast<int>(lab), v);
+      }
+      st.stand_t0 = -1.0;
+      st.win.clear();
+      st.latched = false;
+    } else if (st.stand_t0 < 0.0) {
+      st.stand_t0 = t;
+    }
+    // new evidence from the newest complete frame
+    if (!f_tried) {
+      f_tried = true;
+      f = pc::snapshot(t);
+      if (f.ok) {
+        proj.reserve(objects.size());
+        for (const auto & o : objects) {
+          proj.push_back(pc::project(
+            f, o.second.pose.position.x, o.second.pose.position.y, o.second.pose.position.z, tf2::getYaw(o.second.pose.orientation),
+            o.second.shape.dimensions.z, footprint(o.second)));
+        }
+      }
+    }
+    if (f.ok && f.t > st.frame_t) {
+      st.frame_t = f.t;
+      std::vector<pc::Proj> others;
+      others.reserve(proj.size());
+      for (size_t k = 0; k < proj.size(); ++k)
+        if (k != i) others.push_back(proj[k]);
+      const auto e = pc::evaluate(f, proj[i], others);
+      if (e.seen && e.person) st.person_ever = true;
+      if (cand && e.seen) st.win.push_back({f.t, e.person ? 1.0 : 0.0, (!e.person && e.other) ? 1.0 : 0.0});
+      if (q.debug >= 2 && cand) {
+        const auto & id = obj.uuid.uuid;
+        RCLCPP_INFO(
+          rclcpp::get_logger("multi_object_tracker"),
+          "[NERO_MOT_PERSON_CAM] %02x%02x%02x%02x t %.2f frame %.2f seen %d person %d other %d occ %.2f pix %.3f iou_p %.2f iou_v %.2f box "
+          "%.0f %.0f %.0f %.0f ahead %.1f",
+          id[0], id[1], id[2], id[3], t, f.t, e.seen, e.person, e.other, e.occ, e.pix_person, e.iou_person, e.iou_vehicle, proj[i].u0,
+          proj[i].v0, proj[i].u1, proj[i].v1, proj[i].ahead);
+      }
+    }
+    while (!st.win.empty() && (st.win.size() > static_cast<size_t>(q.n_win) || t - st.win.front()[0] > q.t_win)) st.win.pop_front();
+    if (!cand) continue;
+    const bool was = st.latched;
+    if (st.person_ever || !fresh) {
+      st.latched = false;
+    } else if (!st.latched && t - st.stand_t0 >= q.t_stand) {
+      int n_clear = 0;
+      for (const auto & w : st.win) n_clear += w[2] > 0.5 ? 1 : 0;
+      if (n_clear >= q.n_clear) st.latched = true;
+    }
+    if (q.debug > 0 && was != st.latched) {
+      const auto & id = obj.uuid.uuid;
+      RCLCPP_INFO(
+        rclcpp::get_logger("multi_object_tracker"), "[NERO_MOT_PERSON_CAM] %02x%02x%02x%02x t %.2f %s (class %d, %zu frames in the window, %s)",
+        id[0], id[1], id[2], id[3], t, st.latched ? "-> UNKNOWN" : "relabel ends", static_cast<int>(lab), st.win.size(),
+        st.person_ever ? "person seen" : (!fresh ? "camera stale" : "clear"));
+    }
+    if (!st.latched) continue;
+    float prob = 0.0F;
+    for (const auto & c : obj.classification) prob = std::max(prob, c.probability);
+    obj.classification = {classes::Classification{classes::Label::UNKNOWN, prob}};
+  }
 }
 
 void TrackerProcessor::neroUnknownCamClass(
@@ -957,6 +1092,8 @@ void TrackerProcessor::getTrackedObjects(
 
   tracked_objects.header.stamp = time;
   types::DynamicObject tracked_object;
+  const bool cam = nero_person_cam::anyCam();  // cam-1: any camera stage collects the objects first (unset: the car's loop exactly)
+  std::vector<std::pair<std::shared_ptr<Tracker>, types::DynamicObject>> nero_objs;
   for (const auto & tracker : list_tracker_) {
     if (!tracker->isConfident(adaptive_threshold_cache_, getEgoPose(), std::nullopt)) continue;
     // [nero trkup] NERO_MOT_UNKNOWN_CONFIRM=<n> (trkup-2 2026-11-10; unset = upstream): an UNKNOWN track is published only from its n-th
@@ -987,12 +1124,27 @@ void TrackerProcessor::getTrackedObjects(
       tracked_object.classification = tracker->getClassification();
       if (neroStandHoldParams().enabled) {
         neroStandHold(tracker, time, tracked_object);  // NERO_MOT_STAND_HOLD (tracker-1): publication only
-        if (neroStandHoldParams().cls_enabled) neroClassHold(tracker, time, tracked_object);  // NERO_MOT_CLASS_HOLD
+        if (neroStandHoldParams().cls_enabled) neroClassHold(tracker, time, tracked_object);  // NERO_MOT_CLASS_HOLD (lidar only)
       }
       if (tracker->neroHasPubUUID()) tracked_object.uuid = tracker->neroPubUUID();  // [nero trkup] REBIRTH
-      tracked_objects.objects.push_back(types::toTrackedObjectMsg(tracked_object));
+      if (cam) {
+        nero_objs.emplace_back(tracker, tracked_object);
+      } else {
+        tracked_objects.objects.push_back(types::toTrackedObjectMsg(tracked_object));
+      }
     }
   }
+  if (!cam) return;
+  // cam-1: the lidar-only publish (NERO_MOT_CAM_SPLIT: detection_by_tracker reads it, so the camera's decisions never feed the tracker back),
+  // then the camera stage on the published copy. Order and content of the lidar copy == the publish without any camera switch.
+  nero_lidar_objects_.objects.clear();
+  nero_lidar_objects_.header = tracked_objects.header;
+  for (const auto & to : nero_objs) nero_lidar_objects_.objects.push_back(types::toTrackedObjectMsg(to.second));
+  if (nero_cam_class::params().enabled) {
+    for (auto & to : nero_objs) neroCamVehicleClass(to.first, time, to.second);
+  }
+  if (nero_person_cam::params().enabled) neroPersonCam(time, nero_objs);
+  for (const auto & to : nero_objs) tracked_objects.objects.push_back(types::toTrackedObjectMsg(to.second));
 }
 
 void TrackerProcessor::getTentativeObjects(
