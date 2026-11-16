@@ -1541,11 +1541,58 @@ void StaticObstacleAvoidanceModule::fillFundamentalData(
       }
       return m;
     }();
+    // NERO_SOA_ROUTE_LC_PASS=<P> (mainlane-18, 2026-11-15, LC19): hand an object over only when the lane change can PASS it,
+    // i.e. its lateral motion can start >= P m before the object's near end. The lane change may start its lateral motion
+    // only where the current lanes have a lane-changeable neighbour on the change side (prepares shorter than the distance to
+    // the target lanes' start are skipped; "lane change start is behind target lanelet" throws), and its "room to change"
+    // stop is clamped to that start. 11-04 15:09 (KRS start, 93787): a SUV standing at the right kerb where 93787's
+    // lane-change zone begins (its near end 0.75-1.03 m past the zone start); 81349 / 79961 have only ADJACENT left
+    // neighbours (solid line in the map), so no lane change could ever pass it: handed over, the robot stood 5 m behind it
+    // for good (two field takeovers). Kept here, static avoidance passes it over the adjacent lane (sim lc19s, m18d) and the
+    // route change follows from the shifted path. A kept object stays kept while it is seen (latched per id, the box
+    // jitters). P = 12 m: the lane change's minimum lane-changing length at a crawl (~9.2 m, NERO_LC_ROUTE_GATE "rest 1")
+    // + the robot's front overhang 1.25 m + margin. Unset = the hand-over as before (route_lc only).
+    static const double route_lc_pass_m = [] {
+      const char * v = std::getenv("NERO_SOA_ROUTE_LC_PASS");
+      const double m = v != nullptr ? std::atof(v) : -1.0;
+      if (m > 0.0) {
+        std::fprintf(stderr, "[NERO_SOA] route_lc_pass=%.1f\n", m);
+      }
+      return m;
+    }();
     if (route_lc_m > 0.0 && !data.target_objects.empty() && !data.current_lanelets.empty()) {
       const auto & rh = planner_data_->route_handler;
       const double dist_to_end = utils::getDistanceToEndOfLane(getEgoPose(), data.current_lanelets);
       const auto registered = generator_.getRawRegisteredShiftLine();
       static std::unordered_map<std::string, double> last_log;
+      static std::unordered_map<std::string, double> pass_kept;  // id -> last time seen kept (NERO_SOA_ROUTE_LC_PASS latch)
+      const double now_s = clock_->now().seconds();
+      for (auto it = pass_kept.begin(); it != pass_kept.end();) {
+        it = (now_s - it->second > 2.0) ? pass_kept.erase(it) : std::next(it);
+      }
+      // room between the change zone's start and the object's near end, measured from the OBJECT's own lanelet backwards: the
+      // zone = the run of consecutive current lanelets with a lane-changeable neighbour on the given side that ends in the
+      // object's lanelet; < 0 when the object's lanelet has no such neighbour (no change can start before it there). It does
+      // not depend on where ego is (a robot waiting within P m of an object in a lane changeable along its whole length keeps
+      // handing it over: lca S1) and needs no closest-lanelet search for ego (gate m18l/m: one more upstream closest-lanelet
+      // search per cycle - nero_geom_fast is off on the car - cost static avoidance ~+0.8 ms p50).
+      const auto rg = rh->getRoutingGraphPtr();
+      const auto room_before_zone = [&](const lanelet::ConstLanelet & olane, const ObjectData & obj, const bool left) {
+        const auto has_nb = [&](const lanelet::ConstLanelet & ll) {
+          return static_cast<bool>(left ? rg->left(ll) : rg->right(ll));
+        };
+        if (!has_nb(olane)) return -1.0;
+        double room = lanelet::utils::getArcCoordinates({olane}, obj.getPose()).length - 0.5 * obj.length;
+        const auto it = std::find_if(data.current_lanelets.begin(), data.current_lanelets.end(), [&](const auto & ll) {
+          return ll.id() == olane.id();
+        });
+        for (auto j = it; j != data.current_lanelets.begin() && it != data.current_lanelets.end();) {
+          --j;
+          if (!has_nb(*j)) break;
+          room += lanelet::utils::getLaneletLength2d(*j);
+        }
+        return room;
+      };
       ObjectDataArray kept;
       for (auto & o : data.target_objects) {
         const bool shifting_for_it = std::any_of(registered.begin(), registered.end(), [&](const auto & al) {
@@ -1558,6 +1605,28 @@ void StaticObstacleAvoidanceModule::fillFundamentalData(
         const bool on_right = utils::static_obstacle_avoidance::isOnRight(o);
         const bool toward_route_lc = (num > 0 && on_right) || (num < 0 && !on_right);
         const double room_after = dist_to_end - (o.longitudinal + o.length);
+        if (route_lc_pass_m > 0.0 && !shifting_for_it && toward_route_lc && room_after < route_lc_m * std::abs(num)) {
+          const auto id = to_hex_string(o.object.object_id).substr(0, 8);
+          const double room_before = room_before_zone(lane, o, num > 0);
+          const double to_start = o.longitudinal - room_before;  // where the change zone starts, from ego (log only)
+          const bool latched = pass_kept.count(id) > 0;
+          if (latched || room_before < route_lc_pass_m) {
+            pass_kept[id] = now_s;
+            static std::unordered_map<std::string, double> pass_log;  // its own limiter: the first keep always prints
+            if (!latched || now_s - pass_log[id] > 2.0) {
+              pass_log[id] = now_s;
+              RCLCPP_INFO(
+                getLogger(),
+                "[NERO_SOA_ROUTE_LC_PASS] %s kept for this module: no lane change can pass it (%d change(s) to the %s from "
+                "lane %ld; the change zone starts %.1f m ahead, the object's near end is %.1f m ahead: %.1f < %.1f m)%s",
+                id.c_str(), std::abs(num), num > 0 ? "left" : "right", lane.id(),
+                to_start, o.longitudinal, room_before, route_lc_pass_m,
+                latched ? " [latched]" : "");
+            }
+            kept.push_back(o);
+            continue;
+          }
+        }
         if (!shifting_for_it && toward_route_lc && room_after < route_lc_m * std::abs(num)) {
           o.info = ObjectInfo::IS_NOT_TARGET_OBJECT;
           data.other_objects.push_back(o);

@@ -1401,8 +1401,71 @@ void NormalLaneChange::extendOutputDrivableArea(BehaviorModuleOutput & output) c
   autoware_utils::ScopedTimeTrack st(__func__, *time_keeper_);
   const auto & dp = planner_data_->drivable_area_expansion_parameters;
 
-  const auto drivable_lanes = utils::lane_change::generateDrivableLanes(
+  auto drivable_lanes = utils::lane_change::generateDrivableLanes(
     *getRouteHandler(), get_current_lanes(), get_target_lanes());
+  // NERO_LC_DRIVABLE_PREV_WIDE=1 (mainlane-18, 2026-11-15, LC19): a lane change approved ON TOP of a running static
+  // avoidance shift toward the change side keeps the previous module's widening of the current-lane-only elements. Its own
+  // elements behind the target lanes' start are the current lane alone ([81349||81349]); combineDrivableAreaInfo matches
+  // lanes by id AND bound ids, this module's are expanded copies, so static avoidance's [81349||124728] is never merged
+  // (only its elements from the 2nd on are appended behind). Sim lc19s (m18d / m18g, 2 of 2): static avoidance had put the
+  // robot 2.2 m left into 124728 / 149201 to pass a SUV standing where 93787's change zone begins; lane_change_left was
+  // approved there, the robot was outside the drivable area, the path optimizer set a wall 0.8-1.2 m ahead for 2 cycles and
+  // the velocity smoother kept its zero start: -4.2 m/s2 from 3.6 m/s to a stand. Here an own element that is one lane L,
+  // contained in a previous-module element P whose lanes reach further toward the change side, takes P's lanes from L up to
+  // P's outermost lane on that side (walked lane by lane through the left / right and adjacent neighbours; skipped if the
+  // walk does not reach it). Lanes on the other side stay as they are. Unset = the car.
+  {
+    static const bool nero_prev_wide = [] {
+      const char * v = std::getenv("NERO_LC_DRIVABLE_PREV_WIDE");
+      return v != nullptr && std::atoi(v) > 0;
+    }();
+    if (nero_prev_wide && direction_ != Direction::NONE) {
+      const auto & prev_lanes = prev_module_output_.drivable_area_info.drivable_lanes;
+      const auto rh = getRouteHandler();
+      const bool left = direction_ == Direction::LEFT;
+      int widened = 0;
+      std::string first;
+      for (auto & d : drivable_lanes) {
+        if (d.left_lane.id() != d.right_lane.id() || !d.middle_lanes.empty()) continue;
+        const auto lid = d.left_lane.id();
+        for (const auto & p : prev_lanes) {
+          bool has = p.left_lane.id() == lid || p.right_lane.id() == lid;
+          for (const auto & m : p.middle_lanes) has = has || m.id() == lid;
+          if (!has) continue;
+          const auto outer_id = left ? p.left_lane.id() : p.right_lane.id();
+          if (outer_id == lid) break;
+          // walk from L toward the change side until P's outermost lane on that side
+          lanelet::ConstLanelets walk;
+          lanelet::ConstLanelet cur = d.left_lane;
+          bool reached = false;
+          for (int k = 0; k < 6; ++k) {
+            const auto nb = left ? rh->getLeftLanelet(cur, true, false) : rh->getRightLanelet(cur, true, false);
+            if (!nb) break;
+            cur = *nb;
+            walk.push_back(cur);
+            if (cur.id() == outer_id) {
+              reached = true;
+              break;
+            }
+          }
+          if (!reached) break;
+          for (size_t k = 0; k + 1 < walk.size(); ++k) d.middle_lanes.push_back(walk[k]);
+          if (left) {
+            d.left_lane = walk.back();  // L stays the right lane
+          } else {
+            d.right_lane = walk.back();  // L stays the left lane
+          }
+          if (widened++ == 0) first = std::to_string(lid) + "->" + std::to_string(outer_id);
+          break;
+        }
+      }
+      if (widened > 0 && nero_lc_debug_every("prev_wide", 1000)) {
+        RCLCPP_INFO(
+          logger_, "[NERO_LC_DA_PREV] %d current-lane element(s) widened to the previous module's lanes (%s), %s change",
+          widened, first.c_str(), left ? "left" : "right");
+      }
+    }
+  }
   const auto shorten_lanes = utils::cutOverlappedLanes(output.path, drivable_lanes);
   const auto expanded_lanes = utils::expandLanelets(
     shorten_lanes, dp.drivable_area_left_bound_offset, dp.drivable_area_right_bound_offset,
