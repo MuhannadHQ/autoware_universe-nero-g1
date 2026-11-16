@@ -529,6 +529,7 @@ private:
   mutable std::string nero_side_wait_id_;
   mutable double nero_side_wait_since_{-1.0};
   mutable double nero_side_wait_log_{-1.0};
+  mutable double nero_side_noshift_since_{-1.0};  // NERO_SOA_SIDE_RELEASE: the latched target needs no shift since
   mutable bool nero_side_plan_out_{false};     // this cycle's candidate leaves the lane (isSafePath, reused by the gap timing)
   mutable bool nero_side_out_safe_{false};     // out-of-lane plans: own safe state / count (not shared with in-lane plans)
   mutable size_t nero_side_out_count_{0};

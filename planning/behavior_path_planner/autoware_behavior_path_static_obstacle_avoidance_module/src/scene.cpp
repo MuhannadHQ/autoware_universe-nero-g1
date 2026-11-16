@@ -3988,6 +3988,30 @@ std::optional<double> StaticObstacleAvoidanceModule::neroSideStopDistance(const 
   return std::nullopt;
 }
 
+namespace
+{
+// NERO_SOA_SIDE_RELEASE=<s> (mainlane-20 2026-11-16, the 15 Nov B3 fork pole replayed with the drive's timing: soa2_1116's side wait
+// latched before the island pole 5bfc because a car 27 m behind made the out-of-lane pass unsafe; the pole then turned
+// SAME_DIRECTION_SHIFT (it needs no shift: the robot passes it where it is), so no shift ever started and the wait never ended:
+// the robot stood for good, sim 1116-134005 / -134317). The latch also ends once its target has needed no shift for <s> seconds
+// without a break (one flicker cannot end it; a target that needs a shift again resets the clock, and a car behind re-arms the
+// latch as before). obstacle_stop stays the safety for a real intrusion. Unset / <= 0 = soa2_1116 as delivered.
+double nero_side_release_s()
+{
+  static const double v = [] {
+    const char * e = std::getenv("NERO_SOA_SIDE_RELEASE");
+    const double s = (e != nullptr && *e != '\0') ? std::atof(e) : 0.0;
+    if (s > 0.0) {
+      RCLCPP_INFO(
+        rclcpp::get_logger("static_obstacle_avoidance"),
+        "[NERO_SOA_SIDE] release on: the side wait also ends after its target needs no shift (SAME_DIRECTION_SHIFT) for %.1f s", s);
+    }
+    return s;
+  }();
+  return v;
+}
+}  // namespace
+
 void StaticObstacleAvoidanceModule::neroSideWaitUpdate(const AvoidancePlanningData & data) const
 {
   const double now = clock_->now().seconds();
@@ -3997,6 +4021,7 @@ void StaticObstacleAvoidanceModule::neroSideWaitUpdate(const AvoidancePlanningDa
       nero_side_wait_id_ = to_hex_string(data.stop_target_object->object.object_id);
       nero_side_wait_since_ = now;
       nero_side_wait_log_ = now;
+      nero_side_noshift_since_ = -1.0;
       RCLCPP_WARN(
         getLogger(),
         "[NERO_SOA_SIDE] wait before %s: its pass is unsafe for %s %s (stop line %.1f m, v %.2f); kept until ego "
@@ -4023,7 +4048,19 @@ void StaticObstacleAvoidanceModule::neroSideWaitUpdate(const AvoidancePlanningDa
   } else if (nero_paused_) {
     why = "a pause owns the path";
   }
+  // NERO_SOA_SIDE_RELEASE: a latched target that needs no shift any more (continuously, <s> seconds)
+  if (why == nullptr && t != nullptr && nero_side_release_s() > 0.0) {
+    if (t->info == ObjectInfo::SAME_DIRECTION_SHIFT) {
+      if (nero_side_noshift_since_ < 0.0) nero_side_noshift_since_ = now;
+      if (now - nero_side_noshift_since_ >= nero_side_release_s()) {
+        why = "it needs no shift any more (SAME_DIRECTION_SHIFT, NERO_SOA_SIDE_RELEASE)";
+      }
+    } else {
+      nero_side_noshift_since_ = -1.0;
+    }
+  }
   if (why != nullptr) {
+    nero_side_noshift_since_ = -1.0;
     RCLCPP_WARN(
       getLogger(), "[NERO_SOA_SIDE] wait before %s ends after %.1f s: %s (v %.2f, ego shift %.2f)",
       nero_side_wait_id_.substr(0, 4).c_str(), now - nero_side_wait_since_, why, getEgoSpeed(), helper_->getEgoShift());
@@ -7684,6 +7721,7 @@ void StaticObstacleAvoidanceModule::initVariables()
   nero_side_pause_ = false;  // NERO_SOA_SIDE_LANE
   nero_side_pass_ = false;
   nero_side_wait_id_.clear();
+  nero_side_noshift_since_ = -1.0;
   nero_side_stop_.reset();
   nero_stop_now_ = false;
   nero_returning_ = false;
