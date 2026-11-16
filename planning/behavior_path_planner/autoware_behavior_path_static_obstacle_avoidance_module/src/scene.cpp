@@ -273,6 +273,21 @@ bool nero_soa_drivable_merge()
   return on;
 }
 
+// NERO_SOA_DRIVABLE_MERGE_AHEAD=<m> (mainlane-17 2026-11-15, needs NERO_SOA_DRIVABLE_MERGE=1): the same merge also when the stock result
+// would make the manager's cut drop path AHEAD of the robot within <m> (the cut end >= 1 m before the path's end). 11-08 13:57 KRS change 1
+// (field window replay, 2 of 2 runs): lane_change_right approved 4.6 m before the 91174|93732 pair, static avoidance running on it ->
+// the cut ended the path at the end of 148829, 4.9 m ahead, fixed in the map; SOA14's 1 m trigger let that stub live 0.9 s -> the velocity
+// smoother stopped at its end: cmd -4.6 m/s2 at 4.3 m/s with no planning factor (and every module behind it saw a 5 m path). Unset (or
+// <= 1) = the car (SOA14's 1 m trigger only).
+double nero_soa_drivable_merge_ahead()
+{
+  static const double v = [] {
+    const char * e = std::getenv("NERO_SOA_DRIVABLE_MERGE_AHEAD");
+    return e ? std::max(1.0, std::atof(e)) : 1.0;
+  }();
+  return v;
+}
+
 std::vector<lanelet::Id> neroDrivableIds(const DrivableLanes & d)
 {
   std::vector<lanelet::Id> ids{d.right_lane.id(), d.left_lane.id()};
@@ -6951,7 +6966,14 @@ BehaviorModuleOutput StaticObstacleAvoidanceModule::plan()
       nero_dup && (!nero_cut_end || output.path.points.size() < 2 ||
                    nero_mu::calcSignedArcLength(
                      output.path.points, getEgoPosition(), *nero_cut_end) < 1.0);
-    if (nero_chopped) {
+    // NERO_SOA_DRIVABLE_MERGE_AHEAD (see nero_soa_drivable_merge_ahead): also a cut that drops >= 1 m of path and ends < <m> ahead
+    const bool nero_chopped_ahead =
+      !nero_chopped && nero_dup && nero_cut_end && nero_soa_drivable_merge_ahead() > 1.0 &&
+      output.path.points.size() >= 2 && *nero_cut_end + 1 < output.path.points.size() &&
+      autoware::motion_utils::calcSignedArcLength(output.path.points, *nero_cut_end, output.path.points.size() - 1) >= 1.0 &&
+      nero_mu::calcSignedArcLength(output.path.points, getEgoPosition(), *nero_cut_end) <
+        nero_soa_drivable_merge_ahead();
+    if (nero_chopped || nero_chopped_ahead) {
       const auto merged = neroCombineDrivableLanesById(
         current_drivable_area_info.drivable_lanes,
         getPreviousModuleOutput().drivable_area_info.drivable_lanes);
@@ -6974,8 +6996,9 @@ BehaviorModuleOutput StaticObstacleAvoidanceModule::plan()
           return str;
         };
         RCLCPP_INFO(
-          getLogger(), "[NERO_SOA_DA_MERGE] stock %s(cut would end the path %s) -> merged %s(dup %d)",
-          dl(output.drivable_area_info.drivable_lanes).c_str(), cut_str.c_str(), dl(merged).c_str(),
+          getLogger(), "[NERO_SOA_DA_MERGE] stock %s(cut would end the path %s%s) -> merged %s(dup %d)",
+          dl(output.drivable_area_info.drivable_lanes).c_str(), cut_str.c_str(),
+          nero_chopped_ahead ? ", AHEAD rule" : "", dl(merged).c_str(),
           static_cast<int>(neroHasSplitDuplicate(merged)));
       }
       output.drivable_area_info.drivable_lanes = merged;
