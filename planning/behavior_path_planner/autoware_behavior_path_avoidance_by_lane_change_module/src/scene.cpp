@@ -470,6 +470,58 @@ std::optional<ObjectData> AvoidanceByLaneChange::createObjectData(
     }
   }
 
+  // NERO_ABLC_STILL=<unknown_s>,<vehicle_s> (ablcstill_1117, 10amimprovement 11-17): an object off the lane centre is a target of
+  // avoidance by lane change only once it has stood still that long (the centre rule NERO_ABLC_CENTRE already asks it of centre objects).
+  // 8 Nov 19:12:13.4: a CAR crossing and driving off 34-41 m ahead (2.8 -> 4.8 m/s) was taken as a target and a 0.5 s candidate (gap-ahead's
+  // short prepare) was approved: a lane change LEFT away from the route's right lane. Standing objects (parked cars, walls) are unchanged.
+  // Unset = as before.
+  struct NeroStill
+  {
+    bool on{false};
+    double unknown_s{1.0};
+    double vehicle_s{3.0};
+  };
+  static const NeroStill nero_still = [] {
+    NeroStill c;
+    if (const char * e = std::getenv("NERO_ABLC_STILL")) {
+      c.on = std::sscanf(e, "%lf,%lf", &c.unknown_s, &c.vehicle_s) >= 1;
+      if (c.on) {
+        RCLCPP_INFO(
+          rclcpp::get_logger("avoidance_by_lane_change"),
+          "[NERO_ABLC_STILL] on: an off-centre target must have stood still %.1f s (UNKNOWN) / %.1f s (other)", c.unknown_s,
+          c.vehicle_s);
+      }
+    }
+    return c;
+  }();
+  // NERO_ABLC_MOVER=<t_move s> (ablcmover_1117, 10amimprovement 11-17, the reworked ablcstill_1117): an object off the lane centre is NOT a target
+  // of avoidance by lane change while it has been moving continuously for >= t_move (move_time: one fast sample - a parked car's tracker speed
+  // blip - restarts NERO_ABLC_STILL's stand clock (window c25 17:46: an 11.2 s stand behind a standing car) but leaves move_time ~0). 8 Nov
+  // 19:12:13: the car crossing and driving off ahead is dropped. Unset = as before.
+  static const double nero_mover_t = [] {
+    double t = -1.0;
+    if (const char * e = std::getenv("NERO_ABLC_MOVER")) {
+      if (std::sscanf(e, "%lf", &t) == 1 && t > 0.0) {
+        RCLCPP_INFO(
+          rclcpp::get_logger("avoidance_by_lane_change"), "[NERO_ABLC_MOVER] on: an off-centre object moving >= %.2f s is not a target", t);
+      } else {
+        t = -1.0;
+      }
+    }
+    return t;
+  }();
+  if (nero_mover_t > 0.0 && !nero_on_centre && object_data.move_time >= nero_mover_t) {
+    nero_drop_centre("mover");
+    return std::nullopt;
+  }
+  if (nero_still.on && !nero_on_centre) {
+    const double need = t == ObjectClassification::UNKNOWN ? nero_still.unknown_s : nero_still.vehicle_s;
+    if (object_data.stop_time < need) {
+      nero_drop_centre("still");
+      return std::nullopt;
+    }
+  }
+
   object_data.direction = calc_lateral_deviation(object_closest_pose, object_pose.position) > 0.0
                             ? Direction::LEFT
                             : Direction::RIGHT;
