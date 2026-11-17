@@ -186,6 +186,31 @@ PairDecision decidePair(TrackerSnapshot & a, TrackerSnapshot & b, const Decision
   const bool a_survives = compareForSurvival(a, b, ctx) > 0;
   TrackerSnapshot & winner = a_survives ? a : b;
   TrackerSnapshot & loser = a_survives ? b : a;
+  // [nero] NERO_MOT_BIKE_NO_ABSORB=<area_ratio> (10amimprovement-2 2026-11-17, TRKCUT): a pedestrian / bicycle track never absorbs a
+  // vehicle track whose extent is more than <area_ratio> times its own (the tracker priority let a bicycle-born track swallow a
+  // parked car's track; it was then published as 'CAR' with a bicycle-size 2.1 x 0.9 m box and the car's id changed). Both tracks
+  // stay: never fewer objects than upstream. Unset = upstream.
+  static const double nero_bike_ratio = [] {
+    double v = -1.0;
+    if (const char * e = std::getenv("NERO_MOT_BIKE_NO_ABSORB")) {
+      if (std::sscanf(e, "%lf", &v) == 1 && v > 0.0) {
+        std::fprintf(stderr, "[NERO_MOT_BIKE_NO_ABSORB] on: a ped/bicycle track never absorbs a vehicle track > %.1fx its area\n", v);
+      } else {
+        v = -1.0;
+      }
+    }
+    return v;
+  }();
+  if (
+    nero_bike_ratio > 0.0 &&
+    winner.tracker->getTrackerType() == types::TrackerType::PEDESTRIAN_AND_BICYCLE &&
+    types::isVehicleTrackerType(loser.tracker->getTrackerType())) {
+    const double area_w = winner.length * winner.width;
+    const double area_l = loser.length * loser.width;
+    if (area_w > 0.0 && area_l > nero_bike_ratio * area_w) {
+      return PairDecision::NoMerge;
+    }
+  }
   // [nero trkup] NERO_MOT_REBIRTH: an UNKNOWN track hidden behind its vehicle successor absorbs no other track
   if (winner.tracker->neroHidden()) {
     return PairDecision::NoMerge;
