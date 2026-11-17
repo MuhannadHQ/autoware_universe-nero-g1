@@ -18,6 +18,7 @@
 
 #include "nero_proj.hpp"
 #include "nero_squeeze.hpp"  // NERO_SOA_SQUEEZE (mainlane-12)
+#include "nero_side_fast.hpp"  // NERO_SOA_SIDE_FAST (sideperf_1117)
 
 #include "autoware/behavior_path_planner_common/interface/scene_module_visitor.hpp"
 #include "autoware/behavior_path_planner_common/utils/drivable_area_expansion/static_drivable_area.hpp"
@@ -3769,10 +3770,31 @@ bool StaticObstacleAvoidanceModule::neroPlanLeavesLane(const ShiftedPath & shift
       nero_side_poly_ids_ = ids;
     }
     const auto & lane_polygon = nero_side_poly_;
+    // NERO_SOA_SIDE_FAST (sideperf_1117, nero_side_fast.hpp): the same answer per point from a band index of the polygon
+    const int nero_sf = nero_side_fast::mode();
+    const auto nero_ix = nero_sf > 0 ? nero_side_fast::index(lane_polygon, nero_side_poly_ids_) : nullptr;
+    if (nero_sf > 0) nero_side_fast::maybe_print();
     for (size_t i = ego_idx; i < pts.size() && !out; ++i) {
       if (std::abs(shifted_path.shift_length.at(i)) <= th) continue;
-      out = !utils::isEgoWithinOriginalLane(
-        lane_polygon, pts.at(i).point.pose, planner_data_->parameters, 0.0);
+      if (!nero_ix) {
+        out = !utils::isEgoWithinOriginalLane(
+          lane_polygon, pts.at(i).point.pose, planner_data_->parameters, 0.0);
+        continue;
+      }
+      const bool fast_in =
+        nero_side_fast::within_lane(*nero_ix, lane_polygon, pts.at(i).point.pose, planner_data_->parameters);
+      out = !fast_in;
+      if (nero_sf == 2) {
+        const bool ref_in = utils::isEgoWithinOriginalLane(
+          lane_polygon, pts.at(i).point.pose, planner_data_->parameters, 0.0);
+        if (ref_in != fast_in) {
+          nero_side_fast::stats().mismatch++;
+          RCLCPP_WARN(
+            getLogger(), "[NERO_SOA_SIDE_FAST] mismatch at (%.3f, %.3f): fast %d original %d",
+            pts.at(i).point.pose.position.x, pts.at(i).point.pose.position.y, fast_in, ref_in);
+        }
+        out = !ref_in;
+      }
     }
   }
   if (update) {
