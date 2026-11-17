@@ -17,9 +17,33 @@
 #include "autoware/multi_object_tracker/object_model/shapes_transform.hpp"
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 
 namespace autoware::multi_object_tracker
 {
+namespace
+{
+// [nero] NERO_MOT_HEIGHT_KEEP=<ratio> (10amimprovement-2 2026-11-17, TRKCUT C2): a conditioned (cluster / partial) update may lower a
+// vehicle track's height only down to <ratio> x the height of its last trusted full box. Cluster updates of a parked car used to pull
+// its height to the 1.0 m clamp while its extent stayed trusted, so the next full detector box of the same car (1.5-1.85 m) failed the
+// 3D overlap gate and started a new track (a new id). Tracks without a trusted box yet are unchanged. Unset = upstream.
+double neroHeightKeepRatio()
+{
+  static const double v = [] {
+    double r = -1.0;
+    if (const char * e = std::getenv("NERO_MOT_HEIGHT_KEEP")) {
+      if (std::sscanf(e, "%lf", &r) == 1 && r > 0.0 && r <= 1.0) {
+        std::fprintf(stderr, "[NERO_MOT_HEIGHT_KEEP] on: a cluster update keeps a vehicle >= %.2fx its last full-box height\n", r);
+      } else {
+        r = -1.0;
+      }
+    }
+    return r;
+  }();
+  return v;
+}
+}  // namespace
 
 using Shape = autoware_perception_msgs::msg::Shape;
 
@@ -67,6 +91,7 @@ void VehicleShapeModel::updateShape(const types::DynamicObject & object)
     std::clamp(width_, object_model_.size_limit.width_min, object_model_.size_limit.width_max);
   height_ =
     std::clamp(height_, object_model_.size_limit.height_min, object_model_.size_limit.height_max);
+  nero_box_height_ = height_;  // [nero] NERO_MOT_HEIGHT_KEEP reference (a trusted full box)
 }
 
 void VehicleShapeModel::updateFootprint(
@@ -93,6 +118,10 @@ void VehicleShapeModel::updateHeight(double z_measurement)
   if (z_measurement <= 0.0) return;
   constexpr double gain = 0.4;
   height_ = (1.0 - gain) * height_ + gain * z_measurement;
+  const double keep = neroHeightKeepRatio();
+  if (keep > 0.0 && nero_box_height_ > 0.0) {
+    height_ = std::max(height_, keep * nero_box_height_);  // [nero] NERO_MOT_HEIGHT_KEEP
+  }
   height_ =
     std::clamp(height_, object_model_.size_limit.height_min, object_model_.size_limit.height_max);
 }
@@ -105,6 +134,7 @@ std::optional<double> VehicleShapeModel::setShape(
       shape.dimensions.y, object_model_.size_limit.width_min, object_model_.size_limit.width_max);
     height_ = std::clamp(
       shape.dimensions.z, object_model_.size_limit.height_min, object_model_.size_limit.height_max);
+    nero_box_height_ = height_;  // [nero] NERO_MOT_HEIGHT_KEEP reference (a stabilised box)
   }
 
   if (!shape.footprint.points.empty()) {

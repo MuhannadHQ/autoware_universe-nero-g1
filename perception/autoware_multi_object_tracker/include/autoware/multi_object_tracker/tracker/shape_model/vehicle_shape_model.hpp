@@ -93,6 +93,9 @@ private:
 
   static constexpr double FOOTPRINT_TIMEOUT_S = 1.0;  // [s] footprint expiry
 
+  // [nero] NERO_MOT_HEIGHT_KEEP: height of the last trusted full box (0 = none yet)
+  double nero_box_height_{0.0};
+
   object_model::ObjectModel object_model_;
 };
 
