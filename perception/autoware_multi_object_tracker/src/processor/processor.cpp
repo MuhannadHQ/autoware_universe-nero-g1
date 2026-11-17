@@ -747,6 +747,47 @@ void TrackerProcessor::neroStandHold(
     st.est[3] += gs * (b[4] - st.est[3]);
     st.est[4] += gs * (b[5] - st.est[4]);
   }
+  // [nero] NERO_MOT_STAND_RESEED=<deg>,<window s>,<k>,<spread deg>,<max deg> (10amimprovement-2 2026-11-17): the held heading is a running mean
+  // whose gain falls to ~1/(n + n0), so noisy far-range headings outweigh steady near ones (8 Nov 19:07:26-30: CenterPoint +3..+13 deg on 43 of 43
+  // frames from 17 m in, held +21 -> +13, then released on a false speed: the box turned 9 deg in one publish 8.6 m ahead, 1.07 m from the line).
+  // When >= k trusted boxes of the last <window> s agree within <spread> deg and their mean differs from the held heading by more than <deg> (and
+  // at most <max> deg: a 90-deg box is not a heading), the held heading moves to that mean: at once (gain 1, default) or by <gain> of the gap per
+  // publish (a smooth turn instead of one step). Unset = as before.
+  {
+    static const std::array<double, 6> rs = [] {
+      std::array<double, 6> v{-1.0, 1.0, 5.0, 5.0, 45.0, 1.0};
+      if (const char * e = std::getenv("NERO_MOT_STAND_RESEED")) {
+        if (std::sscanf(e, "%lf,%lf,%lf,%lf,%lf,%lf", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5]) >= 5 && v[0] > 0.0 && v[5] > 0.0 && v[5] <= 1.0) {
+          std::fprintf(stderr, "[NERO_MOT_STAND_RESEED] on: re-seed the held heading to >= %.0f trusted boxes of %.1f s agreeing within %.1f deg when %.1f-%.0f deg off\n", v[2], v[1], v[3], v[0], v[4]);
+        } else {
+          v[0] = -1.0;
+        }
+      }
+      return v;
+    }();
+    if (rs[0] > 0.0 && st.n > 0) {
+      std::vector<double> ys;
+      for (const auto & b : st.cp) {
+        if (b[0] > t - rs[1] && b[0] <= t + 1e-6) ys.push_back(neroFoldTo(b[3], st.est[2]));
+      }
+      if (static_cast<double>(ys.size()) >= rs[2]) {
+        double m = 0.0;
+        for (const double a : ys) m += a;
+        m /= static_cast<double>(ys.size());
+        double spread = 0.0;
+        for (const double a : ys) spread = std::max(spread, std::abs(a - m));
+        const double off = std::abs(m - st.est[2]) * 180.0 / M_PI;
+        if (spread * 180.0 / M_PI <= rs[3] && off > rs[0] && off <= rs[4]) {
+          if (p.debug > 0) {
+            RCLCPP_INFO(
+              rclcpp::get_logger("multi_object_tracker"), "[NERO_MOT_STAND_RESEED] %02x%02x%02x%02x t %.2f: held %.1f -> %.1f (%zu boxes, spread %.1f)",
+              id[0], id[1], id[2], id[3], t, st.est[2] * 180.0 / M_PI, m * 180.0 / M_PI, ys.size(), spread * 180.0 / M_PI);
+          }
+          st.est[2] += rs[5] * (m - st.est[2]);
+        }
+      }
+    }
+  }
   if (st.n == 0 && p.n0 <= 0.0) return;  // no prior and no trusted box yet: as the car
   const auto & h = st.est;
   // the held heading keeps the sign the car publishes now
