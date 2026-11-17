@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "autoware/behavior_path_lane_change_module/utils/path.hpp"
+#include "autoware/behavior_path_lane_change_module/utils/nero_geom_fast.hpp"  // NERO_LC_GEOM_FAST (gapperf_1117)
 
 #include "autoware/behavior_path_lane_change_module/structs/data.hpp"
 #include "autoware/behavior_path_lane_change_module/utils/calculation.hpp"
@@ -517,8 +518,24 @@ LaneChangePath construct_candidate_path(
         point.point.longitudinal_velocity_mps, static_cast<float>(terminal_lane_changing_velocity));
       continue;
     }
-    const auto nearest_idx =
-      autoware::motion_utils::findNearestIndex(target_lane_reference_path.points, point.point.pose);
+    // NERO_LC_GEOM_FAST (gapperf_1117, nero_geom_fast.hpp (b)): the position overload = the same index without the
+    // never-rejecting yaw test per new minimum
+    const int nero_gf = nero_geom_fast::mode();
+    std::optional<size_t> nearest_idx;
+    if (nero_gf == 0) {
+      nearest_idx =
+        autoware::motion_utils::findNearestIndex(target_lane_reference_path.points, point.point.pose);
+    } else {
+      nero_geom_fast::stats().nearest_calls++;
+      nearest_idx =
+        autoware::motion_utils::findNearestIndex(target_lane_reference_path.points, point.point.pose.position);
+      if (nero_gf == 2) {
+        const auto ref =
+          autoware::motion_utils::findNearestIndex(target_lane_reference_path.points, point.point.pose);
+        if (ref != nearest_idx) nero_geom_fast::stats().nearest_mismatch++;
+        nearest_idx = ref;
+      }
+    }
     point.lane_ids = target_lane_reference_path.points.at(*nearest_idx).lane_ids;
   }
 

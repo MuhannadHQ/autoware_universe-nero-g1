@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "autoware/behavior_path_lane_change_module/utils/utils.hpp"
+#include "autoware/behavior_path_lane_change_module/utils/nero_geom_fast.hpp"  // NERO_LC_GEOM_FAST (gapperf_1117)
 #include "autoware/behavior_path_planner_common/utils/nero_mu.hpp"  // NERO_BPP_PROJ_FAST
 
 #include "autoware/behavior_path_lane_change_module/structs/data.hpp"
@@ -48,6 +49,7 @@
 #include <rclcpp/rclcpp.hpp>
 
 #include <chrono>
+#include <cstring>
 #include <cstdlib>
 
 #include <boost/geometry/algorithms/buffer.hpp>
@@ -162,15 +164,42 @@ bool path_footprint_exceeds_target_lane_bound(
   const auto & target_lanes = common_data_ptr->lanes_ptr->target;
   const bool is_left = common_data_ptr->direction == Direction::LEFT;
 
-  const auto combined_target_lane = lanelet::utils::combineLaneletsShape(target_lanes);
+  // NERO_LC_GEOM_FAST (gapperf_1117, nero_geom_fast.hpp (a)): the combined bound + lanelet2's R-tree kept per (lanes, side)
+  const int nero_gf = nero_geom_fast::mode();
+  const auto nero_bound = nero_gf > 0 ? nero_geom_fast::bound(target_lanes, is_left) : nullptr;
+  if (nero_gf > 0) {
+    nero_geom_fast::stats().bound_calls++;
+    nero_geom_fast::maybe_print();
+  }
+  const auto combined_target_lane =
+    nero_gf == 1 ? lanelet::ConstLanelet{} : lanelet::utils::combineLaneletsShape(target_lanes);
 
   for (const auto & path_point : path.points) {
     const auto & pose = path_point.point.pose;
     const auto front_vertex = getEgoFrontVertex(pose, ego_info, is_left);
 
     const auto sign = is_left ? -1.0 : 1.0;
-    const auto dist_to_boundary =
-      sign * utils::getSignedDistanceFromLaneBoundary(combined_target_lane, front_vertex, is_left);
+    double dist_to_boundary = 0.0;
+    if (nero_gf == 0) {
+      dist_to_boundary =
+        sign * utils::getSignedDistanceFromLaneBoundary(combined_target_lane, front_vertex, is_left);
+    } else {
+      nero_geom_fast::stats().bound_pts++;
+      const double fast = sign * nero_geom_fast::signed_distance(
+                                   *nero_bound, lanelet::BasicPoint2d(front_vertex.x, front_vertex.y));
+      dist_to_boundary = fast;
+      if (nero_gf == 2) {
+        dist_to_boundary =
+          sign * utils::getSignedDistanceFromLaneBoundary(combined_target_lane, front_vertex, is_left);
+        if (std::memcmp(&fast, &dist_to_boundary, sizeof(double)) != 0) {
+          nero_geom_fast::stats().bound_mismatch++;
+          RCLCPP_WARN_THROTTLE(
+            get_logger(), *rclcpp::Clock::make_shared(RCL_STEADY_TIME), 1000,
+            "[NERO_LC_GEOM_FAST] bound mismatch: fast %.17g original %.17g at (%.3f, %.3f)", fast,
+            dist_to_boundary, front_vertex.x, front_vertex.y);
+        }
+      }
+    }
 
     if (dist_to_boundary < margin) {
       RCLCPP_DEBUG(get_logger(), "Path footprint exceeds target lane boundary");
