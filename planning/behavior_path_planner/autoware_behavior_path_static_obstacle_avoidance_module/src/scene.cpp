@@ -2304,6 +2304,18 @@ void StaticObstacleAvoidanceModule::fillEgoStatus(
             nero_corridor_blocker_.c_str(), n, nero_bp::env().over);
         }
       }
+      if (nero_bp::env().on && helper_->isShifted() && nero_corridor_blocker_.rfind("own lane", 0) != 0) {
+        // NERO_SOA_BLOCKED_PASS: every target of the shift is already passed (none ahead): no hold before the line for a
+        // blocker far ahead (the pause is refused with its target behind and NERO_SOA_HOLD_IN_LANE's stop landed at the robot:
+        // -2.3 / -3.4 m/s2 at B3 just after 6ec2, sims 1122-005217, 1122-020439)
+        const auto td = neroPauseTargetDistance(data);
+        if (!td || td.value() <= 0.0) {
+          nero_bp_go = true;
+          RCLCPP_WARN_THROTTLE(
+            getLogger(), *clock_, 2000, "[NERO_SOA_BLOCKED_PASS] %s: every target already passed (%.1f m): no hold",
+            nero_corridor_blocker_.c_str(), td ? td.value() : -99.0);
+        }
+      }
       if (!nero_bp_go) {
         data.safe = false;  // not moving sideways yet: the stock yield; already moving sideways: the pause below
       }
