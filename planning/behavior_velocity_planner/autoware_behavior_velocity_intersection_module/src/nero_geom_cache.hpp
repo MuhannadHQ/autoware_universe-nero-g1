@@ -236,8 +236,21 @@ inline std::shared_ptr<const SegBlocks> kept_seg_blocks(const lanelet::ConstLine
   std::lock_guard<std::mutex> lock(mtx);
   return store.emplace(key, e).first->second;
 }
+// 2026-11-21: upstream dereferences an empty segment (SIGSEGV, behavior_planning_container died
+// 19:02:50) when the centerline has < 2 points or no segment is nearer than DBL_MAX (a non-finite
+// search point). Those inputs never reach it from here: NaN = "no lane direction" instead. A safety
+// net only: every caller tests the point inside the lanelet first (false for a non-finite point) and
+// passes map lanelets (>= 2 points), except the path strip in nero_along_ego_lane, which checks its
+// centerline before calling. Any mode, including 0 (stock otherwise).
+inline bool degenerate_angle_input(
+  const lanelet::ConstLanelet & lanelet, const geometry_msgs::msg::Point & search_point)
+{
+  return !std::isfinite(search_point.x) || !std::isfinite(search_point.y) ||
+         lanelet.centerline2d().size() < 2;
+}
 inline double getLaneletAngle(const lanelet::ConstLanelet & lanelet, const geometry_msgs::msg::Point & search_point)
 {
+  if (degenerate_angle_input(lanelet, search_point)) return std::numeric_limits<double>::quiet_NaN();
   const int m = mode();
   if (m == 0) return lanelet::utils::getLaneletAngle(lanelet, search_point);
   static ExitPrinter at_exit;
@@ -246,7 +259,7 @@ inline double getLaneletAngle(const lanelet::ConstLanelet & lanelet, const geome
   s.la_calls++;
   const auto cl = lanelet.centerline();
   const size_t n = cl.size();
-  if (n < 2) return lanelet::utils::getLaneletAngle(lanelet, search_point);  // upstream's own (empty segment) path
+  if (n < 2) return std::numeric_limits<double>::quiet_NaN();  // unreachable (guarded above)
   const int64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(
                         std::chrono::steady_clock::now().time_since_epoch())
                         .count();
@@ -278,7 +291,7 @@ inline double getLaneletAngle(const lanelet::ConstLanelet & lanelet, const geome
       }
     }
   }
-  if (best == 0) return lanelet::utils::getLaneletAngle(lanelet, search_point);
+  if (best == 0) return std::numeric_limits<double>::quiet_NaN();  // no nearer segment (non-finite points)
   const double fast = std::atan2(cl[best].y() - cl[best - 1].y(), cl[best].x() - cl[best - 1].x());
   if (m == 2) {
     const double ref = lanelet::utils::getLaneletAngle(lanelet, search_point);

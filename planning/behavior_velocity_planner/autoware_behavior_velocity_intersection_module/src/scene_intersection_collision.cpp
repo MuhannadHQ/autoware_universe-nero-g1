@@ -2776,6 +2776,12 @@ void IntersectionModule::updateObjectInfoManagerCollision(
     double nero_adj_skip_conf = 0.0;
     std::pair<double, double> nero_adj_skip_in{0.0, 0.0};
     const auto nero_along_ego_lane = [&](const CollisionInterval & iv) {
+      // 2026-11-21 19:02:50 SIGSEGV: ego_or_entry2exit is a strip built from the path every 1.5 m from
+      // ego's closest point to the lane's end; within 1.5 m of the end it has one point a side (a
+      // line across the lane that a box can still touch) and its centerline < 2 points, where
+      // getLaneletAngle dereferences an empty segment. No lane direction = not "along": the
+      // path stays a normal collision target (never skipped on a guess).
+      if (!has_ego_exit_yaw) return false;
       const double thr = planner_param_.common.attention_area_angle_threshold;
       const auto [b, e] = iv.interval_position;
       double dmax = 0.0;
