@@ -29,6 +29,8 @@
 #include <tf2/utils.h>
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <cmath>
 #include <iostream>
 #include <limits>
@@ -1099,8 +1101,43 @@ ObstacleSlowDownModule::calculate_distance_to_slow_down_with_constraints(
                                   : std::abs(vehicle_info.min_longitudinal_offset_m);
   const double obstacle_vel = obstacle.velocity;
   // calculate slow down velocity
-  const double slow_down_vel =
+  double slow_down_vel =
     calculate_slow_down_velocity(obstacle, prev_output, is_obstacle_moving);
+  // NERO_OSD_ONCOMING_STILL=<v_mps>,<yaw_deg> (izparked-2 2026-11-22, Izdihar B7 19:46: the robot passed a car that had stopped
+  // for it in the oncoming lane at 0.45 m and 10.7 km/h; Ahmed: "a stopped one still counts": walking pace with a side gap):
+  // a standing vehicle facing the robot (heading within 180 - yaw_deg of head-on) inside this module's lateral band (filtering
+  // max_lat_margin, 1.1 m) is passed at no more than v_mps; the stock per-type speed applies when it is lower. Unset = stock.
+  {
+    struct NeroOnc
+    {
+      bool on{false};
+      double v{1.4};
+      double yaw_deg{135.0};
+    };
+    static const NeroOnc nero_onc = [] {
+      NeroOnc c;
+      if (const char * e = std::getenv("NERO_OSD_ONCOMING_STILL")) {
+        c.on = std::sscanf(e, "%lf,%lf", &c.v, &c.yaw_deg) >= 1;
+      }
+      return c;
+    }();
+    if (nero_onc.on && !is_obstacle_moving) {
+      const auto l = obstacle.classification.label;
+      const bool vehicle = l == ObjectClassification::CAR || l == ObjectClassification::TRUCK ||
+                           l == ObjectClassification::BUS || l == ObjectClassification::TRAILER;
+      const double ego_yaw = tf2::getYaw(planner_data->current_odometry.pose.pose.orientation);
+      const double d_yaw =
+        std::abs(autoware_utils::normalize_radian(tf2::getYaw(obstacle.pose.orientation) - ego_yaw));
+      if (vehicle && d_yaw > nero_onc.yaw_deg * M_PI / 180.0 && slow_down_vel > nero_onc.v) {
+        static rclcpp::Clock nero_clock(RCL_ROS_TIME);
+        RCLCPP_INFO_THROTTLE(
+          rclcpp::get_logger("obstacle_slow_down"), nero_clock, 1000,
+          "[NERO_OSD_ONCOMING_STILL] %s standing, facing the robot (%.0f deg), %.2f m from the path: %.2f -> %.2f m/s",
+          obstacle.uuid.substr(0, 4).c_str(), d_yaw * 180.0 / M_PI, obstacle.dist_to_traj_poly, slow_down_vel, nero_onc.v);
+        slow_down_vel = nero_onc.v;
+      }
+    }
+  }
 
   // calculate distance to collision points
   const double dist_to_front_collision =
