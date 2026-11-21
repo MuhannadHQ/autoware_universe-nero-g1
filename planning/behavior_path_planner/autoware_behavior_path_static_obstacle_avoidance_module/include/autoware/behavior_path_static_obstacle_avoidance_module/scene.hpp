@@ -516,6 +516,9 @@ private:
   mutable std::string nero_side_who_;      // that object (debug)
   mutable bool nero_side_pause_{false};    // the current pause is a side pause (C)
   mutable bool nero_side_pass_{false};     // the hold keeps every target's hard margin: no stop
+  mutable bool nero_pause_pass_{false};
+  // NERO_SOA_BLOCKED_PASS: the shift that keeps every target's hard margin (+extra) on that side, if it fits within line + over
+  std::optional<double> neroBlockedPassShift(const AvoidancePlanningData & data, const bool left, int * n_out) const;    // NERO_SOA_BLOCKED_PASS: the corridor pause holds a hard-margin shift and passes slowly
   mutable std::optional<geometry_msgs::msg::Point> nero_side_stop_;  // the side pause's stop point (map)
   mutable double nero_side_clear_since_{-1.0};
   // NERO_SOA_SIDE_LANE: a yield for a car behind / alongside (the out-of-lane pass of this target is unsafe) latches a

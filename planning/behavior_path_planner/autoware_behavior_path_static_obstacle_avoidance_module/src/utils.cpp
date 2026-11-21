@@ -1476,10 +1476,18 @@ std::optional<double> getAvoidMargin(
   // tol_m < 0 aims inside the line: -0.1 (one quantize_size step) keeps the quantized shift off the line itself (tol 0.0 put
   // B3's shift at 0.90 m against a 0.89 m limit: the "pass over the line blocked" pause woke with its target behind the robot,
   // the hold-in-lane stop landed at the robot: -3.4 m/s2, sim 1122-005217)
+  // keep_m (default 0.2): no cap that would leave less than hard + keep_m, so NERO_SOA_AMBIGUOUS_FRAGMENT's "approved line
+  // keeps the hard margin + 0.1 m" holds after the 0.1 m quantize (sim 1122-012029: capped to hard + ~0.05 at 078e, its stop
+  // before the car -> -1.9 m/s2)
   static const std::optional<double> nero_inlane_tol = []() -> std::optional<double> {
     const char * v = std::getenv("NERO_SOA_INLANE_SOFT");
     if (v == nullptr || !*v) return std::nullopt;
     return std::atof(v);
+  }();
+  static const double nero_inlane_keep = [] {
+    double tol = 0.0, keep = 0.15;
+    if (const char * v = std::getenv("NERO_SOA_INLANE_SOFT")) std::sscanf(v, "%lf,%lf", &tol, &keep);
+    return keep;
   }();
   const double stock = std::min(soft_lateral_distance_limit, max_avoid_margin);
   if (nero_inlane_tol && !object.overhang_points.empty() && planner_data->route_handler) {
@@ -1494,8 +1502,12 @@ std::optional<double> getAvoidMargin(
         const bool on_right = utils::static_obstacle_avoidance::isOnRight(object);
         const double room = on_right ? boost::geometry::distance(ll.leftBound2d().basicLineString(), q)
                                      : boost::geometry::distance(ll.rightBound2d().basicLineString(), q);
+        // all or nothing: capped only when the body stays inside the line by -tol AND the margin keeps hard + keep_m; else stock
+        // (a margin floored near the line left the shift a few cm over it: the pass-blocked pause woke at B3 / 078e, sim 1122-012923)
         const double inlane = room + *nero_inlane_tol - 0.5 * vehicle_width;
-        if (inlane >= min_avoid_margin && inlane < stock) {
+        // keep_m applies to a vehicle carrying a fragment's history (NERO_SOA_AMBIGUOUS_FRAGMENT checks hard + 0.1 m for it)
+        const double keep = nero_frag::carried(object) ? nero_inlane_keep : 0.0;
+        if (inlane >= min_avoid_margin + keep && inlane < stock) {
           static rclcpp::Clock dbg_clock(RCL_ROS_TIME);
           static const bool dbg = std::getenv("NERO_SOA_INLANE_DEBUG") != nullptr;
           if (dbg) {
