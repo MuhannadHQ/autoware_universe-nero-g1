@@ -77,7 +77,8 @@ private:
   rclcpp::Subscription<tier4_system_msgs::msg::OperationModeAvailability>::SharedPtr
     sub_operation_mode_availability_;
 
-  // NERO: operator release of the emergency holding latch (dashboard button via the bridge).
+  // NERO: operator release (dashboard "MRM · Release" via the bridge): the emergency holding latch,
+  // and since 2026-11-21 a held MRM itself once not AUTONOMOUS and stopped (see the .cpp).
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr srv_clear_emergency_holding_;
   void onClearEmergencyHolding(
     const std_srvs::srv::Trigger::Request::SharedPtr request,

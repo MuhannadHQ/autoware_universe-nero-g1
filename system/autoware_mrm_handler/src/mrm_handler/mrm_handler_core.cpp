@@ -46,7 +46,7 @@ MrmHandler::MrmHandler(const rclcpp::NodeOptions & options) : Node("mrm_handler"
       std::bind(&MrmHandler::onOperationModeAvailability, this, _1));
 
   // NERO: nothing in v0.44 ever resets is_emergency_holding_, so without this the latch
-  // only clears by restarting the node. Default callback group: mutually exclusive with the
+  // only clears by restarting the node (2026-11-21: also releases a held MRM, see the callback). Default callback group: mutually exclusive with the
   // availability subscription and the timer that read the flag.
   srv_clear_emergency_holding_ = create_service<std_srvs::srv::Trigger>(
     "~/clear_emergency_holding",
@@ -123,22 +123,50 @@ void MrmHandler::onClearEmergencyHolding(
   const std_srvs::srv::Trigger::Request::SharedPtr /*request*/,
   std_srvs::srv::Trigger::Response::SharedPtr response)
 {
-  if (!is_emergency_holding_) {
+  using autoware_adapi_v1_msgs::msg::MrmState;
+  using autoware_adapi_v1_msgs::msg::OperationModeState;
+
+  // NERO 2026-11-21 (operator MRM release, the dashboard's "MRM · Release"): stock v0.44 keeps an
+  // MRM until autonomous mode is available again, and while an emergency-stop MRM holds,
+  // vehicle_cmd_gate replaces every command (Remote included) with the emergency stop. A cause
+  // that never clears (11-21 19:02: behavior_planning_container died) left the car unmovable from
+  // the dashboard until Autoware restarted. The operator may now release it once Autoware no
+  // longer drives (operation mode known and not AUTONOMOUS: the bridge switches to STOP first)
+  // and the vehicle stands still. The MRM arms again as stock on the next AUTONOMOUS engage
+  // (NORMAL -> MRM_OPERATING), which the operation mode manager refuses while the cause lasts.
+  const bool mrm_active = mrm_state_.state != MrmState::NORMAL;
+  if (!is_emergency_holding_ && !mrm_active) {
     response->success = true;
-    response->message = "not latched";
+    response->message = "no MRM to release";
     return;
   }
-  // Releasing while the cause is still there would only re-latch it.
-  if (!operation_mode_availability_ || !operation_mode_availability_->autonomous) {
+  const auto op_mode = sub_operation_mode_state_.take_data();
+  if (!op_mode) {
     response->success = false;
-    response->message = "the cause is still active: autonomous mode is unavailable";
+    response->message = "operation mode not known yet: MRM kept";
     return;
   }
+  if (op_mode->mode == OperationModeState::AUTONOMOUS) {
+    response->success = false;
+    response->message = "Autoware is driving (AUTONOMOUS): switch to STOP first. MRM kept";
+    return;
+  }
+  if (!isStopped()) {
+    response->success = false;
+    response->message = "the vehicle is still moving: MRM kept";
+    return;
+  }
+  const bool cause_active = !operation_mode_availability_ || !operation_mode_availability_->autonomous;
   is_emergency_holding_ = false;
   stamp_autonomous_become_unavailable_.reset();
-  RCLCPP_WARN(get_logger(), "Emergency holding cleared by operator request.");
+  if (mrm_active) transitionTo(MrmState::NORMAL);  // operateMrm() cancels the behavior next tick
+  RCLCPP_WARN(
+    get_logger(), "MRM released by operator request (operation mode %u, %s).", op_mode->mode,
+    cause_active ? "autonomous still unavailable" : "autonomous available");
   response->success = true;
-  response->message = "latch cleared";
+  response->message = cause_active
+                        ? "MRM released; autonomous still unavailable (its cause is active)"
+                        : "MRM released";
 }
 
 void MrmHandler::publishHazardCmd()
