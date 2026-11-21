@@ -38,6 +38,7 @@
 #include <boost/geometry/algorithms/distance.hpp>
 #include <boost/geometry/algorithms/intersection.hpp>  // NERO_SOA_ENVELOPE_CAP
 #include <boost/geometry/algorithms/union.hpp>
+#include <boost/geometry/algorithms/within.hpp>  // NERO_SOA_INLANE_SOFT
 #include <boost/geometry/geometries/point_xy.hpp>
 
 #include <lanelet2_routing/RoutingGraphContainer.h>
@@ -1467,7 +1468,48 @@ std::optional<double> getAvoidMargin(
   }
 
   // Step3. nominal case. avoid margin is limited by soft constraint.
-  return std::min(soft_lateral_distance_limit, max_avoid_margin);
+  // NERO_SOA_INLANE_SOFT=<tol_m> (izparked-2 2026-11-22, Ahmed 11-21: "the robot could have squeexed through"; Izdihar B5/B6 and
+  // B7: the soft margin took the body 0.16 / 0.48 m over the line, at B7 into the oncoming lane with a car coming, where the hard
+  // margin fitted inside the lane with 0.6-0.9 m to spare): the SOFT margin is used only as far as the body stays within tol_m
+  // of the own lane's line on the avoidance side (the route lanelet at the object's overhang point). The hard margin is never
+  // cut: an object that needs the body further out with only the hard margin keeps the stock margin. Unset = stock.
+  // tol_m < 0 aims inside the line: -0.1 (one quantize_size step) keeps the quantized shift off the line itself (tol 0.0 put
+  // B3's shift at 0.90 m against a 0.89 m limit: the "pass over the line blocked" pause woke with its target behind the robot,
+  // the hold-in-lane stop landed at the robot: -3.4 m/s2, sim 1122-005217)
+  static const std::optional<double> nero_inlane_tol = []() -> std::optional<double> {
+    const char * v = std::getenv("NERO_SOA_INLANE_SOFT");
+    if (v == nullptr || !*v) return std::nullopt;
+    return std::atof(v);
+  }();
+  const double stock = std::min(soft_lateral_distance_limit, max_avoid_margin);
+  if (nero_inlane_tol && !object.overhang_points.empty() && planner_data->route_handler) {
+    const auto & op = object.overhang_points.front().second;
+    geometry_msgs::msg::Pose pose;
+    pose.position = op;
+    pose.orientation = object.object.kinematics.initial_pose_with_covariance.pose.orientation;
+    lanelet::ConstLanelet ll;
+    if (planner_data->route_handler->getClosestLaneletWithinRoute(pose, &ll)) {
+      const lanelet::BasicPoint2d q(op.x, op.y);
+      if (boost::geometry::within(q, ll.polygon2d().basicPolygon())) {
+        const bool on_right = utils::static_obstacle_avoidance::isOnRight(object);
+        const double room = on_right ? boost::geometry::distance(ll.leftBound2d().basicLineString(), q)
+                                     : boost::geometry::distance(ll.rightBound2d().basicLineString(), q);
+        const double inlane = room + *nero_inlane_tol - 0.5 * vehicle_width;
+        if (inlane >= min_avoid_margin && inlane < stock) {
+          static rclcpp::Clock dbg_clock(RCL_ROS_TIME);
+          static const bool dbg = std::getenv("NERO_SOA_INLANE_DEBUG") != nullptr;
+          if (dbg) {
+            RCLCPP_INFO_THROTTLE(
+              rclcpp::get_logger("static_obstacle_avoidance"), dbg_clock, 1000,
+              "[NERO_SOA_INLANE] %02x%02x: margin %.2f -> %.2f (room to the lane line %.2f, hard %.2f)",
+              object.object.object_id.uuid[0], object.object.object_id.uuid[1], stock, inlane, room, min_avoid_margin);
+          }
+          return inlane;
+        }
+      }
+    }
+  }
+  return stock;
 }
 
 /**
