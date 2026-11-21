@@ -25,6 +25,7 @@
 #include <autoware/behavior_path_static_obstacle_avoidance_module/data_structs.hpp>
 #include <autoware_lanelet2_extension/utility/utilities.hpp>
 #include <autoware_utils/ros/uuid_helper.hpp>
+#include <autoware_utils/geometry/boost_polygon_utils.hpp>
 #include <autoware_lanelet2_extension/utility/query.hpp>
 #include <rclcpp/logging.hpp>
 
@@ -60,6 +61,64 @@ bool nero_ablc_dbg_every(const int period_ms)
 int nero_ablc_n_in_lane = 0;    // objects overlapping the current lanes in the last fill
 int nero_ablc_n_centre = 0;     // ... dropped for being within th_offset_from_centerline of the centre line
 std::string nero_ablc_centre_ids;
+
+// NERO_ABLC_NEED=<margin_m>,<max_dev_m>,<row_n>,<row_gap_m>,<start_m>,<start_s> (izparked-2 2026-11-22, Ahmed 11-21: "it should go to
+// the other lane only if there is no space on its lane or it would keep hopping back and forth because of too many double parked
+// cars"; "the lane change avoidance was way too early pluas the robot could have squeexed through"). For each avoid_required target
+// ahead, the free width of the own lane beside it (its own box to the far bound, the side with more room) against what static
+// avoidance needs to pass it inside the lane: robot width + margin_m (hard margin + its envelope buffer) - max_dev_m (its
+// max_deviation_from_lane). The other lane is requested only for (a) a target that does not fit, or (b) the first of >= row_n
+// targets each taking the body over the line (free < width + margin) with gaps < row_gap_m; and only once that target is within
+// max(start_m, speed * start_s). Everything else is static avoidance's in-lane pass. Unset = as before (every avoid_required
+// target, from as far as it is seen: 71 m on the 21 Nov route).
+struct NeroNeed
+{
+  bool on{false};
+  double margin{0.4};
+  double max_dev{0.2};
+  int row_n{3};
+  double row_gap{20.0};
+  double start_m{30.0};
+  double start_s{6.0};
+};
+const NeroNeed & nero_need_cfg()
+{
+  static const NeroNeed c = [] {
+    NeroNeed n;
+    if (const char * e = std::getenv("NERO_ABLC_NEED")) {
+      const int k = std::sscanf(
+        e, "%lf,%lf,%d,%lf,%lf,%lf", &n.margin, &n.max_dev, &n.row_n, &n.row_gap, &n.start_m, &n.start_s);
+      n.on = k >= 1;
+      if (n.on) {
+        RCLCPP_INFO(
+          rclcpp::get_logger("avoidance_by_lane_change"),
+          "[NERO_ABLC_NEED] on: margin %.2f max_dev %.2f row %d gap %.1f start max(%.1f m, %.1f s)", n.margin, n.max_dev,
+          n.row_n, n.row_gap, n.start_m, n.start_s);
+      }
+    }
+    return n;
+  }();
+  return c;
+}
+// signed distance of p from the polyline (> 0 left of its direction), nearest segment
+double nero_signed_dist(const std::vector<lanelet::BasicPoint2d> & ls, const lanelet::BasicPoint2d & p)
+{
+  double best = std::numeric_limits<double>::max();
+  double sd = 0.0;
+  for (size_t i = 0; i + 1 < ls.size(); ++i) {
+    const lanelet::BasicPoint2d ab = ls[i + 1] - ls[i];
+    const double l2 = ab.squaredNorm();
+    if (l2 < 1e-9) continue;
+    const lanelet::BasicPoint2d ap = p - ls[i];
+    const double t = std::clamp(ap.dot(ab) / l2, 0.0, 1.0);
+    const double d = (ap - t * ab).norm();
+    if (d < best) {
+      best = d;
+      sd = (ab.x() * ap.y() - ab.y() * ap.x()) >= 0.0 ? d : -d;
+    }
+  }
+  return sd;
+}
 
 geometry_msgs::msg::Point32 create_point32(const geometry_msgs::msg::Pose & pose)
 {
@@ -166,6 +225,27 @@ bool AvoidanceByLaneChange::specialRequiredCheck() const
     return false;
   }
 
+  // NERO_ABLC_NEED: only a target that does not fit in the own lane (or a row) asks for the other lane, and only near it
+  if (nero_need_cfg().on) {
+    if (nero_need_idx_ < 0 || nero_need_idx_ >= static_cast<int>(data.target_objects.size())) {
+      if (nero_log) {
+        RCLCPP_INFO(logger_, "[NERO_ABLC_NEED] no: %s | %s", nero_need_why_.c_str(), nero_lanes().c_str());
+      }
+      return false;
+    }
+    const auto & o = data.target_objects.at(nero_need_idx_);
+    const double min_avoid = calcMinAvoidanceLength(o);
+    const double min_lc = calc_minimum_dist_buffer();
+    const bool ok = o.longitudinal > std::max(min_lc, min_avoid);
+    if (nero_log) {
+      RCLCPP_INFO(
+        logger_, "[NERO_ABLC_NEED] %s | %s | min_lc %.1f min_avoid %.1f | dir %d | %s",
+        ok ? "yes" : "no: nearer than the minimum lengths", nero_need_why_.c_str(), min_lc, min_avoid,
+        static_cast<int>(direction_), nero_lanes().c_str());
+    }
+    return ok;
+  }
+
   // NERO_ABLC_LANES (mainlane): measure the change's room to the nearest object that needs avoiding; upstream took the nearest
   // object of any kind, so a kerb-parked car needing no avoidance 16 m ahead ended the request while the wall it was for was
   // still 21 m ahead (sim S4 r31: "nearer than the minimum lengths" from 10.4 s, static avoidance took the wall)
@@ -249,6 +329,13 @@ void AvoidanceByLaneChange::updateSpecialData()
         direction_ = utils::static_obstacle_avoidance::isOnRight(*it) ? Direction::LEFT : Direction::RIGHT;
       }
     }
+  }
+  // NERO_ABLC_NEED: which target (if any) really needs the other lane; the direction follows it
+  nero_update_need();
+  if (nero_need_idx_ >= 0) {
+    direction_ = utils::static_obstacle_avoidance::isOnRight(avoidance_data_.target_objects.at(nero_need_idx_))
+                   ? Direction::LEFT
+                   : Direction::RIGHT;
   }
   // NERO_ABLC_DEBUG (log only): the module's own data each 0.5 s (the request chain: current lanes -> objects in them ->
   // targets -> direction -> target lanes -> isLaneChangeRequired)
@@ -594,6 +681,9 @@ const ObjectData & AvoidanceByLaneChange::nero_nearest_required() const
     return v != nullptr && std::atoi(v) > 0;
   }();
   const auto & objs = avoidance_data_.target_objects;
+  if (nero_need_idx_ >= 0 && nero_need_idx_ < static_cast<int>(objs.size())) {
+    return objs.at(nero_need_idx_);  // NERO_ABLC_NEED: the target the change is for (the wait stop is placed before it)
+  }
   if (on) {
     // ahead of ego only: a piece already beside / behind the robot (longitudinal <= 0) made every request "nearer than the
     // minimum lengths" (field logsim w1108_1910: nearest -6 .. -30 m)
@@ -605,6 +695,96 @@ const ObjectData & AvoidanceByLaneChange::nero_nearest_required() const
     }
   }
   return objs.front();
+}
+
+void AvoidanceByLaneChange::nero_update_need()
+{
+  nero_need_idx_ = -1;
+  nero_need_late_ = false;
+  nero_need_why_.clear();
+  const auto & cfg = nero_need_cfg();
+  if (!cfg.on) return;
+  const auto & objs = avoidance_data_.target_objects;
+  const auto & lanes = avoidance_data_.current_lanelets;
+  if (objs.empty() || lanes.empty()) {
+    nero_need_why_ = objs.empty() ? "no target" : "no lanes";
+    return;
+  }
+  // the own lane's bounds along the current lanes
+  std::vector<lanelet::BasicPoint2d> lb, rb;
+  const auto append = [](std::vector<lanelet::BasicPoint2d> & out, const auto & ls) {
+    for (const auto & q : ls) {
+      const lanelet::BasicPoint2d p(q.x(), q.y());
+      if (out.empty() || (out.back() - p).norm() > 1e-3) out.push_back(p);
+    }
+  };
+  for (const auto & l : lanes) {
+    append(lb, l.leftBound2d().basicLineString());
+    append(rb, l.rightBound2d().basicLineString());
+  }
+  const double w = planner_data_->parameters.vehicle_width;
+  const double fit_need = w + cfg.margin - cfg.max_dev;  // free width static avoidance needs to stay in the lane
+  const double line_need = w + cfg.margin;               // ... to keep the whole body inside the line
+  int blocked = -1, row_first = -1, chain_first = -1, chain_n = 0;
+  double chain_end = 0.0;
+  std::string list;
+  int listed = 0;
+  for (size_t i = 0; i < objs.size(); ++i) {
+    const auto & o = objs.at(i);
+    if (!o.avoid_required || o.longitudinal <= 0.0) continue;
+    const auto poly = autoware_utils::to_polygon2d(o.object);
+    double max_l = -std::numeric_limits<double>::max(), min_r = std::numeric_limits<double>::max();
+    for (const auto & q : poly.outer()) {
+      const lanelet::BasicPoint2d p(q.x(), q.y());
+      max_l = std::max(max_l, nero_signed_dist(lb, p));  // < 0: right of the left bound (inside)
+      min_r = std::min(min_r, nero_signed_dist(rb, p));  // > 0: left of the right bound (inside)
+    }
+    const double free = std::max(-max_l, min_r);
+    if (listed < 6) {
+      char b[72];
+      std::snprintf(
+        b, sizeof(b), " %02x%02x@%.1f:free %.2f", o.object.object_id.uuid[0], o.object.object_id.uuid[1], o.longitudinal,
+        free);
+      list += b;
+      ++listed;
+    }
+    if (blocked < 0 && free < fit_need) blocked = static_cast<int>(i);
+    if (row_first < 0 && free < line_need) {
+      if (chain_n > 0 && o.longitudinal - chain_end < cfg.row_gap) {
+        ++chain_n;
+      } else {
+        chain_first = static_cast<int>(i);
+        chain_n = 1;
+      }
+      chain_end = o.longitudinal + o.length;
+      if (chain_n >= cfg.row_n) row_first = chain_first;
+    }
+  }
+  int first = blocked;
+  const char * kind = "blocked";
+  if (row_first >= 0 && (first < 0 || objs.at(row_first).longitudinal < objs.at(first).longitudinal)) {
+    first = row_first;
+    kind = "row";
+  }
+  char head[160];
+  if (first < 0) {
+    std::snprintf(head, sizeof(head), "fits in the lane (need %.2f, line %.2f) |", fit_need, line_need);
+    nero_need_why_ = head + list;
+    return;
+  }
+  const double start = std::max(cfg.start_m, std::max(0.0, getEgoVelocity()) * cfg.start_s);
+  const auto & f = objs.at(first);
+  if (f.longitudinal > start) {
+    nero_need_late_ = true;
+    std::snprintf(head, sizeof(head), "%s %02x%02x at %.1f m > start %.1f m (need %.2f) |", kind,
+      f.object.object_id.uuid[0], f.object.object_id.uuid[1], f.longitudinal, start, fit_need);
+    nero_need_why_ = head + list;
+    return;
+  }
+  nero_need_idx_ = first;
+  std::snprintf(head, sizeof(head), "%s %02x%02x at %.1f m <= start %.1f m (need %.2f) |", kind,
+    f.object.object_id.uuid[0], f.object.object_id.uuid[1], f.longitudinal, start, fit_need);
+  nero_need_why_ = head + list;
 }
 
 std::vector<std::string> AvoidanceByLaneChange::nero_claim_ids() const

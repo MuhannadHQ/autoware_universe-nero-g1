@@ -78,6 +78,13 @@ private:
   double calcMinAvoidanceLength(const ObjectData & nearest_object) const;
   double calc_minimum_dist_buffer() const;
   double calcLateralOffset() const;
+
+  // NERO_ABLC_NEED (izparked-2 2026-11-22): the first target that really needs the other lane (no room in the own lane, or
+  // the first of a row that would make the robot hop), -1 = none; why = the decision line for the debug log
+  int nero_need_idx_{-1};
+  bool nero_need_late_{false};  // a target needs the other lane but is still farther than the start distance
+  std::string nero_need_why_;
+  void nero_update_need();
 };
 }  // namespace autoware::behavior_path_planner
 
