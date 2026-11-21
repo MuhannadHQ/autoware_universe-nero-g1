@@ -120,6 +120,16 @@ double nero_signed_dist(const std::vector<lanelet::BasicPoint2d> & ls, const lan
   return sd;
 }
 
+// NERO_ABLC_NEED: one stand-clock registry for every avoidance_by_lane_change instance. Each new instance (the idle one
+// that takes over when the module starts running) began with an empty registry, so a standing vehicle near the lane centre
+// (NERO_ABLC_CENTRE: kept only after standing 3 s) was "moving" again for 3 s, the waiting request expired and was re-made:
+// sim 1122-003956, a double-parked truck: requested at 29.8 m, expired, again at 18.4 m, expired, then too near -> stood 29 s.
+autoware::behavior_path_planner::ObjectDataArray & nero_shared_stopped()
+{
+  static autoware::behavior_path_planner::ObjectDataArray reg;
+  return reg;
+}
+
 geometry_msgs::msg::Point32 create_point32(const geometry_msgs::msg::Pose & pose)
 {
   geometry_msgs::msg::Point32 p;
@@ -281,6 +291,13 @@ void AvoidanceByLaneChange::updateSpecialData()
   const auto p = std::dynamic_pointer_cast<AvoidanceParameters>(avoidance_parameters_);
 
   avoidance_debug_data_ = DebugData();
+  if (nero_need_cfg().on) {  // NERO_ABLC_NEED: the shared registry forgets objects not seen standing for 5 s
+    auto & reg = nero_shared_stopped();
+    const rclcpp::Time now = rclcpp::Clock(RCL_ROS_TIME).now();
+    reg.erase(
+      std::remove_if(reg.begin(), reg.end(), [&now](const auto & o) { return (now - o.last_stop).seconds() > 5.0; }),
+      reg.end());
+  }
   avoidance_data_ = calcAvoidancePlanningData(avoidance_debug_data_);
 
   if (avoidance_data_.target_objects.empty()) {
@@ -522,7 +539,8 @@ std::optional<ObjectData> AvoidanceByLaneChange::createObjectData(
   object_data.centroid = return_centroid<Point2d>(object_data.envelope_poly);
 
   // Calc moving time.
-  utils::static_obstacle_avoidance::fillObjectMovingTime(object_data, stopped_objects_, p);
+  utils::static_obstacle_avoidance::fillObjectMovingTime(
+    object_data, nero_need_cfg().on ? nero_shared_stopped() : stopped_objects_, p);
 
   if (nero_on_centre) {  // only reached with NERO_ABLC_CENTRE set
     const bool is_unknown = t == ObjectClassification::UNKNOWN;
