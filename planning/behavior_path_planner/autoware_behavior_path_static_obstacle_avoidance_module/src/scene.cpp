@@ -2299,9 +2299,13 @@ void StaticObstacleAvoidanceModule::fillEgoStatus(
         int n = 0;
         const auto closes = std::abs(desired) >= 0.1 ? neroBlockerClosesLane(data, desired > 0.0) : std::nullopt;
         if (closes) {
+          // izparked-3 05:2x (Ahmed: "it stopped for 13 seconds before doing the go around ??"): the targets are still
+          // passed; the stop goes before the blocker that closes the lane (neroInsertBlockerStop)
           RCLCPP_WARN_THROTTLE(
-            getLogger(), *clock_, 2000, "[NERO_SOA_BLOCKED_PASS] %s: truly blocked, the stock wait", closes->c_str());
-        } else if (std::abs(desired) >= 0.1 && neroBlockedPassShift(data, desired > 0.0, &n)) {
+            getLogger(), *clock_, 2000, "[NERO_SOA_BLOCKED_PASS] %s: the targets are passed, the stop is before it",
+            closes->c_str());
+        }
+        if (std::abs(desired) >= 0.1 && neroBlockedPassShift(data, desired > 0.0, &n)) {
           nero_bp_go = true;
           RCLCPP_WARN_THROTTLE(
             getLogger(), *clock_, 2000,
@@ -2688,6 +2692,7 @@ void StaticObstacleAvoidanceModule::updateEgoBehavior(
   }
 
   const auto insert_velocity = [this, &data, &path]() {
+    neroInsertBlockerStop(path);  // NERO_SOA_BLOCKED_PASS: a stop before a blocker that closes the lane (no-op otherwise)
     if (nero_paused_) {  // NERO_SOA_ONCOMING_PAUSE: stop before the target, the body held inside the lane
       neroInsertPauseStop(path);
       return;
@@ -3280,10 +3285,11 @@ bool StaticObstacleAvoidanceModule::neroOncomingPause(AvoidancePlanningData & da
       : std::nullopt;
   if (nero_closes) {
     RCLCPP_WARN_THROTTLE(
-      getLogger(), *clock_, 1000, "[NERO_SOA_BLOCKED_PASS] %s: truly blocked, stock pause", nero_closes->c_str());
+      getLogger(), *clock_, 1000, "[NERO_SOA_BLOCKED_PASS] %s: the targets are passed, the stop is before it",
+      nero_closes->c_str());
   }
   if (
-    !nero_closes && nero_bp::env().on && !nero_onc_ && !nero_corridor_blocker_.empty() &&
+    nero_bp::env().on && !nero_onc_ && !nero_corridor_blocker_.empty() &&
     nero_corridor_blocker_.rfind("own lane", 0) != 0) {
     const auto & be = nero_bp::env();
     int n = 0;
@@ -4535,6 +4541,13 @@ void StaticObstacleAvoidanceModule::neroReturnClear(AvoidancePlanningData & data
   const double band_lo = std::min(0.0, ego_shift) - half_w - 1.0;
   const double band_hi = std::max(0.0, ego_shift) + half_w + 1.0;
   std::vector<Standing> objs;
+  // NERO_SOA_BLOCKED_PASS (izparked-3 05:3x): with a stop before a blocker that closes the lane, nothing beyond where ego's
+  // front stops is reached: the way back is not held for it (sim 1122-052412: the shift held for the junction car's nose
+  // kept ego over the line, the oncoming truck 620b then made the stock pause stop at once)
+  double nero_bp_stop_s = 1e9;
+  if (nero_bp::env().on && nero_bp_stop_pt_) {
+    nero_bp_stop_s = nero_mu::calcSignedArcLength(ref, getEgoPosition(), nero_bp_stop_pt_.value()) - 4.0;
+  }
   for (const auto & o : planner_data_->dynamic_object->objects) {
     const auto & tw = o.kinematics.initial_twist_with_covariance.twist.linear;
     if (std::hypot(tw.x, tw.y) >= 0.5) continue;  // standing objects only
@@ -4557,6 +4570,7 @@ void StaticObstacleAvoidanceModule::neroReturnClear(AvoidancePlanningData & data
     st.s_near = s_c - r;
     st.s_far = s_c + r;
     if (st.s_far < -vp.base_link2rear || st.s_near > nero_rcl::HORIZON + 30.0) continue;  // behind ego / far ahead
+    if (st.s_near > nero_bp_stop_s) continue;  // NERO_SOA_BLOCKED_PASS: beyond the stop
     if (l_c + r < band_lo - st.margin || l_c - r > band_hi + st.margin) continue;         // off to the side
     st.poly = autoware_utils::to_polygon2d(o.kinematics.initial_pose_with_covariance.pose, o.shape);
     char id[8];
@@ -4566,6 +4580,7 @@ void StaticObstacleAvoidanceModule::neroReturnClear(AvoidancePlanningData & data
   }
   const size_t n_cur = objs.size();  // NERO_SOA_RETURN_CLEAR_PLACE: the remembered places follow the objects of now
   for (const auto & at : place_at) {
+    if (at.s_near > nero_bp_stop_s) continue;  // NERO_SOA_BLOCKED_PASS: beyond the stop
     const auto & pl = places.at(at.k);
     Standing st;
     st.poly = pl.hull;
@@ -6242,6 +6257,14 @@ std::optional<std::string> StaticObstacleAvoidanceModule::neroBlockerClosesLane(
     nero_bp_place_ = c;  // the latch: neroBlockedPassLatch keeps the wait while a vehicle is still here
     nero_bp_place_t_ = clock_->now().seconds();
     nero_bp_clear_since_ = -1.0;
+    // the stop before it (neroInsertBlockerStop): its corner nearest along the path
+    if (!nero_bp_stop_pt_) {
+      RCLCPP_WARN(getLogger(), "[NERO_SOA_BLOCKED_PASS] %s closes the lane: the stop goes before it", nero_corridor_blocker_.c_str());
+    }
+    nero_bp_stop_pt_ = neroNearCorner(rp, poly);
+    nero_bp_stop_place_ = c;
+    nero_bp_stop_left_ = left;
+    nero_bp_stop_clear_since_ = -1.0;
     char buf[160];
     std::snprintf(
       buf, sizeof(buf), "%s closes the lane: past it on the pass side needs %.2f m, line + %.2f gives %.2f m",
@@ -6320,6 +6343,138 @@ void StaticObstacleAvoidanceModule::neroBlockedPassLatch(const AvoidancePlanning
     CLEAR_S);
   nero_bp_place_.reset();
   nero_bp_clear_since_ = -1.0;
+}
+
+geometry_msgs::msg::Point StaticObstacleAvoidanceModule::neroNearCorner(
+  const geometry_msgs::msg::Pose & ref_pose, const autoware_utils::Polygon2d & poly) const
+{
+  // the polygon point nearest along the reference pose's heading
+  const double yaw = tf2::getYaw(ref_pose.orientation);
+  const double cy = std::cos(yaw), sy = std::sin(yaw);
+  double best = 1e18;
+  geometry_msgs::msg::Point out = ref_pose.position;
+  for (const auto & q : poly.outer()) {
+    const double s = cy * (q.x() - ref_pose.position.x) + sy * (q.y() - ref_pose.position.y);
+    if (s < best) {
+      best = s;
+      out = autoware_utils::create_point(q.x(), q.y(), ref_pose.position.z);
+    }
+  }
+  return out;
+}
+
+bool StaticObstacleAvoidanceModule::neroObjClosesLane(
+  const AvoidancePlanningData & data, const PredictedObject & o, const bool left,
+  geometry_msgs::msg::Point * near_pt) const
+{
+  // the same test as neroBlockerClosesLane, for one object
+  const auto & ref = data.reference_path.points;
+  if (ref.size() < 2) return false;
+  const auto & be = nero_bp::env();
+  const double hw = 0.5 * planner_data_->parameters.vehicle_width;
+  const double sign = left ? 1.0 : -1.0;
+  const auto & c = o.kinematics.initial_pose_with_covariance.pose.position;
+  const auto idx = autoware::motion_utils::findNearestIndex(ref, c);
+  const auto & rp = ref.at(idx).point.pose;
+  const double ryaw = tf2::getYaw(rp.orientation);
+  const double cy = std::cos(ryaw), sy = std::sin(ryaw);
+  const auto poly = autoware_utils::to_polygon2d(o.kinematics.initial_pose_with_covariance.pose, o.shape);
+  double lo = 1e9, hi = -1e9;
+  for (const auto & q : poly.outer()) {
+    const double l = sign * (-sy * (q.x() - rp.position.x) + cy * (q.y() - rp.position.y));
+    lo = std::min(lo, l);
+    hi = std::max(hi, l);
+  }
+  lanelet::ConstLanelet ll;
+  if (!nero_geom_fast::getClosestLanelet(data.current_lanelets, rp, &ll)) return false;
+  const auto bp = left ? ll.leftBound2d() : ll.rightBound2d();
+  const auto bo = left ? ll.rightBound2d() : ll.leftBound2d();
+  if (bp.size() < 2 || bo.size() < 2) return false;
+  const lanelet::BasicPoint2d p{rp.position.x, rp.position.y};
+  const double d_pass = boost::geometry::distance(p, bp.basicLineString());
+  const double d_other = boost::geometry::distance(p, bo.basicLineString());
+  const auto & op = parameters_->object_parameters.at(utils::getHighestProbLabel(o.classification));
+  const double m = op.lateral_hard_margin + be.extra;
+  if (-(d_other - hw) <= lo - hw - m || d_pass + be.over - hw >= hi + hw + m) return false;
+  if (near_pt) *near_pt = neroNearCorner(rp, poly);
+  return true;
+}
+
+void StaticObstacleAvoidanceModule::neroInsertBlockerStop(ShiftedPath & shifted_path) const
+{
+  // izparked-3 05:2x (Ahmed on the A1 sim: "it stopped for 13 seconds before doing the go around ??"; his default: wait
+  // rather than pass a standing vehicle closer than 0.4 m): the targets are passed slowly as before, and the robot stops
+  // STOP_GAP before the blocker that closes the lane (it cannot be passed within line + over with its hard margin + extra),
+  // in its lane, while a vehicle is still at that place (a standing one that closes the lane, or one pulling out), and goes
+  // once the place has been clear for CLEAR_S (or what stands there no longer closes the lane).
+  constexpr double PLACE_M = 6.0;
+  constexpr double CLEAR_S = 1.5;
+  constexpr double STOP_GAP = 4.0;  // 2.0: a car pulling out of that place toward ego met it at 1.4 m/s (sim 1122-053537: -1.07)
+  if (!nero_bp::env().on || !nero_bp_stop_pt_ || !nero_bp_stop_place_ || !planner_data_->dynamic_object) return;
+  const auto & data = avoid_data_;
+  const auto & pts = shifted_path.path.points;
+  if (pts.size() < 2) return;
+  const double now = clock_->now().seconds();
+  const auto release = [&](const char * why) {
+    RCLCPP_WARN(getLogger(), "[NERO_SOA_BLOCKED_PASS] the stop before the blocker that closed the lane is released: %s", why);
+    nero_bp_stop_pt_.reset();
+    nero_bp_stop_place_.reset();
+    nero_bp_stop_clear_since_ = -1.0;
+  };
+  const double d_pt = nero_mu::calcSignedArcLength(pts, getEgoPosition(), nero_bp_stop_pt_.value());
+  if (d_pt < planner_data_->parameters.base_link2front) {
+    release("ego is at / past it");
+    return;
+  }
+  const auto & pl = nero_bp_stop_place_.value();
+  bool moving = false, closing = false, standing_open = false;
+  std::string who;
+  for (const auto & o : planner_data_->dynamic_object->objects) {
+    const auto label = utils::getHighestProbLabel(o.classification);
+    if (
+      label != ObjectClassification::CAR && label != ObjectClassification::TRUCK && label != ObjectClassification::BUS &&
+      label != ObjectClassification::TRAILER && label != ObjectClassification::MOTORCYCLE) {
+      continue;
+    }
+    const auto & p = o.kinematics.initial_pose_with_covariance.pose.position;
+    if (std::hypot(p.x - pl.x, p.y - pl.y) > PLACE_M) continue;
+    char buf[48];
+    std::snprintf(buf, sizeof(buf), "vehicle %02x%02x", o.object_id.uuid[0], o.object_id.uuid[1]);
+    const auto & tw = o.kinematics.initial_twist_with_covariance.twist.linear;
+    if (std::hypot(tw.x, tw.y) >= 0.5) {
+      moving = true;
+      who = buf;
+      continue;
+    }
+    geometry_msgs::msg::Point np;
+    if (neroObjClosesLane(data, o, nero_bp_stop_left_, &np)) {
+      closing = true;
+      who = buf;
+      // the nearest corner along the path of what closes the lane now
+      if (nero_mu::calcSignedArcLength(pts, getEgoPosition(), np) < d_pt) nero_bp_stop_pt_ = np;
+    } else {
+      standing_open = true;
+    }
+  }
+  if (moving || closing) {
+    nero_bp_stop_clear_since_ = -1.0;
+  } else if (standing_open) {
+    release("what stands there no longer closes the lane");
+    return;
+  } else {
+    if (nero_bp_stop_clear_since_ < 0.0) nero_bp_stop_clear_since_ = now;
+    if (now - nero_bp_stop_clear_since_ >= CLEAR_S) {
+      release("the place is clear for 1.5 s");
+      return;
+    }
+    who = "place clear < 1.5 s";
+  }
+  const double d_new = nero_mu::calcSignedArcLength(pts, getEgoPosition(), nero_bp_stop_pt_.value());
+  const double d_stop = std::max(0.0, d_new - planner_data_->parameters.base_link2front - STOP_GAP);
+  utils::static_obstacle_avoidance::insertDecelPoint(getEgoPosition(), d_stop, 0.0, shifted_path.path, stop_pose_);
+  RCLCPP_WARN_THROTTLE(
+    getLogger(), *clock_, 1000, "[NERO_SOA_BLOCKED_PASS] stop %.1f m ahead before %s (%s): wait", d_stop, who.c_str(),
+    moving ? "pulling out / moving at the place" : (closing ? "it closes the lane" : "just left"));
 }
 
 void StaticObstacleAvoidanceModule::neroInsertPauseStop(ShiftedPath & shifted_path) const

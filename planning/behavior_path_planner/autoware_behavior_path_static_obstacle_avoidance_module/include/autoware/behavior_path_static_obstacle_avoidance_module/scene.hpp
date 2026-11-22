@@ -529,6 +529,17 @@ private:
   mutable double nero_bp_place_t_{-1.0};
   mutable bool nero_bp_latched_{false};
   mutable double nero_bp_clear_since_{-1.0};
+  // NERO_SOA_BLOCKED_PASS (izparked-3 05:2x): the stop before a blocker that closes the lane
+  void neroInsertBlockerStop(ShiftedPath & shifted_path) const;
+  bool neroObjClosesLane(
+    const AvoidancePlanningData & data, const PredictedObject & o, const bool left,
+    geometry_msgs::msg::Point * near_pt) const;
+  geometry_msgs::msg::Point neroNearCorner(
+    const geometry_msgs::msg::Pose & ref_pose, const autoware_utils::Polygon2d & poly) const;
+  mutable std::optional<geometry_msgs::msg::Point> nero_bp_stop_pt_;
+  mutable std::optional<geometry_msgs::msg::Point> nero_bp_stop_place_;
+  mutable bool nero_bp_stop_left_{true};
+  mutable double nero_bp_stop_clear_since_{-1.0};
   mutable std::optional<geometry_msgs::msg::Point> nero_side_stop_;  // the side pause's stop point (map)
   mutable double nero_side_clear_since_{-1.0};
   // NERO_SOA_SIDE_LANE: a yield for a car behind / alongside (the out-of-lane pass of this target is unsafe) latches a
