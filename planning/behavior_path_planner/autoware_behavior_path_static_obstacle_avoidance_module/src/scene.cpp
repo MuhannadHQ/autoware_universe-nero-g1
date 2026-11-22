@@ -6427,6 +6427,11 @@ void StaticObstacleAvoidanceModule::neroInsertBlockerStop(ShiftedPath & shifted_
     return;
   }
   const auto & pl = nero_bp_stop_place_.value();
+  // the path's heading at the stop corner: a corner nearer along the path is one behind it in that heading (no path helper
+  // per object: nero_lint)
+  const auto & sp0 = pts.at(autoware::motion_utils::findNearestIndex(pts, nero_bp_stop_pt_.value())).point.pose;
+  const double hy = tf2::getYaw(sp0.orientation);
+  const double hc = std::cos(hy), hs = std::sin(hy);
   bool moving = false, closing = false, standing_open = false;
   std::string who;
   for (const auto & o : planner_data_->dynamic_object->objects) {
@@ -6451,7 +6456,8 @@ void StaticObstacleAvoidanceModule::neroInsertBlockerStop(ShiftedPath & shifted_
       closing = true;
       who = buf;
       // the nearest corner along the path of what closes the lane now
-      if (nero_mu::calcSignedArcLength(pts, getEgoPosition(), np) < d_pt) nero_bp_stop_pt_ = np;
+      const auto & cur = nero_bp_stop_pt_.value();
+      if (hc * (np.x - cur.x) + hs * (np.y - cur.y) < 0.0) nero_bp_stop_pt_ = np;
     } else {
       standing_open = true;
     }
