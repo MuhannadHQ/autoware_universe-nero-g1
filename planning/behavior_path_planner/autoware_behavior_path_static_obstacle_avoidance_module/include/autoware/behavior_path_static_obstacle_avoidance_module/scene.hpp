@@ -519,6 +519,9 @@ private:
   mutable bool nero_pause_pass_{false};
   // NERO_SOA_BLOCKED_PASS: the shift that keeps every target's hard margin (+extra) on that side, if it fits within line + over
   std::optional<double> neroBlockedPassShift(const AvoidancePlanningData & data, const bool left, int * n_out) const;    // NERO_SOA_BLOCKED_PASS: the corridor pause holds a hard-margin shift and passes slowly
+  // NERO_SOA_BLOCKED_PASS (izparked-3): the corridor blocker itself leaves no way past it inside the lane (body at most `over`
+  // past the line on the pass side) with its hard margin + extra: "<why>" (the path is truly blocked), else nullopt
+  std::optional<std::string> neroBlockerClosesLane(const AvoidancePlanningData & data, const bool left) const;
   mutable std::optional<geometry_msgs::msg::Point> nero_side_stop_;  // the side pause's stop point (map)
   mutable double nero_side_clear_since_{-1.0};
   // NERO_SOA_SIDE_LANE: a yield for a car behind / alongside (the out-of-lane pass of this target is unsafe) latches a
