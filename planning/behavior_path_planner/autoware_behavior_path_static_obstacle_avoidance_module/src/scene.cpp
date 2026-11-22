@@ -6203,18 +6203,29 @@ std::optional<std::string> StaticObstacleAvoidanceModule::neroBlockerClosesLane(
   const auto & be = nero_bp::env();
   const double hw = 0.5 * planner_data_->parameters.vehicle_width;
   const double sign = left ? 1.0 : -1.0;
+  const PredictedObject * found = nullptr;
   for (const auto & o : planner_data_->dynamic_object->objects) {
-    if (o.object_id.uuid[0] != b0 || o.object_id.uuid[1] != b1) continue;
-    const auto poly = autoware_utils::to_polygon2d(o.kinematics.initial_pose_with_covariance.pose, o.shape);
-    double lo = 1e9, hi = -1e9;  // its lateral extent, + toward the pass side
-    for (const auto & q : poly.outer()) {
-      const double l = sign * nero_mu::calcLateralOffset(ref, autoware_utils::create_point(q.x(), q.y(), 0.0));
-      lo = std::min(lo, l);
-      hi = std::max(hi, l);
+    if (o.object_id.uuid[0] == b0 && o.object_id.uuid[1] == b1) {
+      found = &o;
+      break;
     }
+  }
+  if (found) {
+    const auto & o = *found;
+    // its lateral extent, + toward the pass side, in the frame of the reference pose nearest to it (one path scan per
+    // cycle, no path helper per polygon point: nero_lint)
     const auto & c = o.kinematics.initial_pose_with_covariance.pose.position;
     const auto idx = autoware::motion_utils::findNearestIndex(ref, c);
     const auto & rp = ref.at(idx).point.pose;
+    const double ryaw = tf2::getYaw(rp.orientation);
+    const double cy = std::cos(ryaw), sy = std::sin(ryaw);
+    const auto poly = autoware_utils::to_polygon2d(o.kinematics.initial_pose_with_covariance.pose, o.shape);
+    double lo = 1e9, hi = -1e9;
+    for (const auto & q : poly.outer()) {
+      const double l = sign * (-sy * (q.x() - rp.position.x) + cy * (q.y() - rp.position.y));
+      lo = std::min(lo, l);
+      hi = std::max(hi, l);
+    }
     lanelet::ConstLanelet ll;
     if (!nero_geom_fast::getClosestLanelet(data.current_lanelets, rp, &ll)) return std::nullopt;
     const auto bp = left ? ll.leftBound2d() : ll.rightBound2d();
