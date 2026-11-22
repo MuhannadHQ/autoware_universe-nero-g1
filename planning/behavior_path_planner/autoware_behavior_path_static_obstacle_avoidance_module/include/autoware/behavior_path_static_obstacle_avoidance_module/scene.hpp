@@ -522,6 +522,13 @@ private:
   // NERO_SOA_BLOCKED_PASS (izparked-3): the corridor blocker itself leaves no way past it inside the lane (body at most `over`
   // past the line on the pass side) with its hard margin + extra: "<why>" (the path is truly blocked), else nullopt
   std::optional<std::string> neroBlockerClosesLane(const AvoidancePlanningData & data, const bool left) const;
+  // ... and the wait holds while a vehicle is still at that blocker's place (a waiting car that starts to pull out is not
+  // gone yet): latched place, when it last closed the lane, and whether this cycle's blocker is the latch's
+  void neroBlockedPassLatch(const AvoidancePlanningData & data) const;
+  mutable std::optional<geometry_msgs::msg::Point> nero_bp_place_;
+  mutable double nero_bp_place_t_{-1.0};
+  mutable bool nero_bp_latched_{false};
+  mutable double nero_bp_clear_since_{-1.0};
   mutable std::optional<geometry_msgs::msg::Point> nero_side_stop_;  // the side pause's stop point (map)
   mutable double nero_side_clear_since_{-1.0};
   // NERO_SOA_SIDE_LANE: a yield for a car behind / alongside (the out-of-lane pass of this target is unsafe) latches a

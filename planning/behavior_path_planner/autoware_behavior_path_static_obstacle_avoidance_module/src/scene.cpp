@@ -2262,6 +2262,7 @@ void StaticObstacleAvoidanceModule::fillEgoStatus(
       }
     }
     nero_corridor_blocker_ = nero_ovl::env().corridor ? neroCorridorBlocker(data) : "";
+    if (nero_ovl::env().corridor) neroBlockedPassLatch(data);  // NERO_SOA_BLOCKED_PASS: no-op unless it closed the lane
     nero_lane_block_.reset();
     if (nero_ovl::lane_blocked()) {
       neroUpdateLaneLatch(data);
@@ -6190,6 +6191,9 @@ std::optional<std::string> StaticObstacleAvoidanceModule::neroBlockerClosesLane(
   // most `over` past the line) with its own hard margin + extra truly blocks the way: the stock wait (field: the robot waited
   // at the target, the car pulled out after 12 s).
   const auto & ref = data.reference_path.points;
+  if (nero_bp_latched_) {
+    return nero_corridor_blocker_ + " is still at the place of the blocker that closed the lane";
+  }
   if (!planner_data_->dynamic_object || ref.size() < 2) return std::nullopt;
   const auto sp = nero_corridor_blocker_.rfind(' ');
   unsigned b0 = 0, b1 = 0;
@@ -6224,6 +6228,9 @@ std::optional<std::string> StaticObstacleAvoidanceModule::neroBlockerClosesLane(
     const double a = -(d_other - hw);      // ego's centre: furthest to the other side, body inside the lane
     const double b = d_pass + be.over - hw;  // ... furthest to the pass side, body at most `over` past the line
     if (a <= lo - hw - m || b >= hi + hw + m) return std::nullopt;  // a way past it on one side or the other
+    nero_bp_place_ = c;  // the latch: neroBlockedPassLatch keeps the wait while a vehicle is still here
+    nero_bp_place_t_ = clock_->now().seconds();
+    nero_bp_clear_since_ = -1.0;
     char buf[160];
     std::snprintf(
       buf, sizeof(buf), "%s closes the lane: past it on the pass side needs %.2f m, line + %.2f gives %.2f m",
@@ -6231,6 +6238,77 @@ std::optional<std::string> StaticObstacleAvoidanceModule::neroBlockerClosesLane(
     return std::string(buf);
   }
   return std::nullopt;
+}
+
+void StaticObstacleAvoidanceModule::neroBlockedPassLatch(const AvoidancePlanningData & data) const
+{
+  // izparked-3 (A1 sim 1122-031459 t 19-24): the robot set off the moment the car that closed the lane started to pull out
+  // (a moving car is no corridor blocker); that car came toward it, the oncoming pause cut the shift and obstacle_stop
+  // braked on the nose-in target's corner (-1.66, 1 s -1.06). The wait now holds while a vehicle is still within PLACE_M of
+  // the place of the blocker that closed the lane (at most LATCH_S after it last did), if the pass still needs the line.
+  constexpr double LATCH_S = 30.0;
+  constexpr double PLACE_M = 6.0;
+  nero_bp_latched_ = false;
+  if (!nero_bp::env().on || !nero_bp_place_) return;
+  const double now = clock_->now().seconds();
+  if (now - nero_bp_place_t_ > LATCH_S) {
+    RCLCPP_WARN(getLogger(), "[NERO_SOA_BLOCKED_PASS] latch released: %.0f s since the lane was closed", LATCH_S);
+    nero_bp_place_.reset();
+    nero_bp_clear_since_ = -1.0;
+    return;
+  }
+  if (!nero_corridor_blocker_.empty() || !planner_data_->dynamic_object) return;  // a blocker this cycle: judged as such
+  const auto & ref = data.reference_path.points;
+  if (ref.size() < 2 || nero_mu::calcSignedArcLength(ref, getEgoPosition(), nero_bp_place_.value()) < 0.0) {
+    nero_bp_place_.reset();  // the place is behind the robot
+    nero_bp_clear_since_ = -1.0;
+    return;
+  }
+  // only while the planned pass still takes the body over the line (as neroCorridorBlocker)
+  const auto & sp = data.candidate_path.path.points.empty() ? helper_->getPreviousSplineShiftPath() : data.candidate_path;
+  if (sp.path.points.empty() || sp.shift_length.size() != sp.path.points.size()) return;
+  double max_shift = 0.0;
+  for (size_t i = planner_data_->findEgoIndex(sp.path.points); i < sp.path.points.size(); ++i) {
+    if (std::abs(sp.shift_length.at(i)) > std::abs(max_shift)) max_shift = sp.shift_length.at(i);
+  }
+  const auto room = neroInLaneShiftLimit(data, max_shift > 0.0, 0.0);
+  if (!room || std::abs(max_shift) <= room.value()) return;
+  const auto & pl = nero_bp_place_.value();
+  for (const auto & o : planner_data_->dynamic_object->objects) {
+    const auto label = utils::getHighestProbLabel(o.classification);
+    if (
+      label != ObjectClassification::CAR && label != ObjectClassification::TRUCK && label != ObjectClassification::BUS &&
+      label != ObjectClassification::TRAILER && label != ObjectClassification::MOTORCYCLE) {
+      continue;
+    }
+    const auto & p = o.kinematics.initial_pose_with_covariance.pose.position;
+    if (std::hypot(p.x - pl.x, p.y - pl.y) > PLACE_M) continue;
+    char buf[48];
+    std::snprintf(buf, sizeof(buf), "vehicle %02x%02x", o.object_id.uuid[0], o.object_id.uuid[1]);
+    nero_corridor_blocker_ = buf;
+    nero_bp_latched_ = true;
+    nero_bp_clear_since_ = -1.0;
+    const auto & tw = o.kinematics.initial_twist_with_covariance.twist.linear;
+    RCLCPP_WARN_THROTTLE(
+      getLogger(), *clock_, 1000,
+      "[NERO_SOA_BLOCKED_PASS] %s (v %.1f) is still at the place of the blocker that closed the lane %.1f s ago: wait",
+      buf, std::hypot(tw.x, tw.y), now - nero_bp_place_t_);
+    return;
+  }
+  // released once the place has been clear for CLEAR_S (a track id switch leaves the place empty for up to 1.2 s: capture A1
+  // 18:47, 6bfc > 1001 > 1b06 > b207 > 2809)
+  constexpr double CLEAR_S = 1.5;
+  if (nero_bp_clear_since_ < 0.0) nero_bp_clear_since_ = now;
+  if (now - nero_bp_clear_since_ < CLEAR_S) {
+    nero_corridor_blocker_ = "place clear for < 1.5 s";
+    nero_bp_latched_ = true;
+    return;
+  }
+  RCLCPP_WARN(
+    getLogger(), "[NERO_SOA_BLOCKED_PASS] the place of the blocker that closed the lane is clear for %.1f s: released",
+    CLEAR_S);
+  nero_bp_place_.reset();
+  nero_bp_clear_since_ = -1.0;
 }
 
 void StaticObstacleAvoidanceModule::neroInsertPauseStop(ShiftedPath & shifted_path) const
