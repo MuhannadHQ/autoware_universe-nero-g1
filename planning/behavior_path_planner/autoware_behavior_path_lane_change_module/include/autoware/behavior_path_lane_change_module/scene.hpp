@@ -109,6 +109,7 @@ public:
   std::optional<std::string> nero_abort_room_refuse(bool decide = true);  // decide false: record positions only (every cycle)
   bool nero_abort_stalled();
   bool nero_smooth_return_possible() const;  // NERO_LC_ABORT_SMOOTH: the smooth return keeps the body inside the current lanes
+  bool nero_return_fits(double extra_lag, bool log) const;  // NERO_LC_ABORT_SMOOTH: the firm return after lag + extra_lag fits
   // NERO_LC_GIVEUP (scene.cpp): true while a held route change near the lane end is given up (ego carries on, re-route asked)
   bool nero_lc_giveup();
   // NERO_LC_GAP_AHEAD (mainlane-7): a candidate check dropped a passer coming from behind within the last 0.5 s (a gap is planned). Non-virtual.

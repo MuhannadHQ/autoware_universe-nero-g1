@@ -1169,6 +1169,8 @@ struct NeroAbortSmooth
   double j_firm{4.0};
   double t_lag{0.7};    // 8th: the robot keeps following its current path this long before a new path takes (path optimizer + control)
   double ret_tol{0.2};  // 9th: a safety return may bring the body edge this far over the lane line at its peak
+  int pnr_now{0};       // 10th (izlanechange-4): 1 = an approved change judged unsafe is acted on at once (no unsafe hysteresis)
+                        // when waiting out the hysteresis would carry the robot past the point where its return still fits
 };
 const NeroAbortSmooth & nero_abort_smooth()
 {
@@ -1178,7 +1180,9 @@ const NeroAbortSmooth & nero_abort_smooth()
       r.on = true;
       double a = r.a_max, j = r.j_max, t0 = r.t_min, t1 = r.t_max, st = r.settle_s, af = r.a_firm, jf = r.j_firm, tl = r.t_lag,
              rt = r.ret_tol;
-      std::sscanf(v, "%lf,%lf,%lf,%lf,%lf,%lf,%lf,%lf,%lf", &a, &j, &t0, &t1, &st, &af, &jf, &tl, &rt);
+      int pn = r.pnr_now;
+      std::sscanf(v, "%lf,%lf,%lf,%lf,%lf,%lf,%lf,%lf,%lf,%d", &a, &j, &t0, &t1, &st, &af, &jf, &tl, &rt, &pn);
+      r.pnr_now = pn;
       r.t_lag = std::clamp(tl, 0.0, 2.0);
       r.ret_tol = std::clamp(rt, 0.0, 0.5);
       r.a_firm = std::max(0.1, af);
@@ -1278,7 +1282,7 @@ struct NeroReturnProfile
 NeroReturnProfile nero_return_profile(
   const std::vector<autoware_internal_planning_msgs::msg::PathPointWithLaneId> & base,
   const std::vector<autoware_internal_planning_msgs::msg::PathPointWithLaneId> & cur, const geometry_msgs::msg::Pose & ego,
-  const double v, const bool firm)
+  const double v, const bool firm, const double extra_lag = 0.0)
 {
   const auto & sm = nero_abort_smooth();
   NeroReturnProfile r;
@@ -1292,7 +1296,7 @@ NeroReturnProfile nero_return_profile(
   };
   rel(ego, r.d0, r.s0);
   r.d1 = r.d0, r.s1 = r.s0;
-  r.s_lag = v * sm.t_lag;
+  r.s_lag = v * (sm.t_lag + extra_lag);
   if (r.s_lag > 0.3 && cur.size() >= 2) {
     size_t i = autoware::motion_utils::findNearestSegmentIndex(cur, ego.position) + 1;
     double acc = autoware_utils::calc_distance2d(ego.position, cur.at(std::min(i, cur.size() - 1)).point.pose.position);
@@ -4103,6 +4107,7 @@ struct NeroHoldState
   bool holding{false};
   int unsafe_n{0};
   int safe_n{0};
+  int reach{-1};  // NERO_LC_HOLD_REACH: -1 not judged for this hold, 0 the stop is out of reach, 1 it is reachable
   std::chrono::steady_clock::time_point last{};
 };
 std::unordered_map<const void *, NeroHoldState> & nero_hold_states()
@@ -5011,6 +5016,23 @@ bool NormalLaneChange::nero_in_hold_mode() const
     common_data_ptr_->lanes_polygon_ptr->current, getEgoPose(), planner_data_->parameters, h.overhang);
 }
 
+// NERO_LC_HOLD_REACH=<a m/s2>[,<margin m>] (izlanechange-4, 2026-11-23; sim c13 abort2c 1123-200233): the hold STOPS the robot on
+// its approved path (isRequiredStop) when the change has turned unsafe and can no longer be cancelled; that only helps if the robot
+// can stop at <a> before that path takes its body out of the current lanes. At 5.6 m/s in the middle of the move (15 m to stop at
+// 1 m/s2, the body over the line ~5 m on) it cannot: there it slowed the robot 5.6 -> 2.1 m/s while the path carried it on into the
+// target lane in front of the car it was holding for (that car then needed 1.7 m/s2). Judged once per hold, when its stop would
+// start: out of reach -> no NERO hold stop (the change goes on at its speed, the car's own stop rules unchanged). The hold mode
+// itself (the strict check of the approved path, the faster verdict) is unchanged. -1 / unset = the car.
+std::pair<double, double> nero_hold_reach_param()
+{
+  static const std::pair<double, double> reach = [] {
+    double a = -1.0, m = 1.0;
+    if (const char * e = std::getenv("NERO_LC_HOLD_REACH")) std::sscanf(e, "%lf,%lf", &a, &m);
+    return std::make_pair(a, m);
+  }();
+  return reach;
+}
+
 PathSafetyStatus NormalLaneChange::isApprovedPathSafe() const
 {
   if (nero_queue_on()) {
@@ -5154,6 +5176,7 @@ PathSafetyStatus NormalLaneChange::evaluateApprovedPathWithUnsafeHysteresis(
         st.unsafe_n = 0;
         if (st.holding && ++st.safe_n >= nero_hold().safe_cycles) {
           st.holding = false;
+          st.reach = -1;  // NERO_LC_HOLD_REACH: judged again for the next hold
           st.safe_n = 0;
         }
       }
@@ -5178,6 +5201,26 @@ PathSafetyStatus NormalLaneChange::evaluateApprovedPathWithUnsafeHysteresis(
     ++unsafe_hysteresis_count_;
     RCLCPP_DEBUG(
       logger_, "%s: Increasing hysteresis count to %d.", __func__, unsafe_hysteresis_count_);
+    // NERO_LC_ABORT_SMOOTH 10th field = 1 (izlanechange-4, 2026-11-23; sim c13 stream6c s1 1123-204029): the unsafe hysteresis
+    // (cancel.unsafe_hysteresis_threshold 5 = 0.6 s) keeps a flicker from cancelling a change, but it also carried the robot past
+    // the point where a return still fits: a car at 13 m/s came into view (the ~50 m tracker range) at 27.6 s with the robot
+    // 0.4 m out, the verdict passed the hysteresis at 28.15 s with it 0.72 m out, too late to return -> it crossed in front of
+    // that car (it needed 1.9 m/s2). Now, if a return fits now but would not after the rest of the hysteresis, the unsafe
+    // verdict is passed on at once (abort / cancel as the car decides it). Unset = the car.
+    const int th = lane_change_parameters_->cancel.th_unsafe_hysteresis;
+    if (
+      nero_abort_smooth().on && nero_abort_smooth().pnr_now == 1 && unsafe_hysteresis_count_ <= th &&
+      !isEgoOnPreparePhase()) {
+      const double rest_s = 0.1 * static_cast<double>(th + 1 - unsafe_hysteresis_count_);
+      const bool fits_now = isAbleToReturnCurrentLane() || nero_return_fits(0.0, false);
+      if (fits_now && !nero_return_fits(rest_s, false)) {
+        RCLCPP_INFO(
+          logger_, "[NERO_LC_ABORT_SMOOTH] unsafe %d/%d: a return fits now but not in %.1f s: acted on at once",
+          unsafe_hysteresis_count_, th + 1, rest_s);
+        unsafe_hysteresis_count_ = th + 1;
+        return approved_path_safety_status;
+      }
+    }
   } else {
     if (unsafe_hysteresis_count_ > 0) {
       RCLCPP_DEBUG(logger_, "%s: Lane change is now SAFE. Resetting hysteresis count.", __func__);
@@ -5357,7 +5400,32 @@ bool NormalLaneChange::isRequiredStop(const bool is_trailing_object)
   if (nero_hold().v > 0.0) {
     const auto it = nero_hold_states().find(this);
     if (it != nero_hold_states().end() && it->second.holding) {
-      return true;  // NERO hold: stop on the merge path, whatever the zero-tolerance in-lane test says
+      const auto reach = nero_hold_reach_param();
+      if (reach.first > 0.0 && it->second.reach < 0 && status_.lane_change_path.path.points.size() >= 2) {
+        // NERO_LC_HOLD_REACH (see nero_hold_reach_param): judged once, when the hold's stop would start
+        const auto & pts = status_.lane_change_path.path.points;
+        const auto ego = getEgoPose();
+        const double v = std::max(0.0, getEgoVelocity());
+        const double need = v * v / (2.0 * reach.first) + reach.second;
+        size_t i = autoware::motion_utils::findNearestIndex(pts, ego.position);
+        double s = 0.0;
+        it->second.reach = 1;
+        for (; i + 1 < pts.size() && s <= need; ++i) {
+          s += autoware_utils::calc_distance2d(pts.at(i), pts.at(i + 1));
+          if (!utils::isEgoWithinOriginalLane(
+                common_data_ptr_->lanes_polygon_ptr->current, pts.at(i + 1).point.pose, planner_data_->parameters,
+                nero_hold().overhang)) {
+            it->second.reach = 0;
+            RCLCPP_INFO(
+              logger_, "[NERO_LC_HOLD_REACH] no hold stop: the approved path takes the body out of its lane in %.1f m, a stop at "
+              "%.1f m/s needs %.1f m", s, v, need);
+            break;
+          }
+        }
+      }
+      if (it->second.reach != 0) {
+        return true;  // NERO hold: stop on the merge path, whatever the zero-tolerance in-lane test says
+      }
     }
   }
   if (nero_queue_on() && nero_queue_hold_latched()) {
@@ -5375,6 +5443,13 @@ bool NormalLaneChange::isRequiredStop(const bool is_trailing_object)
 // the closing car (TTC 1.5 s).
 bool NormalLaneChange::nero_smooth_return_possible() const
 {
+  return nero_return_fits(0.0, true);
+}
+
+// the firm return from where the robot will be after the lag (+ extra_lag s more along its current path) keeps the body within
+// ret_tol of the current lanes (NERO_LC_ABORT_SMOOTH)
+bool NormalLaneChange::nero_return_fits(const double extra_lag, const bool log) const
+{
   if (!nero_abort_smooth().on || prev_module_output_.path.points.size() < 2) return false;
   const auto & curr_lanes_poly = common_data_ptr_->lanes_polygon_ptr->current;
   const auto ego = getEgoPose();
@@ -5388,18 +5463,16 @@ bool NormalLaneChange::nero_smooth_return_possible() const
   const auto & q = pts.at(seg + 1).point.pose.position;
   const double byaw = std::atan2(q.y - p.y, q.x - p.x);
   const double d0 = autoware::motion_utils::calcLateralOffset(pts, ego.position, seg);
-  const double he = autoware_utils::normalize_radian(tf2::getYaw(ego.orientation) - byaw);
   const double v = std::max(lane_change_parameters_->trajectory.min_lane_changing_velocity, getEgoVelocity());
-  (void)he;
   // a safety return: firm limits, from where the robot will be after the lag along its current path
-  const auto prof = nero_return_profile(pts, status_.lane_change_path.path.points, ego, v, true);
+  const auto prof = nero_return_profile(pts, status_.lane_change_path.path.points, ego, v, true, extra_lag);
   const double extra = prof.peak - d0;  // further sideways than now (signed, left +)
   auto moved = ego;
   moved.position.x -= std::sin(byaw) * extra;
   moved.position.y += std::cos(byaw) * extra;
   const bool ok =
     utils::isEgoWithinOriginalLane(curr_lanes_poly, moved, planner_data_->parameters, tol + nero_abort_smooth().ret_tol);
-  if (nero_lc_debug_every("smooth_return", 500)) {
+  if (log && nero_lc_debug_every("smooth_return", 500)) {
     RCLCPP_INFO(
       logger_,
       "[NERO_LC_ABORT_SMOOTH] stock abort too late; the return from %.2f m (%.2f m after the %.1f m lag) peaks %.2f m (%.2f s): %s",
@@ -5502,7 +5575,21 @@ bool NormalLaneChange::calcAbortPath()
       const double v = current_velocity;
       const double s_ego = calcSignedArcLength(pts, size_t{0}, current_pose.position);
       (void)slope0;
-      const bool firm = !isAbleToReturnCurrentLane();  // the car's abort would be 'too late': a safety return, firm limits
+      const bool stock_late = !isAbleToReturnCurrentLane();  // the car's abort would be 'too late': a safety return, firm limits
+      bool firm = stock_late;
+      // 10th field = 1 (izlanechange-4; sim c13 stream6i 1123-2233xx): the car's abort test (footprint 1 s along the change path)
+      // can pass while the gentle return, planned after the lag from a robot moving out at 0.47 m/s, still carries the body over
+      // the line (peak 1.81 m: the centre crossed, the closing car needed 4 m/s2): the firm limits then, when they keep it in
+      if (!firm && sm.pnr_now == 1) {
+        const auto gentle = nero_return_profile(pts, selected_path.path.points, current_pose, v, false);
+        auto moved = current_pose;
+        moved.position.x -= std::sin(yaw_at(seg)) * (gentle.peak - d0);
+        moved.position.y += std::cos(yaw_at(seg)) * (gentle.peak - d0);
+        const auto & cpoly = common_data_ptr_->lanes_polygon_ptr->current;
+        firm = !cpoly.empty() && !utils::isEgoWithinOriginalLane(
+                                   cpoly, moved, planner_data_->parameters,
+                                   lane_change_parameters_->cancel.overhang_tolerance + sm.ret_tol);
+      }
       const auto prof = nero_return_profile(pts, selected_path.path.points, current_pose, v, firm);
       const double T = prof.q.T + nero_abort_smooth().t_lag, a_pk = prof.q.a_pk, j_pk = prof.q.j_pk, L = prof.total;
       const double stop_dist = calculation::calc_stopping_distance(common_data_ptr_->lc_param_ptr);
@@ -5555,7 +5642,7 @@ bool NormalLaneChange::calcAbortPath()
             "lane in %.2f s / %.1f m, peak offset %.2f m, a_lat %.2f m/s2, jerk %.2f m/s3 (stock: delta %.1f s + %.1f s)%s",
             d0, he * 180.0 / M_PI, getEgoVelocity() * std::sin(he), getEgoVelocity(), T, L, peak, a_pk, j_pk,
             lane_change_parameters_->cancel.delta_time, lane_change_parameters_->cancel.duration,
-            firm ? " [firm: the car's abort was too late]" : "");
+            firm ? (stock_late ? " [firm: the car's abort was too late]" : " [firm: the gentle return would leave the lane]") : "");
           return true;
         }
       }
