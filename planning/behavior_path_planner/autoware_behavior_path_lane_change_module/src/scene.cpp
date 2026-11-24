@@ -14,6 +14,7 @@
 
 #include "autoware/behavior_path_lane_change_module/scene.hpp"
 #include "autoware/behavior_path_planner_common/utils/nero_mu.hpp"  // NERO_BPP_PROJ_FAST
+#include <geometry_msgs/msg/pose_array.hpp>  // NERO_LC_GIVEUP
 #include <cstdio>
 #include <autoware_utils/ros/uuid_helper.hpp>
 
@@ -330,6 +331,94 @@ std::unordered_map<const void *, NeroUnsafeSeen> & nero_unsafe_seen_map()
   return m;
 }
 
+// NERO_LC_SIGHT=<v_min km/h>,<add km/h>,<t_B s>,<b m/s2>,<t_G s>,<cap m>[,<lean 0|1>[,<stand release s>]] (izlanechange 2026-11-23, Ahmed 23 Nov:
+// "it should lean until it exposes the blind spot ... try to expose a lane before lane changes"). A lane change is not approved
+// while the part of the target lane behind ego that ego's lidars can see is shorter than what a hidden car at v_h would need:
+// L_req = dv * t_B + dv^2 / (2 b) + v_e * t_G, dv = v_h - v_e, v_h = max(v_min, the target lane's speed limit + add)
+// (UN R157 5.2.6.7 / R79 5.6.4.7: an unseen vehicle assumed at the edge of the sensed area; capped at <cap> m = what the lidars
+// can see at all). The view is traced from the top lidar (0.43, 0) and the side lidar on the change side (0.65, +-0.13) to the
+// target lane's centre and near edge every metre back to 60 m; an object (>= 0.9 m tall) outside the target lane whose box
+// crosses the ray hides that place (22 Nov 14:24:59: car 6b7f first listed 9 m behind at 10.3 m/s as the robot crossed the
+// line; the robot's own follower 8 m behind shaded the target lane from ~12 m back). A seen car in the target lane ends the
+// trace as "covered" (the safety check judges it, a hidden car behind it must pass it first). While the view is short the
+// waiting change leans (NERO_LC_INCH hug: body 0.25 m inside the line, ramped over the next metres, never over the line)
+// and is held; a robot that cannot expose the lane keeps waiting in its lane. <stand release s> (default 0 = never): once the
+// robot has stood (< 0.3 m/s) that long with the change held by sight alone, the hold is released and the module's own safety
+// check decides (a car straddling the line right behind the robot - the escort of 22 Nov - hides the lane for good; sim fol2:
+// a 30 s stand at the lane end). Unset = the car.
+struct NeroSight
+{
+  double v_min{-1.0};
+  double add{10.0};
+  double t_b{1.4};
+  double b{3.0};
+  double t_g{1.0};
+  double cap{50.0};
+  int lean{1};
+  double stand_release{0.0};
+};
+const NeroSight & nero_sight_param()
+{
+  static const NeroSight p = [] {
+    NeroSight r;
+    if (const char * e = std::getenv("NERO_LC_SIGHT")) {
+      std::sscanf(
+        e, "%lf,%lf,%lf,%lf,%lf,%lf,%d,%lf", &r.v_min, &r.add, &r.t_b, &r.b, &r.t_g, &r.cap, &r.lean, &r.stand_release);
+    }
+    return r;
+  }();
+  return p;
+}
+struct NeroSightState
+{
+  bool lacking{false};
+  double view{0.0};
+  double need{0.0};
+  std::string blocker;
+  std::chrono::steady_clock::time_point last{};
+  std::optional<std::chrono::steady_clock::time_point> stand_since{};
+  double v_h{0.0};
+  std::optional<std::chrono::steady_clock::time_point> ok_since{};  // view long enough since
+  std::chrono::steady_clock::time_point lack_last{};                // last cycle with the view short
+};
+// NERO_LC_SIGHT_PROBE=<v_ret m/s>,<t_lat s>,<margin m>,<max_over m> (izlanechange 2026-11-23, Ahmed 12:14 "try to change the lane
+// in a way that guarantees the lane is free and its not blind ... it could be a more gradual change"): while the view is short the
+// lean may take the body over the line by e = v_ret * (view / (v_h - v_e) - t_lat) - margin (at most max_over): the robot can get
+// its body back inside its own lane before a car at v_h coming from the edge of what it sees reaches it; every step over moves the
+// side lidar past the follower and opens more of the lane (22 Nov geometry: follower 8 m back, 0.4 m over the line: view 19 m at
+// the hug, 22 m with the body at the line, 34 m 0.3 m over, all of it 0.5 m over). A follower in ego's own lane (centre inside
+// the current lanes) is not target-lane traffic for the lean (it follows; it does not pass). Seen target-lane cars keep the
+// hug's own pull-back. Needs NERO_LC_SIGHT (lean field 1). Unset = the hug only.
+// Return rule revised 12:3x (research/probe/PROBE_DESIGN.md: fail-safe / invariably-safe planning, Pek & Althoff; UN R157
+// 5.2.6.6.3): the body may be e over the line only if it is back inside before a car at v_h from the edge of the seen area could
+// reach it AND clear: e <= a_y / 6 x T^2 - 0.1, T = (view - 0.78) / (v_h - v_e) - t_lat - t_clear (a lateral move of e with peak
+// lateral acceleration a_y takes sqrt(6 e / a_y)); capped at max_over (0.3 m: a car still passes inside its own lane, W - car - 2 x
+// 0.5). The pull-back from a probe is ramped over v_e x sqrt(6 (e + 0.1) / a_y) (~7 m at 20 km/h) instead of the hug's 4 m.
+// Fields: <a_y m/s2>,<t_lat s>,<t_clear s>,<max_over m>.
+struct NeroProbe
+{
+  double a_y{-1.0};
+  double t_lat{1.0};
+  double t_clear{1.0};
+  double max_over{0.3};
+};
+const NeroProbe & nero_probe_param()
+{
+  static const NeroProbe p = [] {
+    NeroProbe r;
+    if (const char * e = std::getenv("NERO_LC_SIGHT_PROBE")) {
+      std::sscanf(e, "%lf,%lf,%lf,%lf", &r.a_y, &r.t_lat, &r.t_clear, &r.max_over);
+    }
+    return r;
+  }();
+  return p;
+}
+std::unordered_map<const void *, NeroSightState> & nero_sight_state()
+{
+  static std::unordered_map<const void *, NeroSightState> m;
+  return m;
+}
+
 // streamjoin2: per module instance, "this change waits for a gap in a passing stream" (NERO_LC_MULTI_STAND_OFFSET /
 // NERO_LC_MULTI_ROLL act only then)
 struct NeroGapWait
@@ -379,8 +468,62 @@ using utils::lane_change::create_lanes_polygon;
 namespace calculation = utils::lane_change::calculation;
 using utils::path_safety_checker::filter::velocity_filter;
 
+// NERO_LC_GIVEUP (izlanechange-2 2026-11-23): the planner node's publisher of the carry-on request (made once by the
+// lane change manager when the switch is set; read by the mission planner, visible to the bridge)
+rclcpp::Publisher<geometry_msgs::msg::PoseArray>::SharedPtr & nero_lc_giveup_pub()
+{
+  static rclcpp::Publisher<geometry_msgs::msg::PoseArray>::SharedPtr p;
+  return p;
+}
+
 namespace
 {
+// NERO_LC_GIVEUP=<margin m>[,<wait s>] (izlanechange-2 2026-11-23, Ahmed 23 Nov 12:14 "no standing is dangerous ... so it
+// doesnt change blind"): a route lane change that is still held (no safe gap, or the target lane not seen far enough:
+// NERO_LC_SIGHT) when ego is within max(30 m, 10 s x v) + <margin> of the end of its lane is given up instead of waiting
+// at the lane end: the module is no longer requested (no waiting stop), ego keeps its lane and speed, and the mission
+// planner is asked to carry the route on through the lane after ego's lane (straight on) and plan from there to the same
+// goal (the distance is the mission planner's own re-route safety length, so the new route is accepted while moving).
+// Only where ego's lane has a lane after it; a lane that truly ends (no successor in the map) keeps the module's wait.
+// No new route within <wait> s (default 3) -> the change waits as before (never a stand caused by the give-up itself).
+// Unset = the car.
+struct NeroGiveupParam
+{
+  double margin{-1.0};
+  double wait{3.0};
+};
+const NeroGiveupParam & nero_giveup_param()
+{
+  static const NeroGiveupParam p = [] {
+    NeroGiveupParam q;
+    if (const char * e = std::getenv("NERO_LC_GIVEUP")) {
+      std::sscanf(e, "%lf,%lf", &q.margin, &q.wait);
+    }
+    return q;
+  }();
+  return p;
+}
+struct NeroGiveupState
+{
+  lanelet::Id lane{lanelet::InvalId};
+  int32_t sec{0};
+  uint32_t nanosec{0};
+  bool refused{false};  // no new route in time: the change waits as before for this lane and route
+  // the smooth give-up: within the return distance before the give-up point the waiting path brings a lean back to the lane centre
+  lanelet::Id ret_lane{lanelet::InvalId};
+  int32_t ret_sec{0};
+  uint32_t ret_nanosec{0};
+  double ret_len{15.0};
+  std::chrono::steady_clock::time_point since{};
+  std::chrono::steady_clock::time_point last_pub{};
+  geometry_msgs::msg::PoseArray msg;
+};
+NeroGiveupState & nero_giveup_state()
+{
+  static NeroGiveupState s;
+  return s;
+}
+
 // streamjoin job (NERO_LC_MULTI_STAND_PREPARE): the predicted time at which ego reaches the candidate's lane-changing
 // start (the end of its prepare segment) along the given ego prediction; 0 once ego is past it
 double nero_time_to_lc_start(
@@ -830,8 +973,14 @@ void NormalLaneChange::update_transient_data(const bool is_approved)
       }();
       if (inch_clear >= 0.0) {
         bool traffic = false;
+        const bool probe_on = nero_probe_param().a_y > 0.0 && nero_sight_param().v_min > 0.0;
         for (const auto & obj : filtered_objects_.target_lane_trailing) {
           if (std::max(0.0, obj.initial_twist.linear.x) < 0.5) continue;
+          if (probe_on && std::any_of(cur_lanes.begin(), cur_lanes.end(), [&](const auto & ll) {
+                return lanelet::utils::isInLanelet(obj.initial_pose, ll);
+              })) {
+            continue;  // NERO_LC_SIGHT_PROBE: ego's own follower (centre in ego's lane) does not pass; it is no reason to stay centred
+          }
           const double s_obj = lanelet::utils::getArcCoordinates(tgt_lanes, obj.initial_pose).length;
           if (s_ego_t - (s_obj + 0.5 * obj.shape.dimensions.x) < 40.0) traffic = true;
         }
@@ -843,6 +992,58 @@ void NormalLaneChange::update_transient_data(const bool is_approved)
         if (traffic && cmd > cap) {
           cmd = cap;
           if (ego_lat > cap + 0.05) pulling = true;
+        }
+      }
+      // NERO_LC_SIGHT lean (see nero_sight_param): while the target lane behind is not seen far enough, hug now (ramped over
+      // the next max(8 m, 2 s) instead of toward the far waiting stop) and never further than the hug level (body
+      // NERO_LC_INCH_SIGNAL_GAP inside the line): the lean opens the view past the robot's own follower
+      bool sight_lean = false;
+      {
+        const auto & sp = nero_sight_param();
+        const auto it = nero_sight_state().find(this);
+        if (
+          sp.v_min > 0.0 && sp.lean > 0 && it != nero_sight_state().end() && it->second.lacking &&
+          std::chrono::steady_clock::now() - it->second.last < std::chrono::milliseconds(500)) {
+          sight_lean = true;
+          cmd = std::min(cmd, signal);
+          double over = -1.0;
+          const auto & pp = nero_probe_param();
+          if (pp.a_y > 0.0) {
+            // seen target-lane cars (not ego's own follower): a moving one behind that could not stop comfortably before ego, or
+            // one alongside / just ahead -> no probe (the hug's own pull-back handles it)
+            bool probe_safe = true;
+            const auto in_cur = [&](const auto & obj) {
+              return std::any_of(cur_lanes.begin(), cur_lanes.end(), [&](const auto & ll) {
+                return lanelet::utils::isInLanelet(obj.initial_pose, ll);
+              });
+            };
+            for (const auto & obj : filtered_objects_.target_lane_trailing) {
+              const double v = std::max(0.0, obj.initial_twist.linear.x);
+              if (v < 0.5 || in_cur(obj)) continue;
+              const double s_obj = lanelet::utils::getArcCoordinates(tgt_lanes, obj.initial_pose).length;
+              const double gap = s_ego_t - vi.rear_overhang_m - (s_obj + 0.5 * obj.shape.dimensions.x);
+              if (gap < v * inch_react + v * v / (2.0 * inch_decel) + 2.0) probe_safe = false;
+            }
+            for (const auto & obj : filtered_objects_.target_lane_leading.moving) {
+              const double s_obj = lanelet::utils::getArcCoordinates(tgt_lanes, obj.initial_pose).length;
+              if (s_obj - 0.5 * obj.shape.dimensions.x < s_ego_t + vi.max_longitudinal_offset_m + 1.0) probe_safe = false;
+            }
+            const double v_e = std::max(0.0, getEgoVelocity());
+            const double T =
+              (it->second.view - 0.78) / std::max(it->second.v_h - v_e, 0.5) - pp.t_lat - pp.t_clear;
+            over = T > 0.0 ? std::min(pp.max_over, pp.a_y / 6.0 * T * T - 0.1) : -1.0;
+            if (probe_safe && over > 0.0) {
+              cmd = std::max(signal, room - 0.5 * vi.vehicle_width_m + over);
+            }
+            if (!probe_safe) over = -2.0;
+          }
+          if (nero_lc_debug_every("sight_lean", 500)) {
+            RCLCPP_INFO(
+              logger_, "[NERO_LC_SIGHT] lean: view %.1f m < need %.1f m, %s to %.2f m (ego at %.2f m, room %.2f%s)%s%s",
+              it->second.view, it->second.need, over > 0.0 ? "probe" : "hug", cmd, ego_lat, room,
+              over > 0.0 ? ", body over the line" : (over < -1.5 ? ", a seen car: no probe" : ""),
+              it->second.blocker.empty() ? "" : ", hidden by ", it->second.blocker.c_str());
+          }
         }
       }
       held = cmd;
@@ -870,6 +1071,28 @@ void NormalLaneChange::update_transient_data(const bool is_approved)
       if (pulling) {
         s_a = 0.0;
         s_b = inch_back_len;
+        if (nero_probe_param().a_y > 0.0 && ego_lat > signal + 0.05) {
+          // NERO_LC_SIGHT_PROBE: back from over the line at <= a_y lateral (v_e x sqrt(6 (e + 0.1) / a_y))
+          const double e_back = ego_lat - signal;
+          s_b = std::max(
+            inch_back_len, std::abs(common_data_ptr_->get_ego_speed()) * std::sqrt(6.0 * (e_back + 0.1) / nero_probe_param().a_y));
+        }
+      } else if (sight_lean) {
+        s_a = 0.0;
+        s_b = std::max(8.0, 2.0 * std::abs(common_data_ptr_->get_ego_speed()));
+      }
+      // NERO_LC_GIVEUP stage A: the held change near its give-up point brings the lean back to the lane centre (smooth give-up)
+      {
+        const auto & gsr = nero_giveup_state();
+        const auto st = getRouteHeader().stamp;
+        if (
+          nero_giveup_param().margin >= 0.0 && !cur_lanes.empty() && gsr.ret_lane == cur_lanes.back().id() &&
+          gsr.ret_sec == st.sec && gsr.ret_nanosec == st.nanosec && !back_stand) {
+          cmd = 0.0;
+          held = 0.0;
+          s_a = 0.0;
+          s_b = gsr.ret_len;
+        }
       }
       double arc = 0.0;
       for (size_t i = 0; i < path.points.size(); ++i) {
@@ -988,8 +1211,197 @@ void NormalLaneChange::updateLaneChangeStatus()
       }
     }
   }
-  c.n = (found_safe_path && !nero_hold_for_passing) ? c.n + 1 : 0;
-  status_.is_safe = found_safe_path && !nero_hold_for_passing && !nero_commit_wait && c.n >= min_safe_cycles;
+  // NERO_LC_SIGHT (see nero_sight_param): the target lane behind ego must be seen far enough before a change is approved
+  bool nero_sight_hold = false;
+  {
+    const auto & sp = nero_sight_param();
+    auto & ss = nero_sight_state()[this];
+    const auto now_s = std::chrono::steady_clock::now();
+    if (now_s - ss.last > std::chrono::milliseconds(500)) {
+      ss = NeroSightState{};
+    }
+    ss.last = now_s;
+    if (
+      sp.v_min > 0.0 && direction_ != Direction::NONE && planner_data_ && planner_data_->dynamic_object &&
+      common_data_ptr_ && common_data_ptr_->is_data_available() && common_data_ptr_->is_lanes_available() &&
+      !common_data_ptr_->lanes_ptr->target.empty()) {
+      const auto & ego = common_data_ptr_->get_ego_pose();
+      const double eyaw = tf2::getYaw(ego.orientation);
+      const double ec = std::cos(eyaw), es = std::sin(eyaw);
+      const double side = direction_ == Direction::LEFT ? 1.0 : -1.0;
+      const auto & vi = common_data_ptr_->bpp_param_ptr->vehicle_info;
+      const auto to_ego = [&](const double x, const double y) {
+        const double dx = x - ego.position.x, dy = y - ego.position.y;
+        return std::make_pair(ec * dx + es * dy, -es * dx + ec * dy);
+      };
+      // the target lane and the target lanes before it (behind ego)
+      lanelet::ConstLanelets tl = common_data_ptr_->lanes_ptr->target;
+      for (const auto & seq : common_data_ptr_->lanes_ptr->preceding_target) {
+        tl.insert(tl.end(), seq.begin(), seq.end());
+      }
+      const auto in_target = [&](const geometry_msgs::msg::Pose & p) {
+        return std::any_of(tl.begin(), tl.end(), [&](const auto & ll) { return lanelet::utils::isInLanelet(p, ll); });
+      };
+      // the hidden car's speed: the target lane's limit (+ add), at least v_min
+      double limit_kmh = common_data_ptr_->lanes_ptr->target.front().attributeOr("speed_limit", 50.0);
+      const double v_h = std::max(sp.v_min, limit_kmh + sp.add) / 3.6;
+      const double v_e = std::max(0.0, getEgoVelocity());
+      const double dv = std::max(0.0, v_h - v_e);
+      const double need = std::min(sp.cap, dv * sp.t_b + dv * dv / (2.0 * sp.b) + v_e * sp.t_g);
+      // occluders: >= 0.9 m tall, not in the target lane, behind ego's front, within 65 m; seen cars in the target lane
+      // behind ego end the trace as covered
+      struct Occ
+      {
+        autoware_utils::Polygon2d poly;
+        std::string id;
+        double cx, cy, r;
+      };
+      std::vector<Occ> occ;
+      double covered_from = -1e9;  // ego-frame x of the nearest seen target-lane car behind ego (its front)
+      for (const auto & o : planner_data_->dynamic_object->objects) {
+        const auto & op = o.kinematics.initial_pose_with_covariance.pose;
+        const auto [ox, oy] = to_ego(op.position.x, op.position.y);
+        if (ox > 2.0 || std::hypot(ox, oy) > 65.0) continue;
+        if (in_target(op)) {
+          covered_from = std::max(covered_from, ox + 0.5 * o.shape.dimensions.x);
+          continue;
+        }
+        if (o.shape.dimensions.z < 0.9) continue;
+        occ.push_back(
+          {autoware_utils::to_polygon2d(op, o.shape), autoware_utils::to_hex_string(o.object_id).substr(0, 8), op.position.x,
+           op.position.y, 0.5 * std::hypot(o.shape.dimensions.x, o.shape.dimensions.y)});
+      }
+      // lidars in base_link: top (0.43, 0) and the change side's (0.65, +-0.13)
+      std::array<std::pair<double, double>, 2> lidars{
+        {{0.43, 0.0}, {0.65, direction_ == Direction::LEFT ? 0.135 : -0.12}}};
+      std::array<autoware_utils::Point2d, 2> S;
+      for (size_t i = 0; i < 2; ++i) {
+        S[i] = autoware_utils::Point2d(
+          ego.position.x + ec * lidars[i].first - es * lidars[i].second,
+          ego.position.y + es * lidars[i].first + ec * lidars[i].second);
+      }
+      // sample the target lanes' centre lines every metre behind ego's rear (60 m), nearest first
+      struct Smp
+      {
+        double ex;
+        autoware_utils::Point2d c, n;
+      };
+      std::vector<Smp> smp;
+      for (const auto & ll : tl) {
+        const auto cl = ll.centerline2d();
+        for (size_t i = 1; i < cl.size(); ++i) {
+          const double ax = cl[i - 1].x(), ay = cl[i - 1].y(), bx = cl[i].x(), by = cl[i].y();
+          const double L = std::hypot(bx - ax, by - ay);
+          if (L < 1e-3) continue;
+          const double ux = (bx - ax) / L, uy = (by - ay) / L;
+          for (double t = 0.0; t < L; t += 1.0) {
+            const double px = ax + ux * t, py = ay + uy * t;
+            const auto [ex, ey] = to_ego(px, py);
+            if (ex > -vi.rear_overhang_m || ex < -60.0 - vi.rear_overhang_m || side * ey < 0.5) continue;
+            // the near edge: 0.6 m from the centre toward ego
+            double nx = -uy, ny = ux;
+            if ((ego.position.x - px) * nx + (ego.position.y - py) * ny < 0.0) {
+              nx = -nx;
+              ny = -ny;
+            }
+            smp.push_back({ex, autoware_utils::Point2d(px, py), autoware_utils::Point2d(px + 0.6 * nx, py + 0.6 * ny)});
+          }
+        }
+      }
+      std::sort(smp.begin(), smp.end(), [](const auto & a, const auto & b) { return a.ex > b.ex; });
+      double view = 60.0;
+      std::string blocker;
+      for (const auto & q : smp) {
+        if (q.ex < covered_from) break;  // behind a seen target-lane car: covered
+        bool seen = false;
+        std::string by;
+        for (size_t si = 0; si < S.size(); ++si) {
+          const auto & s = S[si];
+          // the side Airy never sees its 4 lowest channels: beyond ~30 m back the target lane is the top lidar's alone
+          // (lidarinsert beams_report; research/probe/PROBE_DESIGN.md)
+          if (si == 1 && -q.ex > 30.0) continue;
+          for (const auto & P : {q.n, q.c}) {
+            autoware_utils::LineString2d ray;
+            ray.push_back(s);
+            ray.push_back(P);
+            bool blocked = false;
+            const double rx = P.x() - s.x(), ry = P.y() - s.y();
+            const double rl2 = std::max(rx * rx + ry * ry, 1e-6);
+            for (const auto & oc : occ) {
+              // quick reject: the occluder's circle must reach the ray
+              const double tq = std::clamp(((oc.cx - s.x()) * rx + (oc.cy - s.y()) * ry) / rl2, 0.0, 1.0);
+              if (std::hypot(s.x() + tq * rx - oc.cx, s.y() + tq * ry - oc.cy) > oc.r) continue;
+              if (boost::geometry::intersects(ray, oc.poly)) {
+                blocked = true;
+                by = oc.id;
+                break;
+              }
+            }
+            if (!blocked) {
+              seen = true;
+              break;
+            }
+          }
+          if (seen) break;
+        }
+        if (!seen) {
+          view = std::max(0.0, -q.ex - vi.rear_overhang_m);
+          blocker = by;
+          break;
+        }
+      }
+      ss.view = view;
+      ss.need = need;
+      ss.v_h = v_h;
+      ss.blocker = blocker;
+      ss.lacking = view < need;
+      nero_sight_hold = ss.lacking;
+      // release hysteresis: after a short view the lane must stay seen 1.2 s before a change is approved. A car first seen this
+      // cycle covers the lane behind it at once (view 60 m) but has no track history yet: lcg5 hid3_v083 approved in that cycle,
+      // the approved path read unsafe 0.5 s later and the module braked to 0.5 m/s at -3 m/s2 while the car passed (janky).
+      if (ss.lacking) {
+        ss.lack_last = now_s;
+        ss.ok_since.reset();
+      } else {
+        if (!ss.ok_since) ss.ok_since = now_s;
+        if (
+          now_s - ss.lack_last < std::chrono::seconds(5) &&
+          now_s - *ss.ok_since < std::chrono::milliseconds(1200)) {
+          nero_sight_hold = true;
+          if (nero_lc_debug_every("sight_rel_h", 300)) {
+            RCLCPP_INFO(logger_, "[NERO_LC_SIGHT] lane seen again: held %.1f s more (release hysteresis)",
+              1.2 - std::chrono::duration<double>(now_s - *ss.ok_since).count());
+          }
+        }
+      }
+      // <stand release s>: standing with only the sight hold in the way for that long -> the module's own check decides
+      if (ss.lacking && found_safe_path && v_e < 0.3) {
+        if (!ss.stand_since) ss.stand_since = now_s;
+      } else {
+        ss.stand_since.reset();
+      }
+      if (
+        sp.stand_release > 0.0 && ss.stand_since &&
+        std::chrono::duration<double>(now_s - *ss.stand_since).count() > sp.stand_release) {
+        nero_sight_hold = false;
+        if (nero_lc_debug_every("sight_rel", 1000)) {
+          RCLCPP_INFO(
+            logger_, "[NERO_LC_SIGHT] released after %.0f s standing: view %.1f m < need %.1f m%s%s", sp.stand_release, view,
+            need, blocker.empty() ? "" : ", hidden by ", blocker.c_str());
+        }
+      }
+      if (nero_lc_debug_every("sight", 500) || (ss.lacking && found_safe_path && nero_lc_debug_every("sight_h", 250))) {
+        RCLCPP_INFO(
+          logger_, "[NERO_LC_SIGHT] %s view behind %.1f m %s need %.1f m (v_e %.1f, hidden car %.1f m/s)%s%s%s",
+          direction_ == Direction::LEFT ? "L" : "R", view, ss.lacking ? "<" : ">=", need, v_e, v_h,
+          blocker.empty() ? "" : ", hidden by ", blocker.c_str(),
+          ss.lacking && found_safe_path ? ": safe path held" : "");
+      }
+    }
+  }
+  c.n = (found_safe_path && !nero_hold_for_passing && !nero_sight_hold) ? c.n + 1 : 0;
+  status_.is_safe =
+    found_safe_path && !nero_hold_for_passing && !nero_commit_wait && !nero_sight_hold && c.n >= min_safe_cycles;
   status_.lane_change_path.path.header = getRouteHeader();
 }
 
@@ -1026,6 +1438,262 @@ std::pair<bool, bool> NormalLaneChange::getSafePath(LaneChangePath & safe_path) 
   return {true, found_safe_path};
 }
 
+// NERO_LC_GIVEUP (see nero_giveup_param): called by isLaneChangeRequired (the idle instance) and by the waiting change's
+// failure check (a waiting candidate is never asked isExecutionRequested again: it leaves only by cancel / success)
+bool NormalLaneChange::nero_lc_giveup()
+{
+  if (
+    nero_giveup_param().margin < 0.0 || !common_data_ptr_ || !common_data_ptr_->is_data_available() ||
+    !common_data_ptr_->is_lanes_available()) {
+    return false;
+  }
+  const auto & current_lanes = common_data_ptr_->lanes_ptr->current;
+  const auto & target_lanes = common_data_ptr_->lanes_ptr->target;
+  if (
+    nero_giveup_param().margin >= 0.0 && type_ == LaneChangeModuleType::NORMAL && direction_ != Direction::NONE &&
+    !current_lanes.empty() && !target_lanes.empty()) {
+    const auto & gp = nero_giveup_param();
+    const auto & rh = common_data_ptr_->route_handler_ptr;
+    const auto & cur = current_lanes.back();
+    lanelet::ConstLanelet next_in_route;
+    const bool leaves_route = !rh->isInGoalRouteSection(cur) && !rh->getNextLaneletWithinRoute(cur, &next_in_route);
+    // not for the last changes into the goal's lane: a target lane in the goal's route section (carrying on would turn a short
+    // approach into a loop; c13: the keep-right changes into the goal lane right after the turn). Not by straight-line distance:
+    // a goal across a U-turn / a turn is near the lane end in metres but not on the way (lcg6: c07 / c13 give-ups lost)
+    bool goal_near = std::any_of(
+      target_lanes.begin(), target_lanes.end(), [&](const auto & l) { return rh->isInGoalRouteSection(l); });
+    {
+      // or the target lane leads (within the route) straight into the goal's section (lcgu c13: the keep-right changes after
+      // the turn, 2096634 -> 35 -> 36, whose next is the goal section)
+      lanelet::ConstLanelet tn;
+      if (!goal_near && rh->getNextLaneletWithinRoute(target_lanes.back(), &tn)) goal_near = rh->isInGoalRouteSection(tn);
+    }
+    if (leaves_route && !goal_near) {
+      auto & gs = nero_giveup_state();
+      const auto stamp = getRouteHeader().stamp;
+      const bool same = gs.lane == cur.id() && gs.sec == stamp.sec && gs.nanosec == stamp.nanosec;
+      const auto now_s = std::chrono::steady_clock::now();
+      const double v_e = std::max(0.0, getEgoVelocity());
+      // the speed the robot drove at over the last 8 s: the waiting change's own slow-down toward its stop (NERO_LC_WAIT_DECEL)
+      // must not shrink the distance (the give-up comes before that slow-down, ego keeps its speed)
+      static std::deque<std::pair<std::chrono::steady_clock::time_point, double>> v_hist;
+      v_hist.emplace_back(now_s, v_e);
+      while (!v_hist.empty() && now_s - v_hist.front().first > std::chrono::seconds(8)) v_hist.pop_front();
+      double v_ref = v_e;
+      for (const auto & h : v_hist) v_ref = std::max(v_ref, h.second);
+      // give up when ego would now have to start braking for the change's waiting stop (at the terminal start): braking from
+      // v_ref at the car's wait deceleration (NERO_LC_WAIT_DECEL, else 0.5 m/s2) + 1 s + margin. A robot coming at speed gives up
+      // before its slow-down (it keeps its speed); one that entered the lane slowly (after a turn) still gets its time to find a gap.
+      static const double b_wait = [] {
+        const char * e = std::getenv("NERO_LC_WAIT_DECEL");
+        const double b = e ? std::atof(e) : 0.0;
+        return b > 0.05 ? b : 0.5;
+      }();
+      const double to_end = common_data_ptr_->transient_data.dist_to_terminal_end;
+      const double to_ts = common_data_ptr_->transient_data.dist_to_terminal_start;
+      const double d_go = v_ref * v_ref / (2.0 * b_wait) + v_ref * 1.0 + gp.margin;
+      // stage A (smooth): from the return distance before the give-up point a still-held change brings its lean back to the lane
+      // centre (the waiting path ramps it out over ret_len), so the cancel at the give-up point is no sideways jump (lcg5 c07:
+      // the 1 m lean dropped in one cycle -> path jump 1.44 m, -1.5 m/s2 lateral)
+      const double d_ret = std::max(15.0, 3.0 * v_ref);
+      if (!same && to_ts <= d_go + d_ret && !status_.is_safe && v_ref >= 3.0) {
+        if (!(gs.ret_lane == cur.id() && gs.ret_sec == stamp.sec && gs.ret_nanosec == stamp.nanosec)) {
+          gs.ret_lane = cur.id();
+          gs.ret_sec = stamp.sec;
+          gs.ret_nanosec = stamp.nanosec;
+          gs.ret_len = d_ret;
+          RCLCPP_INFO(
+            logger_, "[NERO_LC_GIVEUP] lane %ld: change still held %.0f m before its waiting stop: lean back to the lane centre over %.0f m",
+            cur.id(), to_ts, d_ret);
+        }
+      }
+      // only for a robot approaching at speed (>= 3 m/s over the last 8 s: the stand at a lane end it removes; a robot crawling
+      // after a turn toward the goal road keeps the wait - lcgv c13: given up there over and over, then 30 s standing), and at most
+      // one give-up per 20 s (no give-up / re-route ping-pong)
+      static std::chrono::steady_clock::time_point last_giveup{};
+      const bool fast_enough = v_ref >= 3.0;
+      const bool rested = now_s - last_giveup > std::chrono::seconds(20);
+      if (!same && to_ts <= d_go && !status_.is_safe && fast_enough && rested) {
+        last_giveup = now_s;
+        const auto nexts = rh->getNextLanelets(cur);
+        if (nexts.empty()) {
+          static double last_log = 0.0;
+          const double now = std::chrono::duration<double>(now_s.time_since_epoch()).count();
+          if (now - last_log > 2.0) {
+            last_log = now;
+            RCLCPP_INFO(
+              logger_,
+              "[NERO_LC_GIVEUP] lane %ld ends in %.0f m with no lane after it in the map: the change into %ld waits at its "
+              "end as before",
+              cur.id(), to_end, target_lanes.front().id());
+          }
+        } else {
+          // the lane straight on: turn_direction "straight" first, else the smallest heading change
+          const auto ccl = cur.centerline2d();
+          double cyaw = 0.0;
+          if (ccl.size() >= 2) {
+            const auto & a = ccl[ccl.size() - 2];
+            const auto & b = ccl[ccl.size() - 1];
+            cyaw = std::atan2(b.y() - a.y(), b.x() - a.x());
+          }
+          lanelet::ConstLanelet best = nexts.front();
+          double best_a = 1e9;
+          for (const auto & n : nexts) {
+            const auto ncl = n.centerline2d();
+            if (ncl.size() < 2) continue;
+            const double nyaw =
+              std::atan2(ncl.back().y() - ncl.front().y(), ncl.back().x() - ncl.front().x());
+            double a = std::abs(std::remainder(nyaw - cyaw, 2.0 * M_PI));
+            if (std::string(n.attributeOr("turn_direction", "else")) == "straight") a -= 10.0;
+            if (a < best_a) {
+              best_a = a;
+              best = n;
+            }
+          }
+          // start: ego projected on its lane's centre line. Waypoint: on the first ordinary lane straight on (>= 15 m, no
+          // turn_direction: past the junction pieces, at most 3 lanelets on), half way, at most 20 m in. A waypoint inside a
+          // junction piece is also inside the turn pieces that overlap it, and the planner starts the next leg from every
+          // lanelet holding the waypoint (lcg2 c07: the old route came back).
+          geometry_msgs::msg::PoseArray m;
+          m.header.stamp = stamp;
+          m.header.frame_id = "map";
+          const auto & ego = common_data_ptr_->get_ego_pose();
+          m.poses.push_back(lanelet::utils::getClosestCenterPose(cur, ego.position));
+          const auto straightest = [&](const lanelet::ConstLanelet & from, const lanelet::ConstLanelets & cands) {
+            const auto fcl = from.centerline2d();
+            double fyaw = 0.0;
+            if (fcl.size() >= 2) {
+              fyaw = std::atan2(
+                fcl[fcl.size() - 1].y() - fcl[fcl.size() - 2].y(), fcl[fcl.size() - 1].x() - fcl[fcl.size() - 2].x());
+            }
+            lanelet::ConstLanelet b = cands.front();
+            double ba = 1e9;
+            for (const auto & n : cands) {
+              const auto ncl = n.centerline2d();
+              if (ncl.size() < 2) continue;
+              double a = std::abs(std::remainder(
+                std::atan2(ncl.back().y() - ncl.front().y(), ncl.back().x() - ncl.front().x()) - fyaw, 2.0 * M_PI));
+              if (std::string(n.attributeOr("turn_direction", "else")) == "straight") a -= 10.0;
+              if (a < ba) {
+                ba = a;
+                b = n;
+              }
+            }
+            return b;
+          };
+          lanelet::ConstLanelet wl = best;
+          for (int hop = 0; hop < 3; ++hop) {
+            const bool ordinary = static_cast<double>(lanelet::geometry::length(wl.centerline2d())) >= 15.0 &&
+                                  !wl.hasAttribute("turn_direction");
+            if (ordinary) break;
+            const auto nn = rh->getNextLanelets(wl);
+            if (nn.empty()) break;
+            wl = straightest(wl, nn);
+          }
+          const auto wcl = wl.centerline2d();
+          const double s = std::min(0.5 * static_cast<double>(lanelet::geometry::length(wcl)), 20.0);
+          const auto bp = lanelet::geometry::interpolatedPointAtDistance(wcl, s);
+          geometry_msgs::msg::Point wp;
+          wp.x = bp.x();
+          wp.y = bp.y();
+          wp.z = ego.position.z;
+          m.poses.push_back(lanelet::utils::getClosestCenterPose(wl, wp));
+          const lanelet::Id gs_wp_lane = wl.id();
+          // the way on from the waypoint lane to the goal: where it comes back into the current route (a U-turn that is the only
+          // way to the goal's side, 22 Nov 14:25 c07), the route cannot pass that road twice (route sections are built back from
+          // the goal) -> a first leg that ends on the lanelet before the way rejoins the current route (poses[2]); the mission
+          // planner swaps to the goal 150 m before it
+          {
+            lanelet::ConstLanelet goal_ll;
+            if (rh->getGoalLanelet(&goal_ll)) {
+              const auto rt = rh->getRoutingGraphPtr()->getRoute(wl, goal_ll, 0);
+              if (rt) {
+                const auto sp = rt->shortestPath();
+                size_t k = 0;
+                for (size_t q = 1; q < sp.size(); ++q) {
+                  if (rh->isRouteLanelet(sp[q])) {
+                    k = q;
+                    break;
+                  }
+                }
+                // two legs only when the way on comes back into the road ego is on now (its section): re-entering the route
+                // further on (e.g. at the goal's road from its other end) is a plain route (lcgu c13: two legs there swapped
+                // back at once and the give-up repeated)
+                const auto & g = rh->getRoutingGraphPtr();
+                lanelet::ConstLanelets nb{cur};
+                for (const auto & l : g->lefts(cur)) nb.push_back(l);
+                for (const auto & l : g->rights(cur)) nb.push_back(l);
+                for (const auto & l : g->adjacentLefts(cur)) nb.push_back(l);
+                for (const auto & l : g->adjacentRights(cur)) nb.push_back(l);
+                const bool same_road =
+                  k > 0 && std::any_of(nb.begin(), nb.end(), [&](const auto & l) { return l.id() == sp[k].id(); });
+                if (k >= 2 && same_road) {
+                  // the lanelet before the re-entry; one more back if it is short (a junction piece)
+                  size_t gi = k - 1;
+                  if (static_cast<double>(lanelet::geometry::length(sp[gi].centerline2d())) < 15.0 && gi >= 2) --gi;
+                  const auto gcl = sp[gi].centerline2d();
+                  const auto gpt = lanelet::geometry::interpolatedPointAtDistance(
+                    gcl, 0.5 * static_cast<double>(lanelet::geometry::length(gcl)));
+                  geometry_msgs::msg::Point g1;
+                  g1.x = gpt.x();
+                  g1.y = gpt.y();
+                  g1.z = ego.position.z;
+                  m.poses.push_back(lanelet::utils::getClosestCenterPose(sp[gi], g1));
+                  RCLCPP_INFO(
+                    logger_,
+                    "[NERO_LC_GIVEUP] the way on comes back into this route at %ld: first leg to %ld, then the goal",
+                    sp[k].id(), sp[gi].id());
+                }
+              }
+            }
+          }
+          gs.refused = false;
+          gs.last_pub = std::chrono::steady_clock::time_point{};
+          gs.lane = cur.id();
+          gs.sec = stamp.sec;
+          gs.nanosec = stamp.nanosec;
+          gs.since = now_s;
+          gs.msg = m;
+          const auto sit = nero_sight_state().find(this);
+          const bool sight = sit != nero_sight_state().end() && sit->second.lacking &&
+                             now_s - sit->second.last < std::chrono::milliseconds(500);
+          char why[160];
+          if (sight) {
+            std::snprintf(
+              why, sizeof(why), "the target lane behind is not seen far enough (view %.1f m < need %.1f m)",
+              sit->second.view, sit->second.need);
+          } else {
+            std::snprintf(why, sizeof(why), "no safe gap");
+          }
+          RCLCPP_INFO(
+            logger_,
+            "[NERO_LC_GIVEUP] %s change into %ld given up: lane %ld ends in %.0f m, waiting stop in %.0f m <= %.0f m (braking "
+            "from %.1f m/s; now %.1f m/s), %s; carry on into %ld (waypoint in %ld) and re-route to the goal",
+            direction_ == Direction::LEFT ? "left" : "right", target_lanes.front().id(), cur.id(), to_end, to_ts, d_go, v_ref, v_e,
+            why, best.id(), gs_wp_lane);
+        }
+      }
+      if (gs.lane == cur.id() && gs.sec == stamp.sec && gs.nanosec == stamp.nanosec && !gs.refused) {
+        if (std::chrono::duration<double>(now_s - gs.since).count() > gp.wait) {
+          gs.refused = true;
+          RCLCPP_WARN(
+            logger_, "[NERO_LC_GIVEUP] no new route within %.1f s: the change from lane %ld waits as before", gp.wait,
+            cur.id());
+        } else {
+          auto & pub = nero_lc_giveup_pub();
+          if (pub && now_s - gs.last_pub > std::chrono::milliseconds(1000)) {
+            pub->publish(gs.msg);
+            gs.last_pub = now_s;
+          }
+          return true;
+        }
+      }
+    }
+  }
+
+  return false;
+}
+
 bool NormalLaneChange::isLaneChangeRequired()
 {
   autoware_utils::ScopedTimeTrack st(__func__, *time_keeper_);
@@ -1060,6 +1728,13 @@ bool NormalLaneChange::isLaneChangeRequired()
     return false;
   }
 
+  // NERO_LC_GIVEUP (see nero_giveup_param): a route change still held near the end of ego's lane is given up; ego carries
+  // on straight and the mission planner re-routes from the lane after ego's lane (no waiting stop at the lane end)
+  if (nero_lc_giveup()) {
+    nero_req_log("no: given up (NERO_LC_GIVEUP), carrying on");
+    return false;
+  }
+
   if (is_near_regulatory_element()) {
     RCLCPP_DEBUG(logger_, "Ego is close to regulatory element, don't run LC module");
     nero_req_log("no: near regulatory element");
@@ -1069,6 +1744,62 @@ bool NormalLaneChange::isLaneChangeRequired()
   if (nero_keep_right_gate_blocks()) {
     nero_req_log("no: keep-right gate");
     return false;
+  }
+
+  // NERO_LC_COMMIT_ZONE=<D0>,<D1> (izlanechange 2026-11-23, Ahmed 22 Nov: "went left too early", "didnt make new plan"):
+  // a route lane change to the LEFT is not started while ego is farther than D0 + D1 x (lane changes due) metres from
+  // the end of its own lane, when that lane leaves the route there (no following lanelet within the route, not the goal
+  // section). This is the commit zone the mission planner's keep-right (NERO_KEEP_RIGHT_LANES) already keeps, but per
+  // lanelet: on a 287 m / 621 m lanelet the whole lanelet became preferred and the change started at its start (22 Nov
+  // 14:24:5x 2096587 -> 86, ~240 m early; 16:29:47 2096558 -> 57 -> 56, ~560 m early, twice, against keep right).
+  // Not for: right changes (keep right), avoidance by lane change (its own type), a lane that continues in the route
+  // (a dashboard lane request moves the preferred lane beside a lane that continues). Unset / "0" = the car.
+  {
+    // 3rd field <busy m> (default 0): while a moving car (> 2 m/s) is seen in the target lane within 80 m behind / 40 m ahead
+    // of ego, the zone is that much longer (a busy lane is joined earlier, so a stream does not leave the robot standing at the
+    // lane end: mac/app-30's must-keep, the Alfalah boulevard stands of 15-16 Nov)
+    static const std::array<double, 3> cz = [] {
+      double d0 = -1.0, d1 = 40.0, busy = 0.0;
+      if (const char * e = std::getenv("NERO_LC_COMMIT_ZONE")) {
+        std::sscanf(e, "%lf,%lf,%lf", &d0, &d1, &busy);
+      }
+      return std::array<double, 3>{d0, std::max(d1, 0.0), std::max(busy, 0.0)};
+    }();
+    if (cz[0] > 0.0 && type_ == LaneChangeModuleType::NORMAL && direction_ == Direction::LEFT && !current_lanes.empty()) {
+      const auto & rh = common_data_ptr_->route_handler_ptr;
+      lanelet::ConstLanelet next;
+      const bool leaves_route =
+        !rh->isInGoalRouteSection(current_lanes.back()) && !rh->getNextLaneletWithinRoute(current_lanes.back(), &next);
+      if (leaves_route) {
+        const int n = std::max(1, std::abs(rh->getNumLaneToPreferredLane(current_lanes.back(), Direction::LEFT)));
+        double zone = cz[0] + cz[1] * static_cast<double>(n);
+        bool busy = false;
+        if (cz[2] > 0.0) {
+          const auto spd = [](const auto & o) { return std::hypot(o.initial_twist.linear.x, o.initial_twist.linear.y); };
+          for (const auto & o : filtered_objects_.target_lane_trailing) {
+            if (spd(o) > 2.0 && std::abs(o.dist_from_ego) < 80.0) busy = true;
+          }
+          for (const auto & o : filtered_objects_.target_lane_leading.moving) {
+            if (spd(o) > 2.0 && std::abs(o.dist_from_ego) < 40.0) busy = true;
+          }
+          if (busy) zone += cz[2];
+        }
+        const double to_end = common_data_ptr_->transient_data.dist_to_terminal_end;
+        if (to_end > zone) {
+          static double last_log = 0.0;
+          const double now =
+            std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+          if (now - last_log > 1.0) {
+            last_log = now;
+            RCLCPP_INFO(
+              logger_, "[NERO_LC_COMMIT_ZONE] left change held: lane %ld ends in %.0f m, zone %.0f m (%d change%s due%s)",
+              current_lanes.back().id(), to_end, zone, n, n > 1 ? "s" : "", busy ? ", target lane busy" : "");
+          }
+          nero_req_log("no: commit zone");
+          return false;
+        }
+      }
+    }
   }
 
   nero_req_log("yes");

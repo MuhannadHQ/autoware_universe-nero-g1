@@ -20,6 +20,7 @@
 #include "autoware_utils/ros/update_param.hpp"
 
 #include <rclcpp/rclcpp.hpp>
+#include <geometry_msgs/msg/pose_array.hpp>  // NERO_LC_GIVEUP
 
 #include <algorithm>
 #include <cstdlib>
@@ -30,11 +31,22 @@
 namespace autoware::behavior_path_planner
 {
 
+// NERO_LC_GIVEUP (scene.cpp): the planner node's publisher of the carry-on request
+rclcpp::Publisher<geometry_msgs::msg::PoseArray>::SharedPtr & nero_lc_giveup_pub();
+
 void LaneChangeModuleManager::init(rclcpp::Node * node)
 {
   // init manager interface
   initInterface(node, {""});
   initParams(node);
+  // NERO_LC_GIVEUP: one publisher per planner node (the mission planner re-routes on it; the bridge can show it)
+  if (std::getenv("NERO_LC_GIVEUP") != nullptr && !nero_lc_giveup_pub()) {
+    nero_lc_giveup_pub() = node->create_publisher<geometry_msgs::msg::PoseArray>(
+      "/planning/nero/lane_change_giveup", rclcpp::QoS(1).reliable());
+    RCLCPP_INFO(
+      node->get_logger(), "[NERO_LC_GIVEUP] %s: a held route change near the lane end is given up and re-routed",
+      std::getenv("NERO_LC_GIVEUP"));
+  }
 }
 
 // NERO_LC_FIX_12280=1: port of upstream #12280 (path miss detection), read once. Unset = the car.

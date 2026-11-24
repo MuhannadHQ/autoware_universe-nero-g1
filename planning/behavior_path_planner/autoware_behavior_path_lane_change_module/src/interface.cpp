@@ -542,6 +542,10 @@ std::pair<LaneChangeStates, std::string_view> LaneChangeInterface::check_transit
     if (module_type_->is_near_regulatory_element()) {
       return {LaneChangeStates::Cancel, "CloseToRegElement"};
     }
+    // NERO_LC_GIVEUP: the held route change near the lane end is given up (ego carries on, the route is planned again)
+    if (auto * nlc = dynamic_cast<NormalLaneChange *>(module_type_.get()); nlc != nullptr && nlc->nero_lc_giveup()) {
+      return {LaneChangeStates::Cancel, "NeroGiveUp"};
+    }
     return {LaneChangeStates::Normal, "WaitingForApproval"};
   }
 

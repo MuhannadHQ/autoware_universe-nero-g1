@@ -27,6 +27,7 @@
 #include <lanelet2_core/geometry/LineString.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <memory>
 #include <string>
 #include <utility>
@@ -70,6 +71,13 @@ MissionPlanner::MissionPlanner(const rclcpp::NodeOptions & options)
   // NOTE: The route interface should be mutually exclusive by callback group.
   sub_modified_goal_ = create_subscription<PoseWithUuidStamped>(
     "~/input/modified_goal", durable_qos, std::bind(&MissionPlanner::on_modified_goal, this, _1));
+  // NERO_LC_GIVEUP (izlanechange-2 2026-11-23): see on_nero_lc_giveup. Unset = no subscription (the car).
+  if (std::getenv("NERO_LC_GIVEUP") != nullptr) {
+    sub_nero_lc_giveup_ = create_subscription<geometry_msgs::msg::PoseArray>(
+      "/planning/nero/lane_change_giveup", rclcpp::QoS(1).reliable(),
+      std::bind(&MissionPlanner::on_nero_lc_giveup, this, _1));
+    RCLCPP_INFO(get_logger(), "[NERO_LC_GIVEUP] on: a lane change given up near the lane end re-routes straight on");
+  }
   srv_clear_route = create_service<ClearRoute>(
     "~/clear_route", service_utils::handle_exception(&MissionPlanner::on_clear_route, this));
   srv_set_lanelet_route = create_service<SetLaneletRoute>(
@@ -139,6 +147,40 @@ void MissionPlanner::check_initialization()
 void MissionPlanner::on_odometry(const Odometry::ConstSharedPtr msg)
 {
   odometry_ = msg;
+
+  // NERO_LC_GIVEUP two-leg re-route: 150 m before the first leg's goal, the route to the goal (same uuid)
+  if (
+    nero_leg_goal_ && current_route_ && state_.state == RouteState::SET &&
+    rclcpp::Time(current_route_->header.stamp) == rclcpp::Time(nero_leg_stamp_)) {
+    const auto & p = odometry_->pose.pose.position;
+    const double d = std::hypot(nero_leg_goal_->position.x - p.x, nero_leg_goal_->position.y - p.y);
+    if (std::hypot(nero_leg_wp_.position.x - p.x, nero_leg_wp_.position.y - p.y) < 8.0) nero_leg_wp_reached_ = true;
+    if (nero_leg_wp_reached_ && d < 150.0 && (now() - nero_leg_last_try_).seconds() > 1.0) {
+      nero_leg_last_try_ = now();
+      Header header;
+      header.stamp = now();
+      header.frame_id = map_frame_;
+      change_state(RouteState::REROUTING);
+      planner_->clearRoute();
+      const auto route = create_route(
+        header, std::vector<Pose>{}, odometry_->pose.pose, nero_final_goal_, current_route_->uuid,
+        current_route_->allow_modification);
+      if (route.segments.empty()) {
+        cancel_route();
+        change_state(RouteState::SET);
+        RCLCPP_WARN(get_logger(), "[NERO_LC_GIVEUP] second leg: no route yet (%.0f m to the first leg's goal)", d);
+      } else {
+        change_route(route);
+        change_state(RouteState::SET);
+        nero_leg_goal_.reset();
+        RCLCPP_INFO(
+          get_logger(), "[NERO_LC_GIVEUP] second leg: route to the goal (%zu sections), %.0f m before the first leg's goal",
+          route.segments.size(), d);
+      }
+    }
+  } else if (nero_leg_goal_ && current_route_ && rclcpp::Time(current_route_->header.stamp) != rclcpp::Time(nero_leg_stamp_)) {
+    nero_leg_goal_.reset();  // another route came in
+  }
 
   // NOTE: Do not check in the other states as goal may change.
   if (state_.state == RouteState::SET) {
@@ -217,6 +259,93 @@ void MissionPlanner::on_modified_goal(const PoseWithUuidStamped::ConstSharedPtr 
   change_route(route);
   change_state(RouteState::SET);
   RCLCPP_INFO(get_logger(), "Changed the route with the modified goal");
+}
+
+// NERO_LC_GIVEUP=<margin m>[,<wait s>] (izlanechange-2 2026-11-23, Ahmed 23 Nov 12:14 "no standing is dangerous"): the lane
+// change module gave up a route change it could not make safely before the end of ego's lane (no gap, or the target lane
+// not seen far enough). Its message: header.stamp = the stamp of the route it gave up on, poses[0] = ego on its lane's
+// centre line, poses[1] = a pose on the lane after ego's lane (straight on). The route is planned again from poses[0]
+// through poses[1] to the same goal (same uuid: the behavior planner keeps its modules), so ego carries on in its lane
+// instead of standing at its end. Accepted only when the new route starts in ego's lane and its next section holds the
+// lane after it (nothing changes on the path ego is driving up to the lane end). A message for an older route is ignored.
+void MissionPlanner::on_nero_lc_giveup(const geometry_msgs::msg::PoseArray::ConstSharedPtr msg)
+{
+  if (msg->poses.size() < 2 || !is_mission_planner_ready_ || !current_route_ || !odometry_ || !lanelet_map_ptr_) {
+    return;
+  }
+  if (state_.state != RouteState::SET) {
+    return;
+  }
+  if (rclcpp::Time(current_route_->header.stamp) != rclcpp::Time(msg->header.stamp)) {
+    return;  // for an older route (or already carried on)
+  }
+  const bool is_autonomous_driving =
+    operation_mode_state_ ? operation_mode_state_->mode == OperationModeState::AUTONOMOUS &&
+                              operation_mode_state_->is_autoware_control_enabled
+                          : false;
+  if (is_autonomous_driving && !allow_reroute_in_autonomous_mode_) {
+    RCLCPP_WARN_THROTTLE(
+      get_logger(), *get_clock(), 5000,
+      "[NERO_LC_GIVEUP] re-route not allowed in autonomous mode (allow_reroute_in_autonomous_mode false)");
+    return;
+  }
+  Header header;
+  header.stamp = now();
+  header.frame_id = map_frame_;
+  const bool two_legs = msg->poses.size() >= 3;
+  const Pose leg_goal = two_legs ? msg->poses[2] : current_route_->goal_pose;
+  change_state(RouteState::REROUTING);
+  // plan without the current route: the route handler snaps a checkpoint onto a lanelet of the current route that holds it
+  // (upstream #8238, "select the same lane as much as possible when rerouting"), and a U-turn / turn lanelet of the old route
+  // that sweeps over the junction holds the straight-on waypoint (lcg2 c07 fol3: the old route came back). cancel_route()
+  // restores the planner's route when the new one is refused.
+  planner_->clearRoute();
+  const auto route = create_route(
+    header, std::vector<Pose>{msg->poses[1]}, msg->poses[0], leg_goal, current_route_->uuid,
+    two_legs ? false : current_route_->allow_modification);
+  const auto holds = [&](const LaneletSegment & seg, const Pose & p) {
+    return std::any_of(seg.primitives.begin(), seg.primitives.end(), [&](const auto & pr) {
+      return lanelet_map_ptr_->laneletLayer.exists(pr.id) &&
+             lanelet::utils::isInLanelet(p, lanelet_map_ptr_->laneletLayer.get(pr.id));
+    });
+  };
+  // ego's lane first, the waypoint (on the first ordinary lane straight on, past the junction pieces) within the next 4 sections
+  bool wp_near = false;
+  for (size_t k = 1; k < std::min<size_t>(route.segments.size(), 5); ++k) {
+    wp_near = wp_near || holds(route.segments.at(k), msg->poses[1]);
+  }
+  const bool straight_on = route.segments.size() >= 2 && holds(route.segments.at(0), msg->poses[0]) && wp_near;
+  if (!straight_on) {
+    cancel_route();
+    change_state(RouteState::SET);
+    std::string secs;
+    for (size_t k = 0; k < std::min<size_t>(route.segments.size(), 6); ++k) {
+      secs += " " + std::to_string(route.segments.at(k).preferred_primitive.id);
+    }
+    RCLCPP_WARN(
+      get_logger(), "[NERO_LC_GIVEUP] no route straight on from ego's lane to the goal (%zu sections:%s): route kept",
+      route.segments.size(), secs.c_str());
+    return;
+  }
+  const bool safe_by_length = check_reroute_safety(*current_route_, route);
+  if (two_legs) {
+    nero_final_goal_ = current_route_->goal_pose;
+    nero_leg_goal_ = leg_goal;
+    nero_leg_wp_ = msg->poses[1];
+    nero_leg_wp_reached_ = false;
+    nero_leg_stamp_ = route.header.stamp;
+    RCLCPP_INFO(
+      get_logger(), "[NERO_LC_GIVEUP] two legs: first to (%.1f, %.1f), then the goal (%.1f, %.1f)", leg_goal.position.x,
+      leg_goal.position.y, nero_final_goal_.position.x, nero_final_goal_.position.y);
+  }
+  change_route(route);
+  change_state(RouteState::SET);
+  RCLCPP_INFO(
+    get_logger(),
+    "[NERO_LC_GIVEUP] re-routed: carry on from lane %ld into lane %ld, then to the same goal (%zu sections; re-route "
+    "length check %s)",
+    route.segments.at(0).preferred_primitive.id, route.segments.at(1).preferred_primitive.id, route.segments.size(),
+    safe_by_length ? "passed" : "short, accepted: the path to the lane end is unchanged");
 }
 
 void MissionPlanner::on_clear_route(

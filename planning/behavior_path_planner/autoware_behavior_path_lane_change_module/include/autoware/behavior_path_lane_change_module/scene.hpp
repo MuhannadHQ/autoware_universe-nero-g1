@@ -108,6 +108,8 @@ public:
   // abort not finished, footprint inside the current lanes) -> cancel. Both empty / false when the switch is unset (non-virtual).
   std::optional<std::string> nero_abort_room_refuse(bool decide = true);  // decide false: record positions only (every cycle)
   bool nero_abort_stalled();
+  // NERO_LC_GIVEUP (scene.cpp): true while a held route change near the lane end is given up (ego carries on, re-route asked)
+  bool nero_lc_giveup();
   // NERO_LC_GAP_AHEAD (mainlane-7): a candidate check dropped a passer coming from behind within the last 0.5 s (a gap is planned). Non-virtual.
   bool nero_gap_picked() const;
   double nero_pace_cap(double & s_leave, double & s_lc, double & v_lat) const;  // NERO_LC_GAP_AHEAD_PACE: speed cap up to the leave (-1 none)

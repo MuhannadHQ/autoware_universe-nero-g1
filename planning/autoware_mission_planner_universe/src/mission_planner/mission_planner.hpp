@@ -30,6 +30,7 @@
 #include <autoware_adapi_v1_msgs/srv/set_route_points.hpp>
 #include <autoware_internal_debug_msgs/msg/float64_stamped.hpp>
 #include <autoware_planning_msgs/msg/lanelet_route.hpp>
+#include <geometry_msgs/msg/pose_array.hpp>  // NERO_LC_GIVEUP
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <tier4_planning_msgs/msg/reroute_availability.hpp>
 #include <tier4_planning_msgs/msg/route_state.hpp>
@@ -42,6 +43,7 @@
 #include <tf2_ros/transform_listener.h>
 
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -89,6 +91,15 @@ private:
   rclcpp::Publisher<LaneletRoute>::SharedPtr pub_route_;
 
   rclcpp::Subscription<PoseWithUuidStamped>::SharedPtr sub_modified_goal_;
+  // NERO_LC_GIVEUP: the lane change module gave up a change near the lane end -> carry the route on straight
+  rclcpp::Subscription<geometry_msgs::msg::PoseArray>::SharedPtr sub_nero_lc_giveup_;
+  // NERO_LC_GIVEUP two-leg re-route: the first leg's goal, the goal after it, the first leg's route stamp
+  std::optional<Pose> nero_leg_goal_;
+  Pose nero_leg_wp_;            // the waypoint past the lane end: the swap waits until ego has come near it
+  bool nero_leg_wp_reached_{false};
+  Pose nero_final_goal_;
+  builtin_interfaces::msg::Time nero_leg_stamp_;
+  rclcpp::Time nero_leg_last_try_{0, 0, RCL_ROS_TIME};
   rclcpp::Subscription<Odometry>::SharedPtr sub_odometry_;
   rclcpp::Subscription<OperationModeState>::SharedPtr sub_operation_mode_state_;
   autoware_utils::InterProcessPollingSubscriber<RerouteAvailability> sub_reroute_availability_{
@@ -108,6 +119,7 @@ private:
   void on_map(const LaneletMapBin::ConstSharedPtr msg);
   void on_reroute_availability(const RerouteAvailability::ConstSharedPtr msg);
   void on_modified_goal(const PoseWithUuidStamped::ConstSharedPtr msg);
+  void on_nero_lc_giveup(const geometry_msgs::msg::PoseArray::ConstSharedPtr msg);
 
   void on_clear_route(
     const ClearRoute::Request::SharedPtr req, const ClearRoute::Response::SharedPtr res);
