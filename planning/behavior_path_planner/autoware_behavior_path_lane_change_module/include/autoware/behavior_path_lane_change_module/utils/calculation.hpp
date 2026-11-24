@@ -166,10 +166,12 @@ std::vector<PhaseMetrics> calc_prepare_phase_metrics(
   const double max_path_velocity, const double min_length_threshold = 0.0,
   const double max_length_threshold = std::numeric_limits<double>::max());
 
+// nero_gradual (NERO_LC_GRADUAL): false for the terminal lane change path (the car's shape only near the lane end)
 std::vector<PhaseMetrics> calc_shift_phase_metrics(
   const CommonDataPtr & common_data_ptr, const double shift_length, const double initial_velocity,
   const double max_path_velocity, const double lon_accel,
-  const double max_length_threshold = std::numeric_limits<double>::max());
+  const double max_length_threshold = std::numeric_limits<double>::max(),
+  const bool nero_gradual = true);
 
 /**
  * @brief Calculates the minimum and maximum lane changing lengths, along with the corresponding

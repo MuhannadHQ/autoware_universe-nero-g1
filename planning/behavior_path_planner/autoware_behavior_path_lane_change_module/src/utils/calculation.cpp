@@ -16,6 +16,10 @@
 #include <algorithm>
 #include <array>
 #include <cstdlib>
+#include <vector>
+#include <cmath>
+#include <cstdio>
+#include <string>
 #include <autoware/behavior_path_lane_change_module/utils/calculation.hpp>
 #include <autoware/behavior_path_planner_common/utils/utils.hpp>
 #include <autoware/motion_utils/trajectory/path_shift.hpp>
@@ -687,9 +691,47 @@ std::vector<PhaseMetrics> calc_prepare_phase_metrics(
   return metrics;
 }
 
+// NERO_LC_GRADUAL=<lateral jerk m/s3>,<lat acc min m/s2>,<lat acc max m/s2> (izlanechange-3, 2026-11-23; Ahmed 13:40 "make the
+// lane changes more gradual"). The same values as lane change parameters (lateral_jerk 0.5, lateral_acceleration 0.3..0.6) made
+// every change gentler (20 km/h: 5 s / 28 m -> 6 s / 34 m, peak a_lat 0.6 -> 0.44 m/s2, jerk 1.0 -> 0.5) but they also set the
+// minimum change length, the distance buffers and the latest start: on e16 the right change after the left turn of the
+// three-lane road then had no candidate at all in its short lane (dist_to_terminal_start 13.6 m < target lane start 16.4 m;
+// run 1123-155408, a 29 s stand). Here the parameter file keeps the car's values (all lengths, buffers and the terminal path
+// as on the car) and each prepare length gets two gentle candidates first (min and max of these values, this jerk), then
+// the car's samples: the first valid and safe candidate is taken, so a change is gentle where it fits and has the car's
+// shape where the room is short or the gentle one is not safe (a shorter exposure). Near the lane end (ego near the terminal
+// start) only the car's samples (no extra candidates where the search is already the most expensive). Unset = the car.
+namespace
+{
+struct NeroGradual
+{
+  bool on{false};
+  double jerk{0.5};
+  double a_min{0.3};
+  double a_max{0.6};
+};
+const NeroGradual & nero_gradual_param()
+{
+  static const NeroGradual g = [] {
+    NeroGradual r;
+    if (const char * v = std::getenv("NERO_LC_GRADUAL"); v && *v && std::string(v) != "0") {
+      double j = r.jerk, a0 = r.a_min, a1 = r.a_max;
+      std::sscanf(v, "%lf,%lf,%lf", &j, &a0, &a1);
+      r.on = j > 0.05 && a0 > 0.05;
+      r.jerk = j;
+      r.a_min = a0;
+      r.a_max = std::max(a0, a1);
+    }
+    return r;
+  }();
+  return g;
+}
+}  // namespace
+
 std::vector<PhaseMetrics> calc_shift_phase_metrics(
   const CommonDataPtr & common_data_ptr, const double shift_length, const double initial_velocity,
-  const double max_path_velocity, const double lon_accel, const double max_length_threshold)
+  const double max_path_velocity, const double lon_accel, const double max_length_threshold,
+  const bool nero_gradual)
 {
   const auto & min_lc_vel = common_data_ptr->lc_param_ptr->trajectory.min_lane_changing_velocity;
   const auto & max_vel = common_data_ptr->bpp_param_ptr->max_vel;
@@ -713,6 +755,69 @@ std::vector<PhaseMetrics> calc_shift_phase_metrics(
     }
     return false;
   };
+
+  // NERO_LC_GRADUAL: the gentle candidates first
+  if (const auto & g = nero_gradual_param();
+      g.on && nero_gradual && !common_data_ptr->transient_data.is_ego_near_current_terminal_start) {
+    // NERO_LC_GRADUAL_HEAD=<deg>[,<deg>...] (izlanechange-3 19:4x; Ahmed 19:35 "when i say gradual i mean the sharpness of the turn
+    // when changing the lane"): candidates shaped by DISTANCE so the robot's largest heading angle to the lane while crossing stays
+    // under each angle, shallowest first: duration = max(the gentle jerk / acc time, 1.75 |shift| / (v tan(angle))) (1.75 = peak /
+    // mean lateral speed of the shifted path, measured: 6.0 s / 33 m at 5.6 m/s gave 8.5-8.9 deg). At 20 km/h the car turns in at
+    // 10.7-11.3 deg, the jerk/acc gentle shape at 8.5-8.9 deg; at 2-3 m/s after a turn 13-23 deg (time-shaped: 10-15 m long). A
+    // candidate longer than the room is skipped as any other (the next, sharper one, then the car's shape).
+    static const std::vector<double> heads = [] {
+      std::vector<double> h;
+      if (const char * v = std::getenv("NERO_LC_GRADUAL_HEAD"); v && *v) {
+        std::string str(v);
+        size_t pos = 0;
+        while (pos < str.size()) {
+          const size_t c = str.find(',', pos);
+          const double d = std::atof(str.substr(pos, c == std::string::npos ? std::string::npos : c - pos).c_str());
+          if (d > 0.5 && d < 45.0) h.push_back(d);
+          if (c == std::string::npos) break;
+          pos = c + 1;
+        }
+      }
+      return h;
+    }();
+    const double t_jerk = autoware::motion_utils::calc_shift_time_from_jerk(shift_length, g.jerk, g.a_max);
+    // no two gentle candidates of (nearly) the same duration: the same path, evaluated twice (cost)
+    const auto dup = [&metrics](const double t) {
+      return std::any_of(metrics.begin(), metrics.end(), [t](const auto & m) { return std::abs(m.duration - t) < 0.3; });
+    };
+    for (const double deg : heads) {
+      const double v_h = std::max(initial_velocity, 1.0);
+      const double lane_changing_duration =
+        std::max(t_jerk, 1.75 * std::abs(shift_length) / (v_h * std::tan(deg * M_PI / 180.0)));
+      if (dup(lane_changing_duration)) continue;
+      const double lane_changing_accel = calc_lane_changing_acceleration(
+        common_data_ptr, initial_velocity, max_path_velocity, lane_changing_duration, lon_accel);
+      const auto lane_changing_length = calculation::calc_phase_length(
+        initial_velocity, max_vel, lane_changing_accel, lane_changing_duration);
+      if (is_skip(lane_changing_length)) continue;
+      const auto lane_changing_velocity = std::clamp(
+        initial_velocity + lane_changing_accel * lane_changing_duration, min_lc_vel, max_vel);
+      metrics.emplace_back(
+        lane_changing_duration, lane_changing_length, lane_changing_velocity, lon_accel,
+        lane_changing_accel, g.a_min);
+    }
+    for (const double lat_acc : {g.a_min, g.a_max}) {
+      if (lat_acc == g.a_max && std::abs(g.a_max - g.a_min) < 1e-6) continue;
+      const auto lane_changing_duration =
+        autoware::motion_utils::calc_shift_time_from_jerk(shift_length, g.jerk, lat_acc);
+      if (dup(lane_changing_duration)) continue;
+      const double lane_changing_accel = calc_lane_changing_acceleration(
+        common_data_ptr, initial_velocity, max_path_velocity, lane_changing_duration, lon_accel);
+      const auto lane_changing_length = calculation::calc_phase_length(
+        initial_velocity, max_vel, lane_changing_accel, lane_changing_duration);
+      if (is_skip(lane_changing_length)) continue;
+      const auto lane_changing_velocity = std::clamp(
+        initial_velocity + lane_changing_accel * lane_changing_duration, min_lc_vel, max_vel);
+      metrics.emplace_back(
+        lane_changing_duration, lane_changing_length, lane_changing_velocity, lon_accel,
+        lane_changing_accel, lat_acc);
+    }
+  }
 
   for (double lat_acc = min_lateral_acc; lat_acc < max_lateral_acc + eps;
        lat_acc += lateral_acc_resolution) {

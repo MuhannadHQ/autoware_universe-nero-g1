@@ -601,7 +601,12 @@ std::pair<LaneChangeStates, std::string_view> LaneChangeInterface::check_transit
   // To prevent the lane module from having to check rear objects in the current lane, we limit the
   // abort maneuver to cases where the ego vehicle is still in the current lane.
   if (!can_return_to_current) {
-    return {LaneChangeStates::Warning, "TooLateToAbort"};
+    // NERO_LC_ABORT_SMOOTH: the smooth return turns back at once (no 1 s ride on the change path): possible while its overshoot
+    // keeps the footprint inside the current lanes
+    const auto * nlc = dynamic_cast<const NormalLaneChange *>(module_type_.get());
+    if (nlc == nullptr || !nlc->nero_smooth_return_possible()) {
+      return {LaneChangeStates::Warning, "TooLateToAbort"};
+    }
   }
 
   // NERO_LC_ABORT_ROOM (gate A): no abort into a current lane blocked within the abort's return length while the hold can stop

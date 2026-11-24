@@ -223,19 +223,57 @@ std::vector<DrivableLanes> generateDrivableLanes(
 
     const auto left_lane = route_handler.getLeftLanelet(current_lane, false, false);
     const auto right_lane = route_handler.getRightLanelet(current_lane, false, false);
-    if (!left_lane && !right_lane) {
+    // NERO_LC_DRIVABLE_SIDE=1 (izlanechange-3, 2026-11-23): lanes side by side whose shared line is drawn as two bound
+    // ways on the same nodes (the map's junction pieces: e9 / e16 2097045 | 2097046, ways 2095074 / 2095075, 277 pairs in
+    // e16) are not routing neighbours, so the stock loop below never pairs them and the approved change's drivable area on
+    // that piece is the old lane alone while its own path runs in the target lane. reg_1822 with the gentler change (lateral
+    // jerk 0.5, lateral acc 0.3-0.6; runs 1123-151916 / 1123-164427): the path optimizer held the robot inside the old lane
+    // for 39 m, the module stayed RUNNING 20 s, and where the area opened again the finish judge fired astride the line,
+    // the robot's rear corner was 0.2 m outside the lane-following area and the path optimizer's outside-drivable-area stop
+    // braked it to a stand at -3.0 m/s2 (research/finishbrake/FINISH_BRAKE.md). Here a current lanelet that has no routing
+    // neighbour among the lane change lanes takes the lane change lanelet whose facing bound lies on its own (both ends
+    // within 0.2 m, same direction). It only widens an approved change's area onto lanelets its path already runs on.
+    // Unset = the car.
+    static const bool nero_side = [] {
+      const char * v = std::getenv("NERO_LC_DRIVABLE_SIDE");
+      return v != nullptr && std::atoi(v) > 0;
+    }();
+    bool paired = false;
+    if (left_lane || right_lane) {
+      for (size_t lc_idx = current_lc_idx; lc_idx < lane_change_lanes.size(); ++lc_idx) {
+        const auto & lc_lane = lane_change_lanes.at(lc_idx);
+        if (left_lane && lc_lane.id() == left_lane->id()) {
+          drivable_lanes.at(i).left_lane = lc_lane;
+          current_lc_idx = lc_idx;
+          paired = true;
+          break;
+        }
+
+        if (right_lane && lc_lane.id() == right_lane->id()) {
+          drivable_lanes.at(i).right_lane = lc_lane;
+          current_lc_idx = lc_idx;
+          paired = true;
+          break;
+        }
+      }
+    }
+    if (paired || !nero_side) {
       continue;
     }
-
+    const auto same_line = [](const lanelet::ConstLineString3d & a, const lanelet::ConstLineString3d & b) {
+      if (a.size() < 2 || b.size() < 2) return false;
+      const auto d = [](const auto & p, const auto & q) { return std::hypot(p.x() - q.x(), p.y() - q.y()); };
+      return d(a.front(), b.front()) < 0.2 && d(a.back(), b.back()) < 0.2;
+    };
     for (size_t lc_idx = current_lc_idx; lc_idx < lane_change_lanes.size(); ++lc_idx) {
       const auto & lc_lane = lane_change_lanes.at(lc_idx);
-      if (left_lane && lc_lane.id() == left_lane->id()) {
+      if (lc_lane.id() == current_lane.id()) continue;
+      if (same_line(current_lane.leftBound(), lc_lane.rightBound())) {
         drivable_lanes.at(i).left_lane = lc_lane;
         current_lc_idx = lc_idx;
         break;
       }
-
-      if (right_lane && lc_lane.id() == right_lane->id()) {
+      if (same_line(current_lane.rightBound(), lc_lane.leftBound())) {
         drivable_lanes.at(i).right_lane = lc_lane;
         current_lc_idx = lc_idx;
         break;
