@@ -75,6 +75,8 @@ using visualization_msgs::msg::Marker;
 using visualization_msgs::msg::MarkerArray;
 using DebugPublisher = autoware_utils::DebugPublisher;
 
+struct NeroMapWarmUp;  // NERO_PLANNER_MAP_EAGER (behavior_path_planner_node.cpp)
+
 class BehaviorPathPlannerNode : public rclcpp::Node
 {
 public:
@@ -132,6 +134,7 @@ private:
   LaneletMapBin::ConstSharedPtr map_ptr_{nullptr};
   LaneletRoute::ConstSharedPtr route_ptr_{nullptr};
   bool has_received_map_{false};
+  std::shared_ptr<NeroMapWarmUp> nero_warm_;  // NERO_PLANNER_MAP_EAGER: the route handler built at map arrival
   bool has_received_route_{false};
 
   std::shared_ptr<PlannerManager> planner_manager_;

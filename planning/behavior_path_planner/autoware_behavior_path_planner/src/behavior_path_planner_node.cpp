@@ -23,12 +23,191 @@
 #include <autoware_internal_debug_msgs/msg/string_stamped.hpp>
 #include <tier4_planning_msgs/msg/path_change_module_id.hpp>
 
+#include <pthread.h>
+#include <sched.h>
+#include <sys/resource.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+
+#include <atomic>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <system_error>
+#include <thread>
 #include <vector>
 
 namespace autoware::behavior_path_planner
 {
+// ---- NERO_PLANNER_MAP_EAGER (firsttrip_1124, 2026-11-24) ---------------------------------------------------------------
+// The route handler (the lane map deserialised + three Lanelet2 routing graphs: 5 s on the DGX, 12-15 s on the car's Orin
+// with the dense Izdihar lanelets) is built by upstream only once a route exists, so the first route after every Autoware
+// start paid it, in three planners in a row (~40 s of "Autonomous not available" on the car). With NERO_PLANNER_MAP_EAGER=1
+// the first lane map is also handed, when it arrives, to a thread at SCHED_IDLE priority that builds the same
+// route handler from it: it only uses CPU nothing else wants, so it never delays localization, perception or the mission
+// planner. Upstream's own build point stays: it takes the warm-up's result when that is finished for the same map message,
+// else it builds now, on demand, exactly as upstream (a route that comes during the warm-up waits as it does today).
+// Unset / 0 = upstream.
+struct NeroMapWarmUp
+{
+  std::mutex m;
+  int32_t stamp_sec{0};
+  uint32_t stamp_nanosec{0};
+  size_t size{0};
+  std::shared_ptr<route_handler::RouteHandler> rh;
+  std::chrono::steady_clock::time_point t0;
+  double sec{0.0};
+  bool done{false};
+  // v3 (firsttrip, NeroStation 2026-11-24): the thread is owned here and joined, never detached. A detached warm-up still
+  // building when Autoware stopped ran on into process exit, where exit() destroys Lanelet2's static data under it: SIGSEGV
+  // in RoutingGraph::build / GenericTrafficRules::canPass (sim, Autoware stopped 2 s after the map arrived). The build cannot
+  // be interrupted, so the node's destruction waits for it to finish, as a stop during upstream's own on-demand build waits
+  // for that callback. The node is the only owner of this state; the thread uses it through a raw pointer until joined.
+  std::thread th;
+  std::atomic<bool> running{false};
+  rclcpp::Logger logger{rclcpp::get_logger("nero_planner_map_eager")};
+  ~NeroMapWarmUp()
+  {
+    if (!th.joinable()) {
+      return;
+    }
+    const auto tw = std::chrono::steady_clock::now();
+    const bool was_running = running.load();
+    if (was_running) {
+      RCLCPP_WARN(
+        logger,
+        "[NERO_PLANNER_MAP_EAGER] stopping %.1f s into the warm-up: waiting for it to finish (it cannot be interrupted)",
+        std::chrono::duration<double>(tw - t0).count());
+    }
+    // v4: while the process is shutting down (Autoware stopped), wait at most 3 s. A build still running then would hold
+    // the container past ros2 launch's 5 s SIGTERM (on the Orin a whole build takes 10-15 s); the process is ending anyway,
+    // so it ends now, without exit()'s static destructors (the ones that crashed under a running build). A node unloaded
+    // from a running container (rclcpp still ok) waits for the build instead.
+    if (was_running && !rclcpp::ok()) {
+      while (running.load() && std::chrono::steady_clock::now() - tw < std::chrono::seconds(3)) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+      }
+      if (running.load()) {
+        RCLCPP_WARN(
+          logger,
+          "[NERO_PLANNER_MAP_EAGER] warm-up still building 3 s after the stop: the process ends now (std::_Exit(0)), "
+          "without the static destructors a running build would crash on");
+        std::fflush(nullptr);
+        std::_Exit(0);
+      }
+    }
+    th.join();
+    if (was_running) {
+      RCLCPP_INFO(
+        logger, "[NERO_PLANNER_MAP_EAGER] warm-up finished, the stop waited %.1f s",
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - tw).count());
+    }
+  }
+};
+
+namespace
+{
+bool nero_planner_map_eager()
+{
+  static const bool on = []() {
+    const char * e = std::getenv("NERO_PLANNER_MAP_EAGER");
+    return e != nullptr && std::strcmp(e, "1") == 0;
+  }();
+  return on;
+}
+
+std::shared_ptr<NeroMapWarmUp> nero_map_warm_up(
+  const autoware_map_msgs::msg::LaneletMapBin::ConstSharedPtr & msg, const rclcpp::Logger & logger)
+{
+  auto st = std::make_shared<NeroMapWarmUp>();
+  st->stamp_sec = msg->header.stamp.sec;
+  st->stamp_nanosec = msg->header.stamp.nanosec;
+  st->size = msg->data.size();
+  st->t0 = std::chrono::steady_clock::now();
+  st->logger = logger;
+  st->running = true;
+  NeroMapWarmUp * const w = st.get();  // joined in ~NeroMapWarmUp before st goes, so a raw pointer is safe
+  try {
+    st->th = std::thread([w, msg, logger]() {
+    struct Running
+    {
+      std::atomic<bool> & r;
+      ~Running() { r = false; }
+    } running_guard{w->running};
+    sched_param p{};
+    p.sched_priority = 0;
+    if (pthread_setschedparam(pthread_self(), SCHED_IDLE, &p) != 0) {
+      setpriority(PRIO_PROCESS, static_cast<id_t>(syscall(SYS_gettid)), 19);
+    }
+    std::shared_ptr<route_handler::RouteHandler> rh;
+    try {
+      rh = std::make_shared<route_handler::RouteHandler>(*msg);
+    } catch (const std::exception & e) {
+      RCLCPP_ERROR(logger, "[NERO_PLANNER_MAP_EAGER] warm-up failed (%s): built on demand instead", e.what());
+    }
+    const double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - w->t0).count();
+    {
+      std::lock_guard<std::mutex> lk(w->m);
+      if (w->stamp_sec == -1) {
+        return;  // the planner built its own on demand meanwhile: this one is dropped here
+      }
+      w->rh = rh;
+      w->sec = sec;
+      w->done = true;
+    }
+    if (rh) {
+      RCLCPP_INFO(
+        logger, "[NERO_PLANNER_MAP_EAGER] route handler built at map arrival in %.1f s (idle priority, before any route)",
+        sec);
+    }
+  });
+  } catch (const std::system_error & e) {
+    st->running = false;
+    st->stamp_sec = -1;  // no warm-up: the planner builds on demand, as upstream
+    RCLCPP_ERROR(logger, "[NERO_PLANNER_MAP_EAGER] warm-up thread not started (%s): built on demand", e.what());
+  }
+  return st;
+}
+
+// The warm-up's route handler for this map message if it is finished (handed out once), else nullptr (logged).
+std::shared_ptr<route_handler::RouteHandler> nero_take_warm(
+  const std::shared_ptr<NeroMapWarmUp> & st, const autoware_map_msgs::msg::LaneletMapBin & msg,
+  const rclcpp::Logger & logger)
+{
+  if (!st) {
+    return nullptr;
+  }
+  std::lock_guard<std::mutex> lk(st->m);
+  if (
+    st->stamp_sec != msg.header.stamp.sec || st->stamp_nanosec != msg.header.stamp.nanosec ||
+    st->size != msg.data.size()) {
+    return nullptr;
+  }
+  if (!st->done || !st->rh) {
+    RCLCPP_WARN(
+      logger,
+      "[NERO_PLANNER_MAP_EAGER] the first route came %.1f s into the warm-up: route handler built now, on demand "
+      "(as upstream)",
+      std::chrono::duration<double>(std::chrono::steady_clock::now() - st->t0).count());
+    st->done = true;  // its result, if it still comes, is not used
+    st->rh.reset();
+    st->stamp_sec = -1;
+    return nullptr;
+  }
+  auto rh = st->rh;
+  st->rh.reset();
+  st->stamp_sec = -1;
+  RCLCPP_INFO(
+    logger, "[NERO_PLANNER_MAP_EAGER] first route: route handler from the map-arrival warm-up (built in %.1f s)", st->sec);
+  return rh;
+}
+}  // namespace
+// ---- end NERO_PLANNER_MAP_EAGER ---------------------------------------------------------------------------------------
+
 using autoware::vehicle_info_utils::VehicleInfoUtils;
 using tier4_planning_msgs::msg::PathChangeModuleId;
 using DebugStringMsg = autoware_internal_debug_msgs::msg::StringStamped;
@@ -304,6 +483,11 @@ void BehaviorPathPlannerNode::run()
 
   takeData();
 
+  // NERO_PLANNER_MAP_EAGER: the first lane map goes to the idle-priority warm-up as soon as it arrives (before any route)
+  if (nero_planner_map_eager() && !nero_warm_ && map_ptr_) {
+    nero_warm_ = nero_map_warm_up(map_ptr_, get_logger());
+  }
+
   if (!isDataReady()) {
     return;
   }
@@ -339,7 +523,14 @@ void BehaviorPathPlannerNode::run()
 
   // update map
   if (map_ptr) {
-    planner_data_->route_handler->setMap(*map_ptr);
+    // NERO_PLANNER_MAP_EAGER: the first map's route handler from the warm-up when it is finished (the handler has no map
+    // and no route yet, so this is the state setMap() would give it), else setMap() here as upstream
+    const auto warm = nero_take_warm(nero_warm_, *map_ptr, get_logger());
+    if (warm) {
+      *planner_data_->route_handler = *warm;
+    } else {
+      planner_data_->route_handler->setMap(*map_ptr);
+    }
   }
 
   std::unique_lock<std::mutex> lk_manager(mutex_manager_);  // for planner_manager_
