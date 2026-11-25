@@ -220,6 +220,16 @@ private:
   NeroVehDecision neroVehicleCheck(
     const InterpolatedPathInfo & interpolated_path_info,
     autoware_internal_planning_msgs::msg::PathWithLaneId * path);
+  // NERO_BS_STOP_WHY=1 (stops-2, QUEUE JXFOLLOW-1123 / BSFOLLOW): log only. The module logs through a CHILD logger,
+  // which Humble never publishes to /rosout, so no dashboard capture ever named what a blind_spot hold was for. With
+  // the switch an UNSAFE decision writes ONE line through the node's own logger at its onset, when its source or
+  // object changes, and once per second while it holds: which check holds (vehicle check / VRU check / the state
+  // machine's margin with no current target), the object (id, class, where it is from ego, speed, heading).
+  void neroStopLog(const BlindSpotDecision & decision);
+  std::string nero_stop_src_{};
+  std::string nero_stoplog_key_{};
+  double nero_stoplog_t0_{0.0};
+  double nero_stoplog_last_{-1e9};
   void neroDebugOldArea(
     const lanelet::ConstLanelets & blind_spot_lanelets,
     const geometry_msgs::msg::Pose & stop_line_pose, const lanelet::CompoundPolygon3d & area,

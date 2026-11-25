@@ -152,8 +152,12 @@ BlindSpotDecision BlindSpotModule::modifyPathVelocityDetail(PathWithLaneId * pat
     if (
       nero_veh_stop &&
       (!collision_obstacle.has_value() || nero_veh.stop_line_idx.value() < vru_stop_line_idx)) {
+      nero_stop_src_ = "vehicle check (NERO_BS_DETECT_NON_VRU)";  // NERO_BS_STOP_WHY
       return Unsafe{nero_veh.stop_line_idx.value(), nero_veh.object};
     }
+    nero_stop_src_ = collision_obstacle.has_value()
+                       ? "VRU check (stock)"
+                       : "state machine margin, no current target";  // NERO_BS_STOP_WHY
     return Unsafe{vru_stop_line_idx, collision_obstacle};
   }
 
@@ -193,6 +197,7 @@ bool BlindSpotModule::modifyPathVelocity(PathWithLaneId * path)
 
   initializeRTCStatus();
   const auto decision = modifyPathVelocityDetail(path);
+  neroStopLog(decision);  // NERO_BS_STOP_WHY (log only)
   const auto & input_path = *path;
   setRTCStatus(decision, input_path);
   reactRTCApproval(decision, path);

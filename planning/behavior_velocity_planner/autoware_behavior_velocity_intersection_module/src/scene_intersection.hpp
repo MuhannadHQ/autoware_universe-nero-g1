@@ -457,6 +457,16 @@ private:
     double gap{0.0};  //! the footprint gap there [m]
   };
   void neroCrossingHold(PathWithLaneId * path);
+
+  // NERO_IX_STOP_WHY (stops-2, QUEUE JXFOLLOW-1123): log only. A behavior_velocity module logs through a CHILD logger,
+  // which Humble never publishes to /rosout, so no dashboard capture ever named what a junction stop was for. With the
+  // switch, a stop-type decision writes ONE line through the node's own logger (it reaches /rosout and the captures) at
+  // its onset, when its kind or first target changes, and once per second while it holds: the decision, ego's speed and
+  // every UNSAFE attention object (id, class, where it is from ego, speed, heading, its passage interval).
+  void neroStopLog(const DecisionResult & decision);
+  std::string nero_stoplog_key_{};
+  double nero_stoplog_t0_{0.0};
+  double nero_stoplog_last_{-1e9};
   //! NERO_IX_CROSSING_HOLD_CREEP (latecrosser, 2026-10-31): see
   //! scene_intersection_nero_latecross.cpp; caps the path's speed from ego to the creep depth once
   //! the crossing hold held ego (s_line = base_link arc length to the stop line)

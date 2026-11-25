@@ -27,6 +27,7 @@
 #include <autoware_lanelet2_extension/utility/utilities.hpp>
 #include <autoware_utils/geometry/boost_polygon_utils.hpp>  // for toPolygon2d
 #include <autoware_utils/geometry/geometry.hpp>
+#include <autoware_utils/math/normalization.hpp>  // NERO_IX_STOP_WHY
 #include <autoware_utils/ros/uuid_helper.hpp>
 
 #include <boost/geometry/algorithms/intersects.hpp>  // NERO_IX_PRIORITY_NO_EXIT
@@ -112,6 +113,7 @@ bool IntersectionModule::modifyPathVelocity(PathWithLaneId * path)
   nero_ready_stop_known_ = false;  // NERO_IX_PRIORITY_READY: set this cycle by isOverPassJudgeLinesStatus
   const auto decision_result = modifyPathVelocityDetail(path);
   prev_decision_result_ = decision_result;
+  neroStopLog(decision_result);  // NERO_IX_STOP_WHY (log only)
 
   {
     const std::string decision_type =
@@ -1907,6 +1909,95 @@ IntersectionModule::PassJudgeStatus IntersectionModule::isOverPassJudgeLinesStat
   return {
     is_over_1st_pass_judge_line, is_over_2nd_pass_judge_line,
     safely_passed_1st_judge_line_first_time, safely_passed_2nd_judge_line_first_time};
+}
+
+
+// NERO_IX_STOP_WHY=1 (stops-2, 2026-11-25, QUEUE JXFOLLOW-1123): log only, see scene_intersection.hpp. Unset = the car.
+namespace
+{
+bool nero_stop_log_on()
+{
+  static const bool on = [] {
+    const char * e = std::getenv("NERO_IX_STOP_WHY");
+    return e != nullptr && std::atoi(e) == 1;
+  }();
+  return on;
+}
+const char * nero_stoplog_label(const autoware_perception_msgs::msg::PredictedObject & o)
+{
+  if (o.classification.empty()) return "?";
+  switch (o.classification.front().label) {
+    case autoware_perception_msgs::msg::ObjectClassification::CAR: return "CAR";
+    case autoware_perception_msgs::msg::ObjectClassification::TRUCK: return "TRUCK";
+    case autoware_perception_msgs::msg::ObjectClassification::BUS: return "BUS";
+    case autoware_perception_msgs::msg::ObjectClassification::TRAILER: return "TRAILER";
+    case autoware_perception_msgs::msg::ObjectClassification::MOTORCYCLE: return "MOTORCYCLE";
+    case autoware_perception_msgs::msg::ObjectClassification::BICYCLE: return "BICYCLE";
+    case autoware_perception_msgs::msg::ObjectClassification::PEDESTRIAN: return "PEDESTRIAN";
+    default: return "UNKNOWN";
+  }
+}
+}  // namespace
+
+void IntersectionModule::neroStopLog(const DecisionResult & decision)
+{
+  if (!nero_stop_log_on()) return;
+  const char * kind = nullptr;
+  if (std::holds_alternative<StuckStop>(decision)) kind = "StuckStop";
+  else if (std::holds_alternative<YieldStuckStop>(decision)) kind = "YieldStuckStop";
+  else if (std::holds_alternative<NonOccludedCollisionStop>(decision)) kind = "CollisionStop";
+  else if (std::holds_alternative<FirstWaitBeforeOcclusion>(decision)) kind = "FirstWaitBeforeOcclusion";
+  else if (std::holds_alternative<PeekingTowardOcclusion>(decision)) kind = "PeekingTowardOcclusion";
+  else if (std::holds_alternative<OccludedCollisionStop>(decision)) kind = "OccludedCollisionStop";
+  else if (std::holds_alternative<OccludedAbsenceTrafficLight>(decision)) kind = "OccludedAbsenceTrafficLight";
+  if (kind == nullptr) {
+    nero_stoplog_key_.clear();
+    return;
+  }
+  const double now = clock_->now().seconds();
+  const auto & ego = planner_data_->current_odometry->pose;
+  const double ey = tf2::getYaw(ego.orientation);
+  std::string targets;
+  std::string first_id = "-";
+  int n = 0;
+  for (const auto & oi : object_info_manager_.attentionObjects()) {
+    const auto unsafe = oi->unsafe_info();
+    if (!unsafe) continue;
+    const auto & o = oi->predicted_object();
+    const auto & p = o.kinematics.initial_pose_with_covariance.pose;
+    const double dx = p.position.x - ego.position.x, dy = p.position.y - ego.position.y;
+    char id[16];
+    std::snprintf(id, sizeof(id), "%02x%02x%02x%02x", o.object_id.uuid[0], o.object_id.uuid[1], o.object_id.uuid[2], o.object_id.uuid[3]);
+    if (n == 0) first_id = id;
+    if (++n > 3) continue;
+    char buf[320];
+    std::snprintf(
+      buf, sizeof(buf), "%s %s at (%.1f, %.1f) = %.1f ahead %.1f left of ego, v %.2f, heading %+.0f deg vs ego, "
+      "in ego's way %.1f-%.1f s; ",
+      id, nero_stoplog_label(o), p.position.x, p.position.y, dx * std::cos(ey) + dy * std::sin(ey),
+      -dx * std::sin(ey) + dy * std::cos(ey), std::hypot(o.kinematics.initial_twist_with_covariance.twist.linear.x,
+                                                         o.kinematics.initial_twist_with_covariance.twist.linear.y),
+      autoware_utils::normalize_radian(tf2::getYaw(p.orientation) - ey) * 180.0 / M_PI, unsafe->interval_time.first,
+      unsafe->interval_time.second);
+    targets += buf;
+  }
+  const std::string key = std::string(kind) + "/" + first_id;
+  const bool onset = nero_stoplog_key_.empty();
+  if (onset) nero_stoplog_t0_ = now;
+  if (key == nero_stoplog_key_ && now - nero_stoplog_last_ < 1.0) return;
+  const bool changed = !onset && key != nero_stoplog_key_;
+  nero_stoplog_key_ = key;
+  nero_stoplog_last_ = now;
+  // the node's own logger (the module's child logger never reaches /rosout in Humble)
+  std::string name = logger_.get_name();
+  const auto dot = name.rfind('.');
+  if (dot != std::string::npos) name = name.substr(0, dot);
+  RCLCPP_INFO(
+    rclcpp::get_logger(name),
+    "[NERO_IX_STOP] lane %ld %s %s %.1f s, ego (%.1f, %.1f) v %.2f: %d unsafe object(s)%s %s", lane_id_, kind,
+    onset ? "onset" : (changed ? "changed" : "holding"), now - nero_stoplog_t0_, ego.position.x, ego.position.y,
+    planner_data_->current_velocity->twist.linear.x, n,
+    n > 0 ? ":" : " (stuck / occlusion / the state machine's hold)", targets.c_str());
 }
 
 }  // namespace autoware::behavior_velocity_planner

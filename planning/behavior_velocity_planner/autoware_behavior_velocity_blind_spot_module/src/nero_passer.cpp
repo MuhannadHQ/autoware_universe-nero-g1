@@ -1345,4 +1345,53 @@ void BlindSpotModule::neroDebugOldArea(
     vru_collision ? "STOP" : "go");
 }
 
+
+// NERO_BS_STOP_WHY=1 (stops-2, 2026-11-25): log only, see scene.hpp. Unset = the car.
+void BlindSpotModule::neroStopLog(const BlindSpotDecision & decision)
+{
+  static const bool on = [] {
+    const char * e = std::getenv("NERO_BS_STOP_WHY");
+    return e != nullptr && std::atoi(e) == 1;
+  }();
+  if (!on) return;
+  if (!std::holds_alternative<Unsafe>(decision)) {
+    nero_stoplog_key_.clear();
+    return;
+  }
+  const auto & u = std::get<Unsafe>(decision);
+  const double now = clock_->now().seconds();
+  const auto & ego = planner_data_->current_odometry->pose;
+  const double ey = tf2::getYaw(ego.orientation);
+  std::string obj = "no object";
+  std::string oid = "-";
+  if (u.collision_obstacle) {
+    const auto & o = u.collision_obstacle.value();
+    const auto & p = o.kinematics.initial_pose_with_covariance.pose;
+    const double dx = p.position.x - ego.position.x, dy = p.position.y - ego.position.y;
+    oid = short_id(o);
+    char buf[256];
+    std::snprintf(
+      buf, sizeof(buf), "obj %s %s at (%.1f, %.1f) = %.1f ahead %.1f left of ego, v %.2f, heading %+.0f deg vs ego",
+      oid.c_str(), label_name(highest_label(o)), p.position.x, p.position.y, dx * std::cos(ey) + dy * std::sin(ey),
+      -dx * std::sin(ey) + dy * std::cos(ey), o.kinematics.initial_twist_with_covariance.twist.linear.x,
+      norm_angle(tf2::getYaw(p.orientation) - ey) * 180.0 / M_PI);
+    obj = buf;
+  }
+  const std::string key = nero_stop_src_ + "/" + oid;
+  const bool onset = nero_stoplog_key_.empty();
+  if (onset) nero_stoplog_t0_ = now;
+  if (key == nero_stoplog_key_ && now - nero_stoplog_last_ < 1.0) return;
+  const bool changed = !onset && key != nero_stoplog_key_;
+  nero_stoplog_key_ = key;
+  nero_stoplog_last_ = now;
+  // the node's own logger (the module's child logger never reaches /rosout in Humble)
+  std::string name = logger_.get_name();
+  const auto dot = name.rfind('.');
+  if (dot != std::string::npos) name = name.substr(0, dot);
+  RCLCPP_INFO(
+    rclcpp::get_logger(name), "[NERO_BS_STOP] lane %ld UNSAFE %s %.1f s by %s, ego (%.1f, %.1f) v %.2f: %s", lane_id_,
+    onset ? "onset" : (changed ? "changed" : "holding"), now - nero_stoplog_t0_, nero_stop_src_.c_str(),
+    ego.position.x, ego.position.y, planner_data_->current_velocity->twist.linear.x, obj.c_str());
+}
+
 }  // namespace autoware::behavior_velocity_planner
