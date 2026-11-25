@@ -57,6 +57,16 @@ double calc_stopping_distance(const LCParamPtr & lc_param_ptr);
 double nero_change_window(const CommonDataPtr & common_data_ptr, const lanelet::ConstLanelets & lanes);
 
 /**
+ * @brief NERO_LC_GIVEUP_NOFIT (stops job 2026-11-25): true when two or more lane changes are due before the end of the
+ * current lanes and even their shortest form (NERO_LC_SHORT_WINDOW's: the minimum lengths with only the minimum stopping
+ * distance between them) does not fit in the window where the first target lane runs beside the current lanes. Such a
+ * change can never be planned there. window / need are set whenever two or more changes are due.
+ */
+bool nero_changes_cannot_fit(
+  const CommonDataPtr & common_data_ptr, const lanelet::ConstLanelets & lanes, double & window, double & need,
+  size_t & n_changes);
+
+/**
  * @brief Calculates the distance to last fit width position along the lane
  *
  * This function computes the distance from the current ego position to the last

@@ -1695,6 +1695,21 @@ bool NormalLaneChange::nero_lc_giveup()
       // centre (the waiting path ramps it out over ret_len), so the cancel at the give-up point is no sideways jump (lcg5 c07:
       // the 1 m lean dropped in one cycle -> path jump 1.44 m, -1.5 m/s2 lateral)
       const double d_ret = std::max(15.0, 3.0 * v_ref);
+      // NERO_LC_GIVEUP_NOFIT=1 (stops job 2026-11-25, QUEUE NFUTURN-1123 / NOFACTOR-1122): two or more changes due before the
+      // end of ego's lanes whose shortest form does not fit where the first target lane runs beside them can never be planned
+      // there ("no valid path"): the module's waiting stop then holds the robot for good, with no planning factor (22/23 Nov
+      // U-turn 2118496 -> 2097023 with the preferred lane 2097025 two to the right within 18.8 m: 3 of 3 passes stood at the
+      // apex, 2 takeovers). Such a change is given up as soon as it is due, at any speed (no gap can help: the speed gate is
+      // for a slow robot's chance to find one) and wherever ego is before its waiting stop. Unset = the car.
+      static const bool nofit_on = [] {
+        const char * e = std::getenv("NERO_LC_GIVEUP_NOFIT");
+        return e != nullptr && std::atoi(e) > 0;
+      }();
+      double nf_window = 0.0;
+      double nf_need = 0.0;
+      size_t nf_n = 0;
+      const bool nofit =
+        nofit_on && calculation::nero_changes_cannot_fit(common_data_ptr_, current_lanes, nf_window, nf_need, nf_n);
       if (!same && to_ts <= d_go + d_ret && !status_.is_safe && v_ref >= 3.0) {
         if (!(gs.ret_lane == cur.id() && gs.ret_sec == stamp.sec && gs.ret_nanosec == stamp.nanosec)) {
           gs.ret_lane = cur.id();
@@ -1710,10 +1725,13 @@ bool NormalLaneChange::nero_lc_giveup()
       // after a turn toward the goal road keeps the wait - lcgv c13: given up there over and over, then 30 s standing), and at most
       // one give-up per 20 s (no give-up / re-route ping-pong)
       static std::chrono::steady_clock::time_point last_giveup{};
-      const bool fast_enough = v_ref >= 3.0;
+      const bool fast_enough = v_ref >= 3.0 || nofit;
       const bool rested = now_s - last_giveup > std::chrono::seconds(20);
-      if (!same && to_ts <= d_go && !status_.is_safe && fast_enough && rested) {
-        last_giveup = now_s;
+      if (!same && (to_ts <= d_go || nofit) && !status_.is_safe && fast_enough && rested) {
+        // NERO_LC_GIVEUP_NOFIT also arms the 20 s rest only when a change is really given up: a lane with no lane after it
+        // (nothing given up, the change waits as before) must not hold the next give-up (stops e16 U-turn: the left change
+        // into 2097020 at 14 s held the cannot-fit give-up until 34 s, after its waiting stop had slowed the robot to 0.4 m/s)
+        if (!nofit_on) last_giveup = now_s;
         const auto nexts = rh->getNextLanelets(cur);
         if (nexts.empty()) {
           static double last_log = 0.0;
@@ -1727,6 +1745,7 @@ bool NormalLaneChange::nero_lc_giveup()
               cur.id(), to_end, target_lanes.front().id());
           }
         } else {
+          if (nofit_on) last_giveup = now_s;
           // the lane straight on: turn_direction "straight" first, else the smallest heading change
           const auto ccl = cur.centerline2d();
           double cyaw = 0.0;
@@ -1757,7 +1776,15 @@ bool NormalLaneChange::nero_lc_giveup()
           m.header.stamp = stamp;
           m.header.frame_id = "map";
           const auto & ego = common_data_ptr_->get_ego_pose();
-          m.poses.push_back(lanelet::utils::getClosestCenterPose(cur, ego.position));
+          // NERO_LC_GIVEUP_NOFIT gives up before ego reaches the last current lane (e16 U-turn: ego on 2097020, cur = 2097023
+          // across the turn): the route then starts on the current lane ego is on (projected on cur, the start fell on the exit
+          // section 2097023/24/25 -> "Current lanelets is empty" -> validator "trajectory too far" -> EMERGENCY_STOP)
+          lanelet::ConstLanelet start_ll = cur;
+          if (nofit_on) {
+            lanelet::ConstLanelet c;
+            if (lanelet::utils::query::getClosestLanelet(current_lanes, ego, &c)) start_ll = c;
+          }
+          m.poses.push_back(lanelet::utils::getClosestCenterPose(start_ll, ego.position));
           const auto straightest = [&](const lanelet::ConstLanelet & from, const lanelet::ConstLanelets & cands) {
             const auto fcl = from.centerline2d();
             double fyaw = 0.0;
@@ -1862,7 +1889,13 @@ bool NormalLaneChange::nero_lc_giveup()
               why, sizeof(why), "the target lane behind is not seen far enough (view %.1f m < need %.1f m)",
               sit->second.view, sit->second.need);
           } else {
-            std::snprintf(why, sizeof(why), "no safe gap");
+            if (nofit) {
+              std::snprintf(
+                why, sizeof(why), "%zu changes due cannot fit before the lane end (window %.1f m < %.1f m, NERO_LC_GIVEUP_NOFIT)",
+                nf_n, nf_window, nf_need);
+            } else {
+              std::snprintf(why, sizeof(why), "no safe gap");
+            }
           }
           RCLCPP_INFO(
             logger_,

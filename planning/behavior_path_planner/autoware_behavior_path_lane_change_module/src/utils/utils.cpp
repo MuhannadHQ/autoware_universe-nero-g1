@@ -986,13 +986,23 @@ bool is_same_lane_with_prev_iteration(
     return false;
   }
 
+  // NERO_LC_PREV_LANES_FIX=1 (stops job 2026-11-25): upstream compares each previous BACK lane with itself (always equal),
+  // so only the front lanes are checked: after a re-route that keeps the same first current / target lanes (NERO_LC_GIVEUP
+  // from before a U-turn) the module kept the old route's target lanes (2097024 alone instead of 2097024 -> 27 -> 30: two
+  // changes judged due, a 15 s stand). With the switch the back lanes are compared as intended. Unset = upstream (the car).
+  static const bool back_fix = [] {
+    const char * e = std::getenv("NERO_LC_PREV_LANES_FIX");
+    return e != nullptr && std::atoi(e) > 0;
+  }();
+  const auto & cur_back_cmp = back_fix ? current_lanes.back() : prev_current_lanes.back();
+  const auto & tgt_back_cmp = back_fix ? target_lanes.back() : prev_target_lanes.back();
   if (
     (prev_current_lanes.front().id() != current_lanes.front().id()) ||
-    (prev_current_lanes.back().id() != prev_current_lanes.back().id())) {
+    (prev_current_lanes.back().id() != cur_back_cmp.id())) {
     return false;
   }
   return (prev_target_lanes.front().id() == target_lanes.front().id()) &&
-         (prev_target_lanes.back().id() == prev_target_lanes.back().id());
+         (prev_target_lanes.back().id() == tgt_back_cmp.id());
 }
 
 bool is_ahead_of_ego(

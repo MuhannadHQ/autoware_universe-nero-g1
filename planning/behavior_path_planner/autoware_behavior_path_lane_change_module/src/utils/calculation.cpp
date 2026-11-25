@@ -440,6 +440,36 @@ std::pair<MinMaxValue, MinMaxValue> calc_lc_length_and_dist_buffer(
   return {{min_lc_length, max_lc_length}, {min_dist_buffer, max_dist_buffer}};
 }
 
+// NERO_LC_GIVEUP_NOFIT (stops job 2026-11-25, QUEUE NFUTURN-1123): see the header. The same intervals (NERO_LC_ROUTE_GATE
+// included: a target lane that runs on keeps one change due) and the same shortest buffer as NERO_LC_SHORT_WINDOW.
+bool nero_changes_cannot_fit(
+  const CommonDataPtr & common_data_ptr, const lanelet::ConstLanelets & lanes, double & window, double & need,
+  size_t & n_changes)
+{
+  n_changes = 0;
+  if (
+    !common_data_ptr || !common_data_ptr->is_data_available() || lanes.empty() ||
+    common_data_ptr->lc_type != LaneChangeModuleType::NORMAL || !common_data_ptr->is_lanes_available() ||
+    common_data_ptr->lanes_ptr->target.empty()) {
+    return false;
+  }
+  const auto shift_intervals = calculation::calc_shift_intervals(common_data_ptr, lanes);
+  const auto min_lc_lengths =
+    calculation::calc_min_lane_change_lengths(common_data_ptr->lc_param_ptr, shift_intervals);
+  n_changes = min_lc_lengths.size();
+  if (n_changes < 2) {
+    return false;
+  }
+  const auto & lc_param = *common_data_ptr->lc_param_ptr;
+  const double buffer = calculation::calc_distance_buffer(common_data_ptr->lc_param_ptr, min_lc_lengths);
+  const double stop_offset = calc_stopping_distance(common_data_ptr->lc_param_ptr);
+  const double v_min = lc_param.trajectory.min_lane_changing_velocity;
+  const double min_stop = std::abs(v_min * v_min / (2.0 * lc_param.trajectory.min_longitudinal_acc));
+  need = buffer - (static_cast<double>(n_changes) - 1.0) * std::max(0.0, stop_offset - min_stop);
+  window = nero_change_window(common_data_ptr, lanes);
+  return window < need;
+}
+
 double calc_phase_length(
   const double velocity, const double maximum_velocity, const double acceleration,
   const double duration)
