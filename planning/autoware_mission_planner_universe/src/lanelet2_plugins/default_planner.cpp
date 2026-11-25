@@ -14,6 +14,8 @@
 
 #include "default_planner.hpp"
 
+#include <functional>  // NERO_KEEP_RIGHT_CHAIN
+
 #include "utility_functions.hpp"
 
 #include <autoware/motion_utils/trajectory/trajectory.hpp>
@@ -248,26 +250,77 @@ void DefaultPlanner::nero_keep_right_lanes(RouteSections & sections, double d0, 
 
   // A. a junction piece (or single lane) of the route: add the parallel pieces that leave the previous section's lanes
   // with the same turn and lead into the next section (the right lane's straight piece beside the left lane's one)
+  // NERO_KEEP_RIGHT_CHAIN=<max sections> (lcearly 2026-11-24, Ahmed: "why dont you fix it"): a junction can be several
+  // single-lane sections deep. 24 Nov: the route went 2096568 -> 2096571 -> 2118560 -> [2096574-76] (left lane) while the
+  // right lane 2096570 -> 2096573 -> 2118558 joins the same section: one piece deep 2096573 does not feed [2118560], so it
+  // was never added and the whole 614 m road kept the left lane preferred (two left changes for nothing; the 14:38 early
+  // left). With the switch the parallel chain is followed section by section (each piece: same turn as the route's piece
+  // there, passable, not in the route, the route's section a single lane piece with no neighbours) until it feeds a later
+  // section, at most <max sections> deep; then every piece of the chain is added to its section. Unset = one piece deep.
+  static const int chain_max = [] {
+    const char * e = std::getenv("NERO_KEEP_RIGHT_CHAIN");
+    return e ? std::max(0, std::atoi(e)) : 0;
+  }();
+  // single-lane junction sections of the route as planned (pieces added below do not change it: a second lane's chain
+  // through the same sections must still be found)
+  std::vector<bool> single_orig(n, false);
+  for (size_t k = 0; k < n; ++k) {
+    single_orig.at(k) =
+      prims.at(k).size() == 1 && !right_id(prims.at(k).front()) && !left_id(prims.at(k).front());
+  }
+  const auto single_piece = [&](const size_t k) { return k < n && single_orig.at(k); };
   std::vector<std::pair<lanelet::Id, lanelet::Id>> added;
   for (size_t j = 1; j + 1 < n; ++j) {
     const auto piece = sections.at(j).preferred_primitive.id;
-    if (prims.at(j).size() != 1 || right_id(piece) || left_id(piece)) {
+    if (chain_max > 1 ? !single_piece(j) : (prims.at(j).size() != 1 || right_id(piece) || left_id(piece))) {
       continue;
     }
     for (const auto q : std::vector<lanelet::Id>(prims.at(j - 1))) {
       for (const auto c : following_ids(q)) {
         if (
           c == piece || has(in_route, c) || nero_turn(get(c)) != nero_turn(get(piece)) ||
-          !tr->canPass(get(c)) || !feeds(c, j + 1)) {
+          !tr->canPass(get(c))) {
           continue;
         }
-        autoware_planning_msgs::msg::LaneletPrimitive p;
-        p.id = c;
-        p.primitive_type = "lane";
-        sections.at(j).primitives.push_back(p);
-        prims.at(j).push_back(c);
-        in_route.push_back(c);
-        added.emplace_back(piece, c);
+        // the chain c -> ... that ends in a piece feeding a later section (one piece deep: c feeds j + 1)
+        std::vector<lanelet::Id> chain{c};
+        bool found = feeds(c, j + 1);
+        if (!found && chain_max > 1) {
+          // depth-first over the successors; each level k must be a single-lane section of the route
+          std::function<bool(std::vector<lanelet::Id> &)> extend = [&](std::vector<lanelet::Id> & ch) -> bool {
+            const size_t k = j + ch.size();  // the section the next piece would sit in
+            if (static_cast<int>(ch.size()) >= chain_max || !single_piece(k) || k + 1 >= n) {
+              return false;
+            }
+            const auto route_piece = prims.at(k).front();
+            for (const auto nx : following_ids(ch.back())) {
+              if (
+                nx == route_piece || has(in_route, nx) || has(ch, nx) ||
+                nero_turn(get(nx)) != nero_turn(get(route_piece)) || !tr->canPass(get(nx))) {
+                continue;
+              }
+              ch.push_back(nx);
+              if (feeds(nx, k + 1) || extend(ch)) {
+                return true;
+              }
+              ch.pop_back();
+            }
+            return false;
+          };
+          found = extend(chain);
+        }
+        if (!found) {
+          continue;
+        }
+        for (size_t d = 0; d < chain.size(); ++d) {
+          autoware_planning_msgs::msg::LaneletPrimitive p;
+          p.id = chain.at(d);
+          p.primitive_type = "lane";
+          sections.at(j + d).primitives.push_back(p);
+          prims.at(j + d).push_back(chain.at(d));
+          in_route.push_back(chain.at(d));
+          added.emplace_back(prims.at(j + d).front(), chain.at(d));
+        }
       }
     }
   }
