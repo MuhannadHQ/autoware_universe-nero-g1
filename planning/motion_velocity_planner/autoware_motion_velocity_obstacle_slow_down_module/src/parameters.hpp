@@ -21,6 +21,7 @@
 
 #include <autoware_utils/ros/parameter.hpp>
 
+#include <cstdlib>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -190,7 +191,16 @@ struct SlowDownPlanningParam
   std::string get_param_type(const ObjectClassification label) const
   {
     const auto type_str = object_types_maps.at(label.label);
-    if (object_type_specific_param_map.count(type_str) == 0) {
+    // NERO_OSD_TYPE_PARAMS=1 (sidegap 2026-11-24, upstream universe #10672 / 16b76462c): the map's keys are
+    // "<type>.moving" / "<type>.static", so the stock lookup of "<type>" never matches and EVERY object gets the
+    // "default" table (the car's car / truck entries of 2026-11-15 never applied). With the switch the type's own table
+    // is used when the yaml lists that type. Unset = stock (default table for every type).
+    static const bool nero_type_params = [] {
+      const char * e = std::getenv("NERO_OSD_TYPE_PARAMS");
+      return e && std::string(e) == "1";
+    }();
+    const auto key = nero_type_params ? type_str + ".moving" : type_str;
+    if (object_type_specific_param_map.count(key) == 0) {
       return "default";
     }
     return type_str;

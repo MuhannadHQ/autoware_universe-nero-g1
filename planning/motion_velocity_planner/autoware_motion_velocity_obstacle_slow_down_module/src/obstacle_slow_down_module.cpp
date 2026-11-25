@@ -558,7 +558,16 @@ ObstacleSlowDownModule::create_slow_down_obstacle_for_predicted_object(
     // check if entering slow down
     if (is_slow_down_condition_met) {
       const int count = slow_down_condition_counter_.increase_counter(obj_uuid_str);
-      if (p.successive_num_to_entry_slow_down_condition <= count) {
+      // NERO_OSD_PERSON 4th field <entry_n> (sidegap): a pedestrian / bicycle enters after entry_n cycles instead of
+      // successive_num_to_entry_slow_down_condition (5 = 0.5 s: a walker first tracked 1.3 m before the bumper is beside
+      // the robot before the stock entry, 22 Nov 14:38:23)
+      const int nero_person_entry = nero_person_param().on ? nero_person_param().entry_n : 0;
+      const int entry_n =
+        (nero_person_entry > 0 && (obj_label == ObjectClassification::PEDESTRIAN ||
+                                   obj_label == ObjectClassification::BICYCLE))
+          ? std::min(nero_person_entry, p.successive_num_to_entry_slow_down_condition)
+          : p.successive_num_to_entry_slow_down_condition;
+      if (entry_n <= count) {
         slow_down_condition_counter_.reset(obj_uuid_str);
         return true;
       }
@@ -927,6 +936,22 @@ std::vector<SlowdownInterval> ObstacleSlowDownModule::plan_slow_down(
     // calculate slow down velocity
     const double stable_slow_down_vel = [&]() {
       if (prev_output) {
+        // NERO_OSD_PERSON: a person's target comes DOWN without the 0.9 low-pass (10 %/cycle: ~2 s to halve a gap
+        // in speed); it still rises through the filter
+        const bool nero_person_on = nero_person_param().on;
+        const auto l = obstacle.classification.label;
+        if (
+          nero_person_on && feasible_slow_down_vel < prev_output->target_vel &&
+          (l == ObjectClassification::PEDESTRIAN || l == ObjectClassification::BICYCLE)) {
+          return feasible_slow_down_vel;
+        }
+        // NERO_OSD_CLOSE_LEAD: the close-branch target (already within lead of the robot's speed) is not low-passed down
+        static const bool nero_close_on = std::getenv("NERO_OSD_CLOSE_LEAD") != nullptr;
+        if (
+          nero_close_on && feasible_slow_down_vel < prev_output->target_vel &&
+          dist_to_slow_down_start <= dist_to_ego) {
+          return feasible_slow_down_vel;
+        }
         return autoware::signal_processing::lowpassFilter(
           feasible_slow_down_vel, prev_output->target_vel,
           slow_down_planning_param_.lpf_gain_slow_down_vel);
@@ -1108,16 +1133,21 @@ ObstacleSlowDownModule::calculate_distance_to_slow_down_with_constraints(
   // a standing vehicle facing the robot (heading within 180 - yaw_deg of head-on) inside this module's lateral band (filtering
   // max_lat_margin, 1.1 m) is passed at no more than v_mps; the stock per-type speed applies when it is lower. Unset = stock.
   {
+    // sidegap 2026-11-24 (OSDFACING-1123): optional 3rd field <min_left_m> = the cap applies only to a vehicle whose
+    // centre lies at least that far LEFT of the trajectory (signed lateral offset, left +): the oncoming side, where B7's
+    // car had stopped. A car parked on the robot's own (right) kerb that faces it gets the per-type table like any parked
+    // car (23 Nov 14:49 / 21:27 / 21:28, 24 Nov 21:00: 1.2-1.4 m/s for 5-10 s at 0.6-1.9 m). Two fields = any side (as before).
     struct NeroOnc
     {
       bool on{false};
       double v{1.4};
       double yaw_deg{135.0};
+      double min_left_m{-1e9};
     };
     static const NeroOnc nero_onc = [] {
       NeroOnc c;
       if (const char * e = std::getenv("NERO_OSD_ONCOMING_STILL")) {
-        c.on = std::sscanf(e, "%lf,%lf", &c.v, &c.yaw_deg) >= 1;
+        c.on = std::sscanf(e, "%lf,%lf,%lf", &c.v, &c.yaw_deg, &c.min_left_m) >= 1;
       }
       return c;
     }();
@@ -1128,7 +1158,28 @@ ObstacleSlowDownModule::calculate_distance_to_slow_down_with_constraints(
       const double ego_yaw = tf2::getYaw(planner_data->current_odometry.pose.pose.orientation);
       const double d_yaw =
         std::abs(autoware_utils::normalize_radian(tf2::getYaw(obstacle.pose.orientation) - ego_yaw));
-      if (vehicle && d_yaw > nero_onc.yaw_deg * M_PI / 180.0 && slow_down_vel > nero_onc.v) {
+      // side = the larger (more to the left) of: the offset from the trajectory, and the offset from the robot's own
+      // heading line (a car that stopped for the robot's left turn / U-turn is right of the turning arc but left of the
+      // heading line: it keeps the cap); the cap is dropped only for a car right of both (a car parked on its own kerb)
+      const auto & ep = planner_data->current_odometry.pose.pose.position;
+      const double heading_offset =
+        std::cos(ego_yaw) * (obstacle.pose.position.y - ep.y) - std::sin(ego_yaw) * (obstacle.pose.position.x - ep.x);
+      const double traj_offset =
+        traj_points.size() < 2 ? 0.0
+                               : autoware::motion_utils::calcLateralOffset(traj_points, obstacle.pose.position);
+      const double side_offset = std::isfinite(traj_offset) ? std::max(traj_offset, heading_offset) : heading_offset;
+      if (
+        vehicle && d_yaw > nero_onc.yaw_deg * M_PI / 180.0 && slow_down_vel > nero_onc.v &&
+        side_offset < nero_onc.min_left_m) {
+        static rclcpp::Clock nero_clock_s(RCL_ROS_TIME);
+        RCLCPP_INFO_THROTTLE(
+          rclcpp::get_logger("obstacle_slow_down"), nero_clock_s, 1000,
+          "[NERO_OSD_ONCOMING_STILL] %s facing the robot (%.0f deg) but %.2f m right of left %.2f: per-type %.2f m/s kept",
+          obstacle.uuid.substr(0, 4).c_str(), d_yaw * 180.0 / M_PI, side_offset, nero_onc.min_left_m, slow_down_vel);
+      }
+      if (
+        vehicle && d_yaw > nero_onc.yaw_deg * M_PI / 180.0 && slow_down_vel > nero_onc.v &&
+        side_offset >= nero_onc.min_left_m) {
         static rclcpp::Clock nero_clock(RCL_ROS_TIME);
         RCLCPP_INFO_THROTTLE(
           rclcpp::get_logger("obstacle_slow_down"), nero_clock, 1000,
@@ -1178,7 +1229,18 @@ ObstacleSlowDownModule::calculate_distance_to_slow_down_with_constraints(
 
   // calculate distance to start/end slow down
   const double dist_to_slow_down_start = dist_to_ego + deceleration_dist;
-  const double dist_to_slow_down_end = dist_to_ego + deceleration_dist + slow_down_dist;
+  // NERO_OSD_PERSON: for a person the stock interval ends where the BUMPER passes his far edge (end = back collision -
+  // front offset), so the limit is gone while he is still beside the body (23 Nov 14:19:36.6: the 0.92 m/s entry vanished
+  // with the walker at the bumper, the robot then accelerated beside him); here it ends when the REAR has passed him
+  const auto plbl = obstacle.classification.label;
+  const bool nero_person_obj = nero_person_param().on && (plbl == ObjectClassification::PEDESTRIAN ||
+                                                          plbl == ObjectClassification::BICYCLE);
+  const double nero_body_ext =
+    nero_person_obj ? abs_ego_offset + (planner_data->is_driving_forward
+                                          ? std::abs(vehicle_info.min_longitudinal_offset_m)
+                                          : std::abs(vehicle_info.max_longitudinal_offset_m))
+                    : 0.0;
+  const double dist_to_slow_down_end = dist_to_ego + deceleration_dist + slow_down_dist + nero_body_ext;
   if (100.0 < dist_to_slow_down_start) {
     // NOTE: distance to slow down is too far.
     return std::nullopt;
@@ -1202,9 +1264,70 @@ ObstacleSlowDownModule::calculate_distance_to_slow_down_with_constraints(
   const double filtered_dist_to_slow_down_end =
     apply_lowpass_filter(dist_to_slow_down_end, prev_output->end_point);
 
+  // NERO_OSD_PERSON=<lead_mps>,<wait_gap_m>,<wait_vlon_mps>[,<entry_n>[,<wait_range_m>]] (nero_osd.hpp; sidegap 2026-11-24,
+  // PEDPASS-1122), for a PEDESTRIAN / BICYCLE:
+  //   beside / first seen near (deceleration_dist < 0): the stock keeps the last target, or max(ego speed, table) on first
+  //     sight = no limit at all for a person first seen < 3 m ahead (22 Nov 14:38:23: 1.91 m/s at 0.27 m). Here: never
+  //     above the robot's own speed (or the last target), at most lead_mps below it (the smoother brakes at its own
+  //     comfort limit, no step the robot cannot follow), down to the table speed; a table above the robot's speed is
+  //     allowed (pull-off beside a standing person at the table's walking pace, never stuck).
+  //   wait (wait_gap_m > 0): a PEDESTRIAN (or a BICYCLE slower than 2.5 m/s) the stock calls moving, walking TOWARD the robot (speed along the trajectory
+  //     <= -wait_vlon_mps), whose box is within wait_gap_m of the band and whose near edge is within wait_range_m of the
+  //     bumper (or beside) gets target 0 the same way: the robot waits for him instead of driving into the corridor beside
+  //     him (23 Nov 14:19:35.7: pulled off with him 2.9 m ahead, passed at 0.32 m). Unset = stock.
+  const auto & npp = nero_person_param();
+  const auto lbl = obstacle.classification.label;
+  const bool is_person =
+    lbl == ObjectClassification::PEDESTRIAN || lbl == ObjectClassification::BICYCLE;
+  const double v_ego = planner_data->current_odometry.twist.twist.linear.x;
+  const double d_front_bumper = dist_to_front_collision - dist_to_ego - abs_ego_offset;
+  // (a BICYCLE too when it rides slower than 2.5 m/s: a pushed / slow bike in the corridor; a fast oncoming rider passes)
+  const bool nero_wait_cls =
+    lbl == ObjectClassification::PEDESTRIAN ||
+    (lbl == ObjectClassification::BICYCLE && std::hypot(obstacle.velocity, obstacle.lat_velocity) <= 2.5);
+  const bool nero_wait = npp.on && nero_wait_cls && npp.wait_gap > 0.0 &&
+                         is_obstacle_moving && obstacle.velocity <= -npp.wait_vlon &&
+                         std::abs(obstacle.dist_to_traj_poly) < npp.wait_gap &&
+                         d_front_bumper <= npp.wait_range;
+  if (nero_wait) {
+    slow_down_vel = 0.0;
+  }
+
   // calculate velocity considering constraints
   const double feasible_slow_down_vel = [&]() {
     if (deceleration_dist < 0) {
+      if (npp.on && is_person) {
+        // beside / too close to plan a slow-down: never above the robot's speed, at most lead below it, down to the table
+        const double cap = prev_output ? std::min(prev_output->target_vel, v_ego) : v_ego;
+        if (slow_down_vel >= cap) {
+          return slow_down_vel;
+        }
+        return std::min(cap, std::max(slow_down_vel, v_ego - npp.lead));
+      }
+      // NERO_OSD_CLOSE_LEAD=<lead_mps> (sidegap 2026-11-24, LATEAVOID-1123), every other type: the stock keeps the FIRST
+      // target for as long as the slow-down start lies behind the robot (prepare distance = table speed x 1.5 s: 6.3 m at
+      // 4.17 m/s), so a box that comes closer later is ignored (23 Nov 21:41: truck 38ac entered at 0.80 m -> 4.17 m/s,
+      // its nose came to 0.21 m 1 m before the robot, table 1.50, kept 4.17). Here, when the table falls below the kept
+      // target and the robot's speed, the target follows it down, at most lead_mps below the robot's speed (the smoother
+      // brakes at its own comfort limit); a table above the kept target lets it rise again (low-passed). Unset = stock.
+      static const double nero_close_lead = [] {
+        const char * e = std::getenv("NERO_OSD_CLOSE_LEAD");
+        double l = 0.0;
+        return (e && std::sscanf(e, "%lf", &l) == 1 && l > 0.0) ? l : 0.0;
+      }();
+      if (nero_close_lead > 0.0 && !is_person) {
+        const double kept = prev_output ? prev_output->target_vel : std::max(v_ego, slow_down_vel);
+        const double cap = std::min(kept, v_ego);
+        if (slow_down_vel < cap) {
+          return std::min(kept, std::max(slow_down_vel, v_ego - nero_close_lead));
+        }
+        // ... and back up once the box is farther again (the stock keeps the lowest target for the whole object: one
+        // close cycle at a long truck's rear corner, 0.41 m -> 1.0 m/s, held along all 8.7 m of it, 22 Nov #15 scene);
+        // the rise goes through the stock 0.9 low-pass in the caller
+        if (slow_down_vel > kept) {
+          return slow_down_vel;
+        }
+      }
       if (prev_output) {
         return prev_output->target_vel;
       }
@@ -1242,6 +1365,21 @@ ObstacleSlowDownModule::calculate_distance_to_slow_down_with_constraints(
     return std::max(slow_down_vel, one_shot_feasible_slow_down_vel);
   }();
 
+  if (nero_osd_param().debug) {
+    // sidegap: one line per slow-down obstacle per cycle (NERO_OSD_DEBUG=1, logging only)
+    const double side =
+      traj_points.size() < 2 ? 0.0
+                             : autoware::motion_utils::calcLateralOffset(traj_points, obstacle.pose.position);
+    RCLCPP_INFO(
+      rclcpp::get_logger("obstacle_slow_down"),
+      "[NERO_OSD_SD] %s cls %d %s vlon %.2f vlat %.2f lat %.2f side %.2f d_front %.2f d_back %.2f dec %.2f table %.2f "
+      "feasible %.2f prev %.2f v_ego %.2f%s",
+      obstacle.uuid.substr(0, 4).c_str(), static_cast<int>(obstacle.classification.label),
+      is_obstacle_moving ? "moving" : "static", obstacle.velocity, obstacle.lat_velocity,
+      obstacle.dist_to_traj_poly, side, dist_to_front_collision - dist_to_ego - abs_ego_offset,
+      dist_to_back_collision - dist_to_ego, deceleration_dist, slow_down_vel, feasible_slow_down_vel,
+      prev_output ? prev_output->target_vel : -1.0, v_ego, nero_wait ? " WAIT" : "");
+  }
   return std::make_tuple(
     filtered_dist_to_slow_down_start, filtered_dist_to_slow_down_end, feasible_slow_down_vel);
 }

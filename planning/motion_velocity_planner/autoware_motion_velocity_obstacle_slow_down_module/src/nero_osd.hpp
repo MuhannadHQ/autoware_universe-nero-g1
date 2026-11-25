@@ -122,6 +122,31 @@ inline const NeroOsdParam & nero_osd_param()
   }();
   return p;
 }
+// NERO_OSD_PERSON=<lead_mps>,<wait_gap_m>,<wait_vlon_mps>[,<entry_n>[,<wait_range_m>]] (sidegap 2026-11-24, PEDPASS-1122):
+//   PEDESTRIAN / BICYCLE in obstacle_slow_down. Parsed once; on = at least the first field and lead_mps > 0.
+struct NeroPersonParam
+{
+  bool on{false};
+  double lead{0.3};
+  double wait_gap{0.0};
+  double wait_vlon{0.3};
+  int entry_n{0};
+  double wait_range{8.0};
+};
+inline const NeroPersonParam & nero_person_param()
+{
+  static const NeroPersonParam p = [] {
+    NeroPersonParam r;
+    double n = 0.0;
+    if (const char * e = std::getenv("NERO_OSD_PERSON")) {
+      const int k = std::sscanf(e, "%lf,%lf,%lf,%lf,%lf", &r.lead, &r.wait_gap, &r.wait_vlon, &n, &r.wait_range);
+      r.on = k >= 1 && r.lead > 0.0;
+      r.entry_n = (k >= 4 && n >= 1.0) ? static_cast<int>(n) : 0;
+    }
+    return r;
+  }();
+  return p;
+}
 }  // namespace autoware::motion_velocity_planner
 
 #endif  // NERO_OSD_HPP_
