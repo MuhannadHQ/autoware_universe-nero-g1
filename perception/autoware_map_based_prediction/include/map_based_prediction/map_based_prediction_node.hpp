@@ -233,6 +233,14 @@ private:
     lru_cache_of_convert_path_type_{1000};
   std::pair<PosePath, double> convertLaneletPathToPosePath(
     const lanelet::routing::LaneletPath & path) const;
+  // NERO_MBP_REF_TRIM (lcearly 2026-11-24): the same conversion without copying cached paths, and each reference path cut
+  // to the part the predicted path can reach (see map_based_prediction_node.cpp). Unset = upstream.
+  std::pair<PosePath, double> computeLaneletPathToPosePath(const lanelet::routing::LaneletPath & path) const;
+  std::shared_ptr<const std::pair<PosePath, double>> neroConvertCached(
+    const lanelet::routing::LaneletPath & path) const;
+  mutable autoware_utils::LRUCache<
+    lanelet::routing::LaneletPath, std::shared_ptr<const std::pair<PosePath, double>>>
+    nero_cache_of_convert_path_{1000};
 
   ////// Debugger
   std::unique_ptr<autoware_utils::PublishedTimePublisher> published_time_publisher_;

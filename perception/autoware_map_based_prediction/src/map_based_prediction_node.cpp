@@ -1405,6 +1405,57 @@ std::vector<PredictedRefPath> MapBasedPredictionNode::convertPredictedReferenceP
 
   std::vector<PredictedRefPath> converted_ref_paths;
 
+  // NERO_MBP_REF_TRIM=1 (lcearly 2026-11-24, 24 Nov 14:38:29 MRM: the objects rate fell under 5 Hz because this node took
+  // 41 -> 243 ms per frame on the 614 m three-lane lanelets): every reference path is the WHOLE lanelet path (the search adds
+  // the current lanelet's full length), about 1,600 poses at 0.5 m there, and per path it was copied out of the LRU cache
+  // (optional<Value>), copied again, front-erased, then walked twice more by the generator (arc length, interpolation base).
+  // Here: the converted path is shared (no copy), the starting index is searched on it exactly as before, and only the part
+  // the predicted path can reach is copied: from the starting index to the first pose farther than
+  // |s0| + |v| T + 5 m along it (+1 pose). Without vehicle acceleration (the car's use_vehicle_acceleration: false) the
+  // generator's longitudinal position never passes |s0| + |v| T (getFrenetPoint: |(s_vel, d_vel)| = |v|; the quartic's speed
+  // stays between s_vel and that), its interpolation is linear between neighbouring poses and its max_length test cannot
+  // trip on either path, so the predicted paths are identical. With vehicle acceleration on: upstream code. Unset = upstream.
+  static const bool nero_trim = [] {
+    const char * e = std::getenv("NERO_MBP_REF_TRIM");
+    return e != nullptr && std::atoi(e) > 0;
+  }();
+  if (nero_trim && !use_vehicle_acceleration_) {
+    const auto & tw = object.kinematics.twist_with_covariance.twist.linear;
+    const double v = std::hypot(tw.x, tw.y);
+    const double horizon = prediction_time_horizon_.vehicle;
+    const auto & op = object.kinematics.pose_with_covariance.pose.position;
+    for (const auto & ref_path : lanelet_ref_paths) {
+      const auto conv = neroConvertCached(ref_path.first);
+      const PosePath & full = conv->first;
+      PredictedRefPath predicted_path;
+      predicted_path.probability = ref_path.second.probability;
+      predicted_path.width = conv->second;
+      predicted_path.maneuver = ref_path.second.maneuver;
+      predicted_path.speed_limit = ref_path.second.speed_limit;
+      if (full.empty()) {
+        continue;  // upstream #12687: an empty path is dropped (0.44.2's loop never advanced past it)
+      }
+      const std::optional<size_t> opt_starting_idx = searchProperStartingRefPathIndex(object, full);
+      if (!opt_starting_idx.has_value()) {
+        continue;  // as upstream: no proper starting point, the reference path is dropped
+      }
+      const size_t i0 = opt_starting_idx.value();
+      const double s0 = std::hypot(op.x - full.at(i0).position.x, op.y - full.at(i0).position.y);
+      const double reach = s0 + v * horizon * 1.001 + 5.0;
+      size_t i1 = i0 + 1;
+      double s = 0.0;
+      while (i1 < full.size() && s <= reach) {
+        s += autoware_utils::calc_distance2d(full.at(i1 - 1), full.at(i1));
+        ++i1;
+      }
+      i1 = std::min(full.size(), i1 + 1);  // one pose past the reach
+      predicted_path.path.assign(
+        full.begin() + static_cast<std::ptrdiff_t>(i0), full.begin() + static_cast<std::ptrdiff_t>(i1));
+      converted_ref_paths.push_back(std::move(predicted_path));
+    }
+    return converted_ref_paths;
+  }
+
   // Step 1. Convert lanelet path to pose path
   for (const auto & ref_path : lanelet_ref_paths) {
     const auto & lanelet_path = ref_path.first;
@@ -1451,7 +1502,27 @@ std::pair<PosePath, double> MapBasedPredictionNode::convertLaneletPathToPosePath
   if (lru_cache_of_convert_path_type_.contains(path)) {
     return *lru_cache_of_convert_path_type_.get(path);
   }
+  const auto converted_path_and_width = computeLaneletPathToPosePath(path);
+  lru_cache_of_convert_path_type_.put(path, converted_path_and_width);
+  return converted_path_and_width;
+}
 
+std::shared_ptr<const std::pair<PosePath, double>> MapBasedPredictionNode::neroConvertCached(
+  const lanelet::routing::LaneletPath & path) const
+{
+  std::unique_ptr<ScopedTimeTrack> st_ptr;
+  if (time_keeper_) st_ptr = std::make_unique<ScopedTimeTrack>("convertLaneletPathToPosePath", *time_keeper_);
+  if (auto hit = nero_cache_of_convert_path_.get(path)) {
+    return *hit;  // a shared pointer: no copy of the path
+  }
+  auto sp = std::make_shared<const std::pair<PosePath, double>>(computeLaneletPathToPosePath(path));
+  nero_cache_of_convert_path_.put(path, sp);
+  return sp;
+}
+
+std::pair<PosePath, double> MapBasedPredictionNode::computeLaneletPathToPosePath(
+  const lanelet::routing::LaneletPath & path) const
+{
   std::pair<PosePath, double> converted_path_and_width;
   {
     PosePath converted_path;
@@ -1544,8 +1615,6 @@ std::pair<PosePath, double> MapBasedPredictionNode::convertLaneletPathToPosePath
       converted_path, reference_path_resolution_, use_akima_spline_for_xy, use_lerp_for_z);
     converted_path_and_width = std::make_pair(resampled_converted_path, width);
   }
-
-  lru_cache_of_convert_path_type_.put(path, converted_path_and_width);
   return converted_path_and_width;
 }
 

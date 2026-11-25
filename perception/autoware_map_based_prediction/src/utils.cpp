@@ -14,6 +14,9 @@
 
 #include "map_based_prediction/utils.hpp"
 
+#include <cstdlib>  // NERO_MBP_LANELET_FAST
+#include <limits>   // NERO_MBP_LANELET_FAST
+
 #include <autoware/motion_utils/trajectory/trajectory.hpp>
 #include <autoware_lanelet2_extension/utility/message_conversion.hpp>
 #include <autoware_utils/geometry/geometry.hpp>
@@ -35,6 +38,10 @@ namespace autoware::map_based_prediction
 {
 namespace utils
 {
+// NERO_MBP_LANELET_FAST (defined below)
+bool nero_lanelet_fast();
+double nero_lanelet_angle(const lanelet::ConstLanelet & lanelet, const geometry_msgs::msg::Point & search_point);
+
 
 /**
  * @brief calc absolute normalized yaw difference between lanelet and object
@@ -243,7 +250,7 @@ double calculateLocalLikelihood(
 
   // compute yaw difference between the object and lane
   const double obj_yaw = tf2::getYaw(object.kinematics.pose_with_covariance.pose.orientation);
-  const double lane_yaw = lanelet::utils::getLaneletAngle(current_lanelet, obj_point);
+  const double lane_yaw = nero_lanelet_angle(current_lanelet, obj_point);  // NERO_MBP_LANELET_FAST
   const double delta_yaw = obj_yaw - lane_yaw;
   const double abs_norm_delta_yaw = std::fabs(autoware_utils::normalize_radian(delta_yaw));
 
@@ -304,6 +311,109 @@ bool isDuplicated(
   return false;
 }
 
+// NERO_MBP_LANELET_FAST=1 (lcearly 2026-11-24, 24 Nov 14:38:29 MRM): the current-lanelet search of every object computed
+// lanelet::utils::getLaneletAngle on each of its 10 nearest lanelets BEFORE the distance test that rejects every lanelet
+// farther than dist_threshold_for_searching_lanelet (3 m), and getLaneletAngle builds two Point3d + a LineString3d + its 2D
+// copy for every centre-line segment. On the 24 Nov road ~25 parked cars between the carriageways each had 10 lanelets of
+// 391-614 m (150-250 centre-line points) within reach and none within 3 m: ~2/3 of this node's time on the road.
+//   - checkCloseLaneletCondition tests the distance before the angle (the same AND of the same conditions);
+//   - nero_lanelet_angle = getLaneletAngle on one reused 2-point BasicLineString2d: the same boost point-to-segment
+//     distance on the same coordinates, the same first-minimum rule, the same atan2 -> the identical angle.
+// Unset = upstream.
+bool nero_lanelet_fast()
+{
+  static const bool on = [] {
+    const char * e = std::getenv("NERO_MBP_LANELET_FAST");
+    return e != nullptr && std::atoi(e) > 0;
+  }();
+  return on;
+}
+
+double nero_lanelet_angle(const lanelet::ConstLanelet & lanelet, const geometry_msgs::msg::Point & search_point)
+{
+  const auto cl = lanelet.centerline();
+  if (!nero_lanelet_fast() || cl.size() < 2) {
+    return lanelet::utils::getLaneletAngle(lanelet, search_point);
+  }
+  const lanelet::BasicPoint2d p(search_point.x, search_point.y);
+  lanelet::BasicLineString2d seg(2);
+  double min_distance = std::numeric_limits<double>::max();
+  size_t best = 0;
+  for (size_t i = 1; i < cl.size(); i++) {
+    seg[0] = lanelet::BasicPoint2d(cl[i - 1].x(), cl[i - 1].y());
+    seg[1] = lanelet::BasicPoint2d(cl[i].x(), cl[i].y());
+    const double distance = lanelet::geometry::distance2d(seg, p);
+    if (distance < min_distance) {
+      min_distance = distance;
+      best = i;
+    }
+  }
+  if (best == 0) {
+    return lanelet::utils::getLaneletAngle(lanelet, search_point);  // no finite distance: as upstream
+  }
+  return std::atan2(cl[best].y() - cl[best - 1].y(), cl[best].x() - cl[best - 1].x());
+}
+
+// NERO_MBP_LANELET_FAST: lanelet::geometry::findNearest (lanelet2 1.2.2 src/LaneletMap.cpp findNearestImpl + NSmallestElements,
+// replicated line for line) with the lanelet's 2D polygon cached per lanelet: lanelet2 builds lanelet.polygon2d() and copies
+// it to a BasicPolygon2d for every candidate of every object every frame (distance2d(prim, pt) =
+// boost::geometry::distance(prim.polygon2d().basicPolygon(), pt)); here the same boost distance on the same points.
+namespace
+{
+template <typename T>
+class NeroNSmallest
+{
+public:
+  explicit NeroNSmallest(size_t n) : n_{n} { values_.reserve(n); }
+  bool insert(double measure, T value)
+  {
+    auto pos = std::lower_bound(
+      values_.begin(), values_.end(), measure, [](auto & v1, double v2) { return v1.first < v2; });
+    if (pos != values_.end() || values_.size() < n_) {
+      if (values_.size() >= n_) {
+        values_.pop_back();
+      }
+      values_.emplace(pos, measure, value);
+      return true;
+    }
+    return false;
+  }
+  const auto & values() const { return values_; }
+  auto moveValues() { return std::move(values_); }
+  bool full() const { return values_.size() >= n_; }
+
+private:
+  std::vector<std::pair<double, T>> values_;
+  size_t n_;
+};
+}  // namespace
+
+std::vector<std::pair<double, lanelet::Lanelet>> nero_find_nearest(
+  const lanelet::LaneletMapPtr & map, const lanelet::BasicPoint2d & pt, unsigned count)
+{
+  static const lanelet::LaneletMap * cached_map = nullptr;
+  static std::unordered_map<lanelet::Id, std::pair<bool, lanelet::BasicPolygon2d>> polys;
+  if (cached_map != map.get()) {
+    polys.clear();
+    cached_map = map.get();
+  }
+  NeroNSmallest<lanelet::Lanelet> closest(count);
+  auto searchFunction = [&closest, &pt](const lanelet::BoundingBox2d & box, const lanelet::Lanelet & prim) {
+    auto dBox = lanelet::geometry::distance(box, pt);
+    if (closest.full() && dBox > closest.values().back().first) {
+      return true;
+    }
+    auto it = polys.find(prim.id());
+    if (it == polys.end() || it->second.first != prim.inverted()) {
+      it = polys.insert_or_assign(prim.id(), std::make_pair(prim.inverted(), prim.polygon2d().basicPolygon())).first;
+    }
+    closest.insert(lanelet::geometry::distance(it->second.second, pt), prim);
+    return false;
+  };
+  map->laneletLayer.nearestUntil(pt, searchFunction);
+  return closest.moveValues();
+}
+
 bool checkCloseLaneletCondition(
   const std::pair<double, lanelet::Lanelet> & lanelet, const TrackedObject & object,
   const std::unordered_map<std::string, std::deque<ObjectData>> & road_users_history,
@@ -330,10 +440,14 @@ bool checkCloseLaneletCondition(
     }
   }
 
+  // NERO_MBP_LANELET_FAST: the distance test first (its result does not depend on the angle)
+  if (nero_lanelet_fast() && dist_threshold_for_searching_lanelet < lanelet.first) {
+    return false;
+  }
+
   // Step2. Calculate the angle difference between the lane angle and obstacle angle
   const double object_yaw = tf2::getYaw(object.kinematics.pose_with_covariance.pose.orientation);
-  const double lane_yaw = lanelet::utils::getLaneletAngle(
-    lanelet.second, object.kinematics.pose_with_covariance.pose.position);
+  const double lane_yaw = nero_lanelet_angle(lanelet.second, object.kinematics.pose_with_covariance.pose.position);
   const double delta_yaw = object_yaw - lane_yaw;
   const double normalized_delta_yaw = autoware_utils::normalize_radian(delta_yaw);
   const double abs_norm_delta = std::fabs(normalized_delta_yaw);
@@ -406,7 +520,8 @@ LaneletsData getCurrentLanelets(
 
   // nearest lanelet
   std::vector<std::pair<double, lanelet::Lanelet>> surrounding_lanelets =
-    lanelet::geometry::findNearest(lanelet_map_ptr->laneletLayer, search_point, 10);
+    nero_lanelet_fast() ? nero_find_nearest(lanelet_map_ptr, search_point, 10)
+                        : lanelet::geometry::findNearest(lanelet_map_ptr->laneletLayer, search_point, 10);
 
   {  // Step 1. Search same directional lanelets
     // No Closest Lanelets
