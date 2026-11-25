@@ -344,7 +344,17 @@ std::vector<std::vector<int64_t>> get_sorted_lane_ids(const CommonDataPtr & comm
       return std::vector{target_lane.id()};
     }
 
-    if (target_lane.id() > find_same_id->id()) {
+    // NERO_LC_IDS_CURRENT_FIRST=1 (lcearly 2026-11-24): the pair on the lane-changing points is {current, target} whatever
+    // the ids. With {target, current} (target id < current id: every left change on the 24 Nov three-lane road) the behaviour
+    // velocity planner's "lanes from ego's lane onward" (getSubsequentLaneIdsSetOnPath) cut the target lane once the path
+    // started on a lane-changing point: its speed bump 2118780 vanished for 3.3 s and came back 2.3 m ahead at 4.6 m/s
+    // (-4.3 m/s2 to a stand; the same for target-lane stop lines, crosswalks, lights). {current, target} is the order every
+    // change with a higher target id already produces. Unset = the car (numeric order).
+    static const bool current_first = [] {
+      const char * v = std::getenv("NERO_LC_IDS_CURRENT_FIRST");
+      return v != nullptr && std::atoi(v) > 0;
+    }();
+    if (current_first || target_lane.id() > find_same_id->id()) {
       return std::vector{find_same_id->id(), target_lane.id()};
     }
 

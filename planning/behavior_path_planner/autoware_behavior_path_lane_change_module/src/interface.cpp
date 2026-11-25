@@ -546,6 +546,12 @@ std::pair<LaneChangeStates, std::string_view> LaneChangeInterface::check_transit
     if (auto * nlc = dynamic_cast<NormalLaneChange *>(module_type_.get()); nlc != nullptr && nlc->nero_lc_giveup()) {
       return {LaneChangeStates::Cancel, "NeroGiveUp"};
     }
+    // NERO_LC_COMMIT_ROUTE recheck (lcearly 2026-11-24): a waiting change is never asked isExecutionRequested again (the
+    // manager keeps an existing candidate): one the commit zone holds now (it slipped through, or the route changed) ends here
+    if (auto * nlc = dynamic_cast<NormalLaneChange *>(module_type_.get());
+        nlc != nullptr && nlc->nero_commit_zone_recheck()) {
+      return {LaneChangeStates::Cancel, "NeroCommitZone"};
+    }
     return {LaneChangeStates::Normal, "WaitingForApproval"};
   }
 

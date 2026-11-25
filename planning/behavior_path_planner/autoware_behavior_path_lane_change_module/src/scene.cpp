@@ -24,6 +24,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <unordered_map>
+#include <unordered_set>  // NERO_LC_COMMIT_ROUTE
 
 #include "autoware/behavior_path_lane_change_module/utils/calculation.hpp"
 #include "autoware/behavior_path_lane_change_module/utils/path.hpp"
@@ -42,6 +43,7 @@
 #include <autoware_frenet_planner/frenet_planner.hpp>
 #include <autoware_frenet_planner/structures.hpp>
 #include <autoware_lanelet2_extension/utility/message_conversion.hpp>
+#include <autoware_lanelet2_extension/utility/query.hpp>  // NERO_LC_COMMIT_ROUTE
 #include <autoware_lanelet2_extension/utility/utilities.hpp>
 #include <autoware_utils/geometry/boost_polygon_utils.hpp>
 #include <autoware_utils/math/unit_conversion.hpp>
@@ -1962,7 +1964,13 @@ bool NormalLaneChange::isLaneChangeRequired()
       }
       return std::array<double, 3>{d0, std::max(d1, 0.0), std::max(busy, 0.0)};
     }();
-    if (cz[0] > 0.0 && type_ == LaneChangeModuleType::NORMAL && direction_ == Direction::LEFT && !current_lanes.empty()) {
+    // NERO_LC_COMMIT_ROUTE (lcearly 2026-11-24): the same zone, decided from where ego's own lane leaves the route
+    if (nero_commit_route_param().walk) {
+      if (nero_commit_zone_holds("request")) {
+        nero_req_log("no: commit zone (route walk)");
+        return false;
+      }
+    } else if (cz[0] > 0.0 && type_ == LaneChangeModuleType::NORMAL && direction_ == Direction::LEFT && !current_lanes.empty()) {
       const auto & rh = common_data_ptr_->route_handler_ptr;
       lanelet::ConstLanelet next;
       const bool leaves_route =
@@ -2001,6 +2009,184 @@ bool NormalLaneChange::isLaneChangeRequired()
 
   nero_req_log("yes");
   return true;
+}
+
+// NERO_LC_COMMIT_ROUTE=<walk>[,<recheck>] (lcearly 2026-11-24, Ahmed 24 Nov: "why did it want to turn left so early", "a
+// mistake like this ... should have been fixed in the sim"): NERO_LC_COMMIT_ZONE decided "the lane leaves the route" from
+// current_lanes.back(). current_lanes is getLaneletSequence(ego's lanelet, forward 300 m), which stops once the FOLLOWING
+// lanelets cover 300 m: from the 21 m junction piece 2096555 it ended at 2096558 (614 m), which continues in the route, so
+// the gate let a left change through 735 m before the lane really left the route (2096570; 24 Nov 14:38:18, lamp 9 s, an
+// approval, an abort). And a change already waiting for approval is never asked again: the planner manager keeps an existing
+// candidate without isExecutionRequested (planner_manager.cpp "module already exist").
+//   walk 1: ego's lane is followed along the route from ego's own lanelet (getNextLaneletWithinRoute) until it leaves the
+//           route (zone measured to that lanelet's end, changes due counted there) or reaches the goal section / runs on
+//           20 km (no hold: a lane that continues to the goal, as before).
+//   recheck 1 (default with walk): a change still waiting for approval is cancelled while the zone holds it (no blinker, no
+//           candidate, no approval before the zone). An approved change is never touched.
+//   free 1: the zone is counted in metres where a change may START: every intersection piece in it (a turn_direction
+//           lanelet whose bounds do not allow lane changes, where is_near_regulatory_element blocks the request) and the
+//           max prepare length before it are added, until stable. 24 Nov road: the 130 / 180 m zone before 2096569 /
+//           2096570 holds two junctions (2096559-61, 2096565-67): the change was pushed past the first one onto the 57 m
+//           piece 2118547 (a squeezed change and a stand there); counted in free metres it starts on the 614 m lanelet.
+// The zone itself is NERO_LC_COMMIT_ZONE's (D0 + D1 x changes due [+ busy]). Unset / "0" = the car (current_lanes.back()).
+const NormalLaneChange::NeroCommitRouteParam & NormalLaneChange::nero_commit_route_param()
+{
+  static const NeroCommitRouteParam p = [] {
+    NeroCommitRouteParam r;
+    if (const char * e = std::getenv("NERO_LC_COMMIT_ROUTE")) {
+      int w = 0, c = 1, f = 0;
+      const int n = std::sscanf(e, "%d,%d,%d", &w, &c, &f);
+      r.walk = n >= 1 && w > 0;
+      r.recheck = r.walk && (n < 2 || c > 0);
+      r.free = r.walk && n >= 3 && f > 0;
+      RCLCPP_INFO(
+        rclcpp::get_logger("lane_change"), "[NERO_LC_COMMIT_ROUTE] on: walk %d recheck %d free %d (from '%s')",
+        r.walk ? 1 : 0, r.recheck ? 1 : 0, r.free ? 1 : 0, e);
+    }
+    return r;
+  }();
+  return p;
+}
+
+bool NormalLaneChange::nero_commit_zone_holds(const char * where)
+{
+  static const std::array<double, 3> cz = [] {
+    double d0 = -1.0, d1 = 40.0, busy = 0.0;
+    if (const char * e = std::getenv("NERO_LC_COMMIT_ZONE")) {
+      std::sscanf(e, "%lf,%lf,%lf", &d0, &d1, &busy);
+    }
+    return std::array<double, 3>{d0, std::max(d1, 0.0), std::max(busy, 0.0)};
+  }();
+  if (
+    cz[0] <= 0.0 || type_ != LaneChangeModuleType::NORMAL || direction_ != Direction::LEFT || !common_data_ptr_ ||
+    !common_data_ptr_->is_data_available() || !common_data_ptr_->is_lanes_available()) {
+    return false;
+  }
+  const auto & current_lanes = common_data_ptr_->lanes_ptr->current;
+  if (current_lanes.empty()) {
+    return false;
+  }
+  const auto & rh = common_data_ptr_->route_handler_ptr;
+  const auto & ego_pose = common_data_ptr_->get_ego_pose();
+  // ego's own lanelet: the current lane nearest ego (current_lanes is ego's lane sequence, refreshed while waiting)
+  lanelet::ConstLanelet ego_ll;
+  if (!lanelet::utils::query::getClosestLanelet(current_lanes, ego_pose, &ego_ll)) {
+    return false;
+  }
+  // walk along the route; the part beyond ego's lanelet is cached per (instance, lanelet, route)
+  struct Walk
+  {
+    lanelet::Id from{lanelet::InvalId};
+    int32_t sec{0};
+    uint32_t nanosec{0};
+    bool leaves{false};
+    lanelet::Id leave_id{lanelet::InvalId};
+    double beyond{0.0};  // length of the lanelets after ego's lanelet up to and including the leaving one
+    int n_due{1};
+    int hops{0};
+    std::vector<std::pair<double, double>> ix;  // free 1: intersection pieces as (distance of their end before the route end, length)
+  };
+  static std::unordered_map<const void *, Walk> cache;
+  const auto stamp = getRouteHeader().stamp;
+  auto & w = cache[this];
+  if (w.from != ego_ll.id() || w.sec != stamp.sec || w.nanosec != stamp.nanosec) {
+    w = Walk{};
+    w.from = ego_ll.id();
+    w.sec = stamp.sec;
+    w.nanosec = stamp.nanosec;
+    constexpr double kMaxSearch = 20000.0;
+    std::unordered_set<lanelet::Id> seen{ego_ll.id()};
+    lanelet::ConstLanelet cur = ego_ll;
+    while (w.beyond < kMaxSearch) {
+      if (rh->isInGoalRouteSection(cur)) {
+        break;  // ego's lane reaches the goal's section: not a lane that leaves the route (as before)
+      }
+      lanelet::ConstLanelet next;
+      if (!rh->getNextLaneletWithinRoute(cur, &next)) {
+        w.leaves = true;
+        w.leave_id = cur.id();
+        w.n_due = std::max(1, std::abs(rh->getNumLaneToPreferredLane(cur, Direction::LEFT)));
+        break;
+      }
+      if (!seen.insert(next.id()).second) {
+        break;  // loop in the route: no hold
+      }
+      const double next_len = lanelet::utils::getLaneletLength2d(next);
+      if (nero_commit_route_param().free && next.hasAttribute("turn_direction")) {
+        bool lc_yes = false;
+        for (const auto & bound : {next.rightBound(), next.leftBound()}) {
+          if (
+            bound.hasAttribute(lanelet::AttributeNamesString::LaneChange) &&
+            bound.attribute(lanelet::AttributeNamesString::LaneChange).value() == std::string("yes")) {
+            lc_yes = true;
+          }
+        }
+        if (!lc_yes) {
+          w.ix.emplace_back(w.beyond + next_len, next_len);  // its end measured from ego's lanelet end for now
+        }
+      }
+      w.beyond += next_len;
+      ++w.hops;
+      cur = next;
+    }
+    if (w.leaves) {
+      for (auto & e : w.ix) e.first = w.beyond - e.first;  // -> distance of the piece's end before the route end
+    } else {
+      w.ix.clear();
+    }
+  }
+  if (!w.leaves) {
+    return false;
+  }
+  const double s_ego = lanelet::utils::getArcCoordinates({ego_ll}, ego_pose).length;
+  const double to_end = std::max(0.0, lanelet::utils::getLaneletLength2d(ego_ll) - s_ego) + w.beyond;
+  double zone = cz[0] + cz[1] * static_cast<double>(w.n_due);
+  bool busy = false;
+  if (cz[2] > 0.0) {
+    const auto spd = [](const auto & o) { return std::hypot(o.initial_twist.linear.x, o.initial_twist.linear.y); };
+    for (const auto & o : filtered_objects_.target_lane_trailing) {
+      if (spd(o) > 2.0 && std::abs(o.dist_from_ego) < 80.0) busy = true;
+    }
+    for (const auto & o : filtered_objects_.target_lane_leading.moving) {
+      if (spd(o) > 2.0 && std::abs(o.dist_from_ego) < 40.0) busy = true;
+    }
+    if (busy) zone += cz[2];
+  }
+  double zone_free_add = 0.0;
+  if (nero_commit_route_param().free && !w.ix.empty()) {
+    const double margin = std::max(0.0, common_data_ptr_->transient_data.max_prepare_length);
+    const double base = zone;
+    for (int it = 0; it < 8; ++it) {
+      double add = 0.0;
+      for (const auto & [end_before, len] : w.ix) {
+        if (end_before < base + add) add += len + margin;  // the piece reaches into the zone: no change may start there
+      }
+      if (std::abs(add - zone_free_add) < 1e-6) break;
+      zone_free_add = add;
+    }
+    zone = base + zone_free_add;
+  }
+  if (to_end <= zone) {
+    return false;
+  }
+  static std::unordered_map<std::string, double> last_log;
+  const double now = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+  double & l = last_log[where];
+  if (now - l > 1.0) {
+    l = now;
+    RCLCPP_INFO(
+      logger_,
+      "[NERO_LC_COMMIT_ZONE] left change held (%s): lane %ld ends in %.0f m, zone %.0f m (%d change%s due%s, +%.0f m "
+      "intersection pieces); route walk from %ld, %d lanelet%s on (current lanes end at %ld)",
+      where, w.leave_id, to_end, zone, w.n_due, w.n_due > 1 ? "s" : "", busy ? ", target lane busy" : "", zone_free_add,
+      ego_ll.id(), w.hops, w.hops == 1 ? "" : "s", current_lanes.back().id());
+  }
+  return true;
+}
+
+bool NormalLaneChange::nero_commit_zone_recheck()
+{
+  return nero_commit_route_param().recheck && nero_commit_zone_holds("waiting change cancelled");
 }
 
 namespace
