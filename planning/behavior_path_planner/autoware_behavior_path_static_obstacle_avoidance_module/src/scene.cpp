@@ -30,6 +30,7 @@
 #include "autoware/behavior_path_static_obstacle_avoidance_module/debug.hpp"
 #include "autoware/behavior_path_static_obstacle_avoidance_module/utils.hpp"
 
+#include <autoware/interpolation/spline_interpolation.hpp>
 #include <autoware/motion_utils/trajectory/interpolation.hpp>
 #include <autoware_lanelet2_extension/regulatory_elements/road_marking.hpp>
 #include <autoware_lanelet2_extension/regulatory_elements/speed_bump.hpp>
@@ -2002,6 +2003,11 @@ void StaticObstacleAvoidanceModule::fillShiftLine(
    * Merge rough shift lines, and extract new shift lines.
    */
   data.new_shift_line = generator_.generate(data, debug);
+  if (utils::static_obstacle_avoidance::nero_ra::cfg().on) {
+    // NERO_SOA_REPLAN_ANCHOR: the generator returned its whole fresh plan (it differs from the registered one) or nothing; the plan is
+    // joined to the robot's state here, and the lines below are what replaces the registered lines
+    neroAnchorResolve(data);
+  }
 
   /**
    * Step2: Validate new shift lines.
@@ -2039,6 +2045,37 @@ void StaticObstacleAvoidanceModule::fillShiftLine(
    * check that there is a certain amount of margin in the lateral and longitudinal direction.
    */
   data.comfortable = helper_->isComfortable(data.new_shift_line);
+  if (utils::static_obstacle_avoidance::nero_ra::cfg().on && nero_ra_.mode != 0 && !data.new_shift_line.empty()) {
+    data.comfortable = nero_ra_.comfortable;  // NERO_SOA_REPLAN_ANCHOR: the lines the re-plan made / changed (neroAnchorResolve)
+  }
+  // NERO_SOA_COMF_FROM_PATH=1 (ownlane-2 2026-11-25, QUEUE SOAFRAG-SIM, the 24 Nov 13:01 c4df chain): the comfort check measures the
+  // first new line's lateral change from the shift the REGISTERED path has at its start (what the path shifter executes: it ramps from
+  // there to the line's end), not from the generator's start value. The trim step can concatenate the fill-gap line from ego with the
+  // lines after it and keep ego's shift as the start of a line that begins metres ahead (sim 1125-181305 27.57 s: trimmed
+  // [3.80>13.10 1.59>0.80] while the registered path is at 1.30 at 3.80 m): a 0.79 m change read where the path makes 0.50 m (gentler
+  // than the registered return it replaces) -> "not comfortable" for 2 s, no new line executed (c4df's level among them), the module
+  // slowed 5.0 -> 2.6 m/s and obstacle_stop / the fragment rule stopped before c4df until its line registered. Unset = the car.
+  static const bool nero_comf_from_path = [] {
+    const char * v = std::getenv("NERO_SOA_COMF_FROM_PATH");
+    return v != nullptr && std::atoi(v) > 0;
+  }();
+  // (not with NERO_SOA_REPLAN_ANCHOR: its lines start from the path's own shift and rate at ego, exactly)
+  if (
+    nero_comf_from_path && !utils::static_obstacle_avoidance::nero_ra::cfg().on && !data.comfortable &&
+    !data.new_shift_line.empty()) {
+    auto lines = data.new_shift_line;
+    const double gen_start = lines.front().start_shift_length;
+    lines.front().start_shift_length = helper_->getLinearShift(lines.front().start.position);
+    if (helper_->isComfortable(lines)) {
+      data.comfortable = true;
+      RCLCPP_INFO_THROTTLE(
+        getLogger(), *clock_, 500,
+        "[NERO_SOA_COMF_FROM_PATH] new line %.1f>%.1f m to %.2f: comfortable from the registered path's %.2f at its start "
+        "(the generator's start %.2f read it as not comfortable)",
+        lines.front().start_longitudinal, lines.front().end_longitudinal, lines.front().end_shift_length,
+        lines.front().start_shift_length, gen_start);
+    }
+  }
   // NERO_SOA_STILL_SHARP_S: standing still behind the object for this long, the move may be sharper than the jerk
   // limit at standstill (lateral max_jerk[0]) — ego that stopped a little closer than the stop point (a hold for a
   // passing car) could otherwise never start again: safe, valid and ready, but "not comfortable" (60+ s deadlock)
@@ -2161,6 +2198,64 @@ void StaticObstacleAvoidanceModule::fillShiftLine(
   data.ready = helper_->isReady(data.new_shift_line, path_shifter_.getLastShiftLength()) &&
                avoidance_ready.first;
   data.request_operator = avoidance_ready.second;
+  // NERO_SOA_REPLAN_ANCHOR: the new lines are the whole manoeuvre re-planned from the robot's state (its return included), in place of
+  // the registered lines. The stock wait for a return's approval (ratio_for_return_shift_approval: ego must have covered half of the
+  // LAST registered line's shift before a line the other way is taken) would hold a re-plan back against a line it replaces
+  // (mk_great s1, sim 1125-202202: 1.8 s, the robot out to 1.6 m). The object-based readiness (ambiguous / wait-and-see) stays.
+  if (
+    utils::static_obstacle_avoidance::nero_ra::cfg().on && !data.ready && avoidance_ready.first &&
+    !data.new_shift_line.empty()) {
+    data.ready = true;
+    RCLCPP_INFO_THROTTLE(
+      getLogger(), *clock_, 500,
+      "[NERO_SOA_ANCHOR] ready: the re-plan (first line %.1f>%.1f m to %.2f) replaces the registered lines, it does not wait for the "
+      "return approval against the last registered %.2f",
+      data.new_shift_line.front().start_longitudinal, data.new_shift_line.front().end_longitudinal,
+      data.new_shift_line.front().end_shift_length, path_shifter_.getLastShiftLength());
+  }
+  // NERO_SOA_REPLAN_HORIZON (ownlane-3, shift_line_generator.cpp): new lines that replace only registered lines that have not started
+  // (they start beyond ego + the nominal prepare distance) are a re-plan, not a return after a target: the stock wait for the return
+  // approval (ratio_for_return_shift_approval: ego must have covered half of the last registered shift) is measured against the level
+  // the COMMITTED lines end at. mk_great s1 (sim 1125-202202) 15.4-17.2 s: the lower plan [1.16>17.36 0.70>0.70] (valid, safe,
+  // comfortable) waited on the not-started pedestrian line [5.97>16.53 0.70>1.60] ("ego 0.70 of 1.60"), which then started: out to 1.6 m.
+  {
+    static const bool nero_replan = [] {
+      const char * v = std::getenv("NERO_SOA_REPLAN_HORIZON");
+      return v != nullptr && std::atof(v) > 0.0 && !utils::static_obstacle_avoidance::nero_ra::cfg().on;
+    }();
+    if (nero_replan && !data.ready && avoidance_ready.first && !data.new_shift_line.empty() && !data.arclength_from_ego.empty()) {
+      const double horizon = helper_->getNominalPrepareDistance();
+      const auto & arc = data.arclength_from_ego;
+      const auto arc_at = [&arc](const size_t i) { return arc.at(std::min(i, arc.size() - 1)); };
+      size_t min_start_idx = std::numeric_limits<size_t>::max();
+      for (const auto & sl : data.new_shift_line) {
+        min_start_idx = std::min(min_start_idx, sl.start_idx);
+      }
+      bool replaces_unstarted = false;
+      bool replaces_started = false;
+      std::optional<ShiftLine> committed_last;
+      for (const auto & sl : path_shifter_.getShiftLines()) {
+        const bool started = arc_at(sl.start_idx) <= horizon;
+        if (started && (!committed_last || sl.end_idx > committed_last->end_idx)) {
+          committed_last = sl;
+        }
+        if (sl.start_idx >= min_start_idx || (sl.end_idx > min_start_idx && arc_at(min_start_idx) > horizon)) {
+          (started ? replaces_started : replaces_unstarted) = true;
+        }
+      }
+      const double committed_level =
+        committed_last ? committed_last->end_shift_length : path_shifter_.getBaseOffset();
+      if (replaces_unstarted && !replaces_started && helper_->isReady(data.new_shift_line, committed_level)) {
+        data.ready = true;
+        RCLCPP_INFO_THROTTLE(
+          getLogger(), *clock_, 500,
+          "[NERO_SOA_REPLAN] new line %.1f>%.1f m to %.2f replaces not-started lines: return approval read from the committed %.2f "
+          "(stock: the last registered %.2f)",
+          data.new_shift_line.front().start_longitudinal, data.new_shift_line.front().end_longitudinal,
+          data.new_shift_line.front().end_shift_length, committed_level, path_shifter_.getLastShiftLength());
+      }
+    }
+  }
 
   // NERO_SOA_APPROVAL_KEEPS_SAFETY: an object the operator already approved is not asked about again
   if (nero_soa::env().approval_keeps_safety && data.request_operator && !data.target_objects.empty()) {
@@ -7895,9 +7990,64 @@ void StaticObstacleAvoidanceModule::updatePathShifter(const AvoidLineArray & shi
       getLogger(), "[NERO_SOA] the operator approved moving around this object: not asked again");
   }
 
+  const bool nero_anchor = utils::static_obstacle_avoidance::nero_ra::cfg().on;
+  if (nero_anchor) {
+    // NERO_SOA_REPLAN_ANCHOR: the re-plan was joined to the registered plan of fillShiftLine; if that plan was replaced since (a
+    // pause / give-way / return freeze of this cycle), the re-plan is not registered: next cycle plans from the new state
+    const auto now_lines = path_shifter_.getShiftLines();
+    bool same = nero_ra_.mode != 0 && now_lines.size() == nero_ra_.stamp_ids.size() &&
+                std::abs(path_shifter_.getBaseOffset() - nero_ra_.stamp_base) < 1.0e-6;
+    for (size_t k = 0; same && k < now_lines.size(); ++k) {
+      same = now_lines.at(k).id == nero_ra_.stamp_ids.at(k);
+    }
+    if (!same) {
+      RCLCPP_INFO(
+        getLogger(), "[NERO_SOA_ANCHOR_REG] not registered: the registered plan changed since the re-plan was joined (mode %d)",
+        nero_ra_.mode);
+      return;
+    }
+  }
+
   addNewShiftLines(path_shifter_, shift_lines);
 
-  generator_.setRawRegisteredShiftLine(shift_lines, avoid_data_);
+  if (nero_anchor) {
+    generator_.neroAnchorSetMemory(
+      shift_lines, avoid_data_, nero_ra_.mode == 1 ? nero_ra_.keep_until_lon : -1.0e9, nero_ra_.n_chord);
+    if (nero_ra_.mode != 1) {
+      // every registered line was replaced: so are their RTC statuses (one status for the re-planned manoeuvre, below)
+      for (const auto & left_shift : left_shift_array_) {
+        if (rtc_interface_ptr_map_.at("left")->isRegistered(left_shift.uuid)) {
+          rtc_interface_ptr_map_.at("left")->updateCooperateStatus(
+            left_shift.uuid, true, State::SUCCEEDED, std::numeric_limits<double>::lowest(),
+            std::numeric_limits<double>::lowest(), clock_->now());
+        }
+      }
+      for (const auto & right_shift : right_shift_array_) {
+        if (rtc_interface_ptr_map_.at("right")->isRegistered(right_shift.uuid)) {
+          rtc_interface_ptr_map_.at("right")->updateCooperateStatus(
+            right_shift.uuid, true, State::SUCCEEDED, std::numeric_limits<double>::lowest(),
+            std::numeric_limits<double>::lowest(), clock_->now());
+        }
+      }
+      left_shift_array_.clear();
+      right_shift_array_.clear();
+    }
+    std::ostringstream ss;
+    ss << std::fixed << std::setprecision(2);
+    for (const auto & sl : path_shifter_.getShiftLines()) {
+      const auto at = [this](const size_t i) {
+        const auto & a = avoid_data_.arclength_from_ego;
+        return a.empty() ? 0.0 : a.at(std::min(i, a.size() - 1));
+      };
+      ss << " [" << at(sl.start_idx) << ">" << at(sl.end_idx) << " " << sl.start_shift_length << ">" << sl.end_shift_length << "]";
+    }
+    RCLCPP_INFO(
+      getLogger(), "[NERO_SOA_ANCHOR_REG] registered (mode %d, base %.2f, %zu line(s) made by the anchor):%s", nero_ra_.mode,
+      path_shifter_.getBaseOffset(), nero_ra_.n_chord, ss.str().c_str());
+    nero_ra_.mode = 0;
+  } else {
+    generator_.setRawRegisteredShiftLine(shift_lines, avoid_data_);
+  }
 
   const auto sl = helper_->getMainShiftLine(shift_lines);
   const auto & sl_front = shift_lines.front();
@@ -7926,6 +8076,12 @@ void StaticObstacleAvoidanceModule::addNewShiftLines(
   PathShifter & path_shifter, const AvoidLineArray & new_shift_lines) const
 {
   autoware_utils::ScopedTimeTrack st(__func__, *time_keeper_);
+  if (utils::static_obstacle_avoidance::nero_ra::cfg().on) {
+    // NERO_SOA_REPLAN_ANCHOR: the new lines are a whole plan already joined to the robot's state (neroAnchorResolve): they replace
+    // the registered lines; nothing is stacked on a line in progress and none is removed from under the robot
+    neroAnchorApply(path_shifter, new_shift_lines);
+    return;
+  }
   ShiftLineArray future = utils::static_obstacle_avoidance::toShiftLineArray(new_shift_lines);
 
   size_t min_start_idx = std::numeric_limits<size_t>::max();
@@ -7978,11 +8134,31 @@ void StaticObstacleAvoidanceModule::addNewShiftLines(
     future.push_back(sl);
   };
 
+  // NERO_SOA_REPLAN_HORIZON (ownlane-3, shift_line_generator.cpp): a registered line that has not started (it starts beyond ego + the
+  // nominal prepare distance) and reaches across the new lines' start is re-planned with them (stock kept it, overlapping the new line)
+  static const bool nero_replan = [] {
+    const char * v = std::getenv("NERO_SOA_REPLAN_HORIZON");
+    return v != nullptr && std::atof(v) > 0.0;  // (not reached with NERO_SOA_REPLAN_ANCHOR)
+  }();
+  const double nero_rh_horizon = nero_replan ? helper_->getNominalPrepareDistance() : 0.0;
+  const auto & nero_arc = avoid_data_.arclength_from_ego;
+  const auto nero_arc_at = [&nero_arc](const size_t idx) {
+    return nero_arc.empty() ? 0.0 : nero_arc.at(std::min(idx, nero_arc.size() - 1));
+  };
+  size_t nero_rh_removed = 0;
+
   for (const auto & sl : current_shift_lines) {
     if (sl.start_idx >= min_start_idx) {
       RCLCPP_DEBUG(
         getLogger(), "sl.start_idx = %lu, this sl starts after new proposal. remove this one.",
         sl.start_idx);
+      continue;
+    }
+
+    if (
+      nero_replan && sl.end_idx > min_start_idx && nero_arc_at(sl.start_idx) > nero_rh_horizon &&
+      nero_arc_at(min_start_idx) > nero_rh_horizon) {
+      ++nero_rh_removed;
       continue;
     }
 
@@ -8018,10 +8194,682 @@ void StaticObstacleAvoidanceModule::addNewShiftLines(
   const double longitudinal_acc =
     std::clamp(road_velocity / shift_time, 0.0, parameters_->max_acceleration);
 
+  if (nero_rh_removed > 0 && &path_shifter == &path_shifter_) {
+    RCLCPP_INFO(
+      getLogger(), "[NERO_SOA_REPLAN] new lines from %.1f m replace %zu not-started registered line(s) reaching across it (horizon %.1f m)",
+      nero_arc_at(min_start_idx), nero_rh_removed, nero_rh_horizon);
+  }
   path_shifter.setShiftLines(future);
   path_shifter.setVelocity(getEgoSpeed());
   path_shifter.setLongitudinalAcceleration(longitudinal_acc);
   path_shifter.setLateralAccelerationLimit(helper_->getLateralMaxAccelLimit());
+}
+
+// ---------------------------------------------------------------------------------------------------------------------------------
+// NERO_SOA_REPLAN_ANCHOR (shift_line_generator.hpp): the fresh plan of this cycle (complete from ego, linear between its line ends)
+// is joined to the robot's state = the registered path's shift y0 and lateral rate y0' (per metre) at ego, and replaces the
+// registered lines. The path shifter draws one S-curve per line with zero lateral slope at both ends, so a line that starts at ego
+// cannot carry a rate; a line that starts BEHIND ego can. The join is therefore one of:
+//  1 keep     the one registered line in progress (or about to start) still ends on the fresh plan: it stays as it is (same curve,
+//             same path at ego); the fresh lines beyond its end replace every other registered line.
+//  2 rest     no lateral motion (|y0'| < RATE_EPS): the base offset becomes y0 and the fresh lines follow, the first one no earlier
+//             than the minimum prepare distance.
+//  3 carrier  in motion: ONE line from a path point behind ego to the fresh plan's first line end, chosen so that its S-curve passes
+//             through y0 at ego with the rate y0' (the start point is searched along the path, the start level follows; the path
+//             shifter itself is the model, so its own curve is matched). It replaces every line in progress. Exists when the plan's
+//             first level lies ahead in the direction of the motion and far enough (|level - y0| >= |y0'| x distance / 3).
+//  4 stop     else: a carrier symmetric about ego (its steepest point at ego) that ends the lateral motion over
+//             e = 2 v sqrt(|y0'| v / jerk_max) at y0 + y0' e / 2 (the robot cannot be anywhere else: the floor that is physical),
+//             then the fresh lines from there.
+// A line back toward the lane centre that would be sharper than the module's jerk limit after the join is lengthened to its
+// sharpest comfortable length (the robot comes back as fast as comfort allows, later than the fresh plan asked); a line away from
+// the centre is never relaxed (the stock comfort check judges it). Lines beyond the first uncomfortable one that is not part of the
+// change are left for a later cycle, as the stock module registers them.
+// The result at ego: the path shifter's output with the new lines equals the registered path at ego's path point and the next one
+// (checked below with the real path shifter: more than 0.03 m off and nothing is re-planned this cycle).
+// ---------------------------------------------------------------------------------------------------------------------------------
+void StaticObstacleAvoidanceModule::neroAnchorConfigure(PathShifter & path_shifter) const
+{
+  // the curve of every line of a re-plan: symmetric along the path (no longitudinal acceleration assumed), so the join found with it
+  // is the join that is drawn
+  path_shifter.setVelocity(getEgoSpeed());
+  path_shifter.setLongitudinalAcceleration(0.0);
+  path_shifter.setLateralAccelerationLimit(helper_->getLateralMaxAccelLimit());
+}
+
+void StaticObstacleAvoidanceModule::neroAnchorSetBase(PathShifter & path_shifter, const double base) const
+{
+  const auto & pts = avoid_data_.reference_path.points;
+  if (pts.size() < 2) {
+    return;
+  }
+  ShiftLine passed;  // the path shifter takes its base offset from a line it removes as passed (as neroFreezeShift does)
+  passed.start = pts.at(0).point.pose;
+  passed.end = pts.at(1).point.pose;
+  passed.start_shift_length = base;
+  passed.end_shift_length = base;
+  path_shifter.setShiftLines(ShiftLineArray{passed});
+  path_shifter.removeBehindShiftLineAndSetBaseOffset(pts.size() - 1);
+}
+
+bool StaticObstacleAvoidanceModule::neroAnchorApply(PathShifter & path_shifter, const AvoidLineArray & lines) const
+{
+  if (lines.empty() || nero_ra_.mode == 0) {
+    return false;
+  }
+  ShiftLineArray future;
+  if (nero_ra_.mode == 1) {
+    for (const auto & sl : path_shifter.getShiftLines()) {
+      if (std::any_of(nero_ra_.keep_ids.begin(), nero_ra_.keep_ids.end(), [&sl](const auto & id) { return id == sl.id; })) {
+        future.push_back(sl);
+      }
+    }
+    if (future.size() != nero_ra_.keep_ids.size()) {
+      return false;
+    }
+  } else {
+    neroAnchorConfigure(path_shifter);
+    neroAnchorSetBase(path_shifter, nero_ra_.base);
+  }
+  for (const auto & l : lines) {
+    future.push_back(l);
+  }
+  path_shifter.setShiftLines(future);
+  return true;
+}
+
+void StaticObstacleAvoidanceModule::neroAnchorResolve(AvoidancePlanningData & data) const
+{
+  using utils::static_obstacle_avoidance::findPathIndexFromArclength;
+  constexpr double RATE_EPS = 0.004;  // [m/m] lateral rate of the path at ego below which the robot is not moving sideways
+  constexpr double PIN_MIN = 1.5;     // [m] a fresh line end nearer than this is not a place the plan can still be changed for
+  nero_ra_ = NeroAnchor{};
+  const auto & ref = data.reference_path.points;
+  const auto & arc = data.arclength_from_ego;
+  const size_t N = ref.size();
+  const size_t i0 = data.ego_closest_path_index;
+  const auto plan = data.new_shift_line;  // the fresh plan (empty: it does not differ from the registered one)
+  const auto reg = path_shifter_.getShiftLines();
+  const std::string why = generator_.neroAnchorWhy();
+  const double ego_lat = N >= 2 ? nero_mu::calcLateralOffset(ref, getEgoPosition()) : 0.0;
+  const auto line_str = [](const AvoidLineArray & ls, const size_t n) {
+    std::ostringstream ss;
+    ss << std::fixed << std::setprecision(2);
+    for (size_t k = 0; k < std::min(n, ls.size()); ++k) {
+      ss << " [" << ls.at(k).start_longitudinal << ">" << ls.at(k).end_longitudinal << " " << ls.at(k).start_shift_length << ">"
+         << ls.at(k).end_shift_length << "]";
+    }
+    if (ls.size() > n) ss << " +" << ls.size() - n;
+    return ss.str();
+  };
+  if (plan.empty() || N < 8 || arc.size() != N || i0 + 4 >= N) {
+    data.new_shift_line.clear();
+    double y = 0.0, r = 0.0;
+    if (N >= 8 && arc.size() == N && i0 + 1 < N && helper_->isInitialized()) {
+      y = helper_->getEgoShift();
+      r = (helper_->getShift(ref.at(i0 + 1).point.pose.position) - helper_->getShift(ref.at(i0).point.pose.position)) /
+          std::max(arc.at(i0 + 1) - arc.at(i0), 1.0e-3);
+    }
+    RCLCPP_INFO(
+      getLogger(), "[NERO_SOA_ANCHOR] ego shift %.2f rate %.3f/m (%.2f m/s) lat %.2f | reg %zu line(s) base %.2f | plan kept", y, r,
+      r * getEgoSpeed(), ego_lat, reg.size(), path_shifter_.getBaseOffset());
+    return;
+  }
+  // the registered plan on this cycle's reference path: the state at ego
+  ShiftedPath cur;
+  const size_t i1 = i0 + 1;
+  const double ds = std::max(arc.at(i1) - arc.at(i0), 1.0e-3);
+  const auto fail = [&](const std::string & what, const double y, const double r) {
+    data.new_shift_line.clear();
+    nero_ra_ = NeroAnchor{};
+    RCLCPP_INFO(
+      getLogger(),
+      "[NERO_SOA_ANCHOR] ego shift %.2f rate %.3f/m (%.2f m/s) lat %.2f | reg %zu line(s) base %.2f | re-plan (%s) NOT joined: %s; "
+      "the registered plan stays | fresh:%s",
+      y, r, r * getEgoSpeed(), ego_lat, reg.size(), path_shifter_.getBaseOffset(), why.c_str(), what.c_str(),
+      line_str(plan, 3).c_str());
+  };
+  if (!path_shifter_.generate(&cur, true, SHIFT_TYPE::SPLINE) || cur.shift_length.size() != N) {
+    fail("the registered path cannot be drawn", 0.0, 0.0);
+    return;
+  }
+  const double y0 = cur.shift_length.at(i0);
+  const double y1 = cur.shift_length.at(i1);
+  const double rate = (y1 - y0) / ds;
+  const double th = std::max(parameters_->lateral_execution_threshold, 0.5 * parameters_->quantize_size) + 0.005;
+  const double ego_lin = helper_->getEgoLinearShift();
+  const auto level_at = [&plan, ego_lin](const double lon) {  // the fresh plan at a distance from ego
+    double level = ego_lin;
+    for (const auto & l : plan) {
+      if (lon <= l.start_longitudinal) return level;
+      if (lon < l.end_longitudinal) {
+        const double len = std::max(l.end_longitudinal - l.start_longitudinal, 1.0e-3);
+        return level + (l.end_shift_length - level) * (lon - l.start_longitudinal) / len;
+      }
+      level = l.end_shift_length;
+    }
+    return level;
+  };
+  const auto set_start = [&](AvoidLine & l, const size_t idx) {
+    l.start_idx = idx;
+    l.start = ref.at(idx).point.pose;
+    l.start_longitudinal = arc.at(idx);
+  };
+  const auto set_end = [&](AvoidLine & l, const size_t idx) {
+    l.end_idx = idx;
+    l.end = ref.at(idx).point.pose;
+    l.end_longitudinal = arc.at(idx);
+  };
+  const auto hold_line = [&](const size_t from_idx, const double level) -> std::optional<AvoidLine> {
+    const size_t to_idx = findPathIndexFromArclength(arc, arc.at(from_idx) + 3.0);
+    if (to_idx < from_idx + 3 || to_idx >= N) return std::nullopt;
+    AvoidLine h;
+    set_start(h, from_idx);
+    set_end(h, to_idx);
+    h.start_shift_length = level;
+    h.end_shift_length = level;
+    return h;
+  };
+  // one line from path point ia to ie ending at amp, drawn by the path shifter as the re-plan will be: its shift per unit at ego's
+  // path point and the next one
+  // (fb18: the path shifter's own curve evaluated at the two points, PathShifter::calc_base_lengths with no longitudinal
+  // acceleration + its spline through the base points, instead of a path shifter copy and a whole path drawn per step of the
+  // search below. The result of the join is still proven with the real path shifter, once, further down)
+  const double unit_v = std::abs(getEgoSpeed());
+  const double unit_acc = helper_->getLateralMaxAccelLimit();
+  const auto unit = [&](const size_t ia, const size_t ie, const double amp, double & f0, double & f1) {
+    if (std::abs(amp) < 1.0e-4 || ie < ia + 3 || ia >= i0 || ie <= i1) return false;
+    const double S = arc.at(ie) - arc.at(ia);
+    const double L = std::abs(amp);
+    if (S < 1.0e-3) return false;
+    std::vector<double> lon{0.0, 0.25 * S, 0.75 * S, S};
+    std::vector<double> lat{0.0, amp / 12.0, 11.0 * amp / 12.0, amp};
+    if (unit_v >= 1.0e-5) {
+      const double T = S / unit_v;
+      if (8.0 * L / (T * T) >= unit_acc) {
+        const double tj = T / 2.0 - 2.0 * L / (unit_acc * T);
+        const double ta = 4.0 * L / (unit_acc * T) - T / 2.0;
+        const double jerk = (2.0 * unit_acc * unit_acc * T) / (unit_acc * T * T - 4.0 * L);
+        if (!(tj < 0.0 || ta < 0.0 || jerk < 0.0 || tj / T < 0.1)) {
+          const double sg = amp > 0.0 ? 1.0 : -1.0;
+          const double tj3 = tj * tj * tj, ta2_tj = ta * ta * tj, ta_tj2 = ta * tj * tj;
+          const double s1 = std::min(tj * unit_v, S);
+          const double s2 = std::min(s1 + ta * unit_v, S);
+          const double s3 = std::min(s2 + tj * unit_v, S);
+          const double s5 = std::min(s3 + tj * unit_v, S);
+          const double s6 = std::min(s5 + ta * unit_v, S);
+          const double s7 = std::min(s6 + tj * unit_v, S);
+          lon = {0.0, s1, s2, s3, s5, s6, s7};
+          lat = {
+            0.0,
+            sg * (1.0 / 6.0 * jerk * tj3),
+            sg * (1.0 / 6.0 * jerk * tj3 + 0.5 * jerk * ta_tj2 + 0.5 * jerk * ta2_tj),
+            sg * (jerk * tj3 + 1.5 * jerk * ta_tj2 + 0.5 * jerk * ta2_tj),
+            sg * (11.0 / 6.0 * jerk * tj3 + 2.5 * jerk * ta_tj2 + 0.5 * jerk * ta2_tj),
+            sg * (11.0 / 6.0 * jerk * tj3 + 3.0 * jerk * ta_tj2 + jerk * ta2_tj),
+            sg * (2.0 * jerk * tj3 + 3.0 * jerk * ta_tj2 + jerk * ta2_tj)};
+        }
+      }
+    }
+    for (size_t n = 1; n < lon.size(); ++n) {
+      if (lon.at(n) <= lon.at(n - 1) + 1.0e-6) return false;  // (the path shifter's spline needs increasing base points)
+    }
+    const std::vector<double> query{arc.at(i0) - arc.at(ia), arc.at(i1) - arc.at(ia)};
+    const auto got = autoware::interpolation::spline(lon, lat, query);
+    if (got.size() != 2) return false;
+    f0 = got.at(0) / amp;
+    f1 = got.at(1) / amp;
+    return std::isfinite(f0) && std::isfinite(f1);
+  };
+
+  AvoidLineArray lines;
+  std::string how;
+  size_t carrier_relaxed = 0;
+  const double s_p = std::max(getEgoSpeed() * parameters_->min_prepare_time, parameters_->min_prepare_distance);
+  const size_t idx_p = std::max(findPathIndexFromArclength(arc, s_p + 0.05), i0 + 1);
+
+  // 1 keep: the registered lines before the first place the plans differ (one after the other, nothing stacked on them) that still
+  // end on this cycle's needs stay as they are, started or not; the fresh lines beyond the last of them replace the rest
+  {
+    const double diff_lon = generator_.neroAnchorDiffLon();
+    std::vector<ShiftLine> kept;
+    for (const auto & k : reg) {  // (in the order of their starts)
+      if (k.end_idx <= i0) continue;
+      if (k.end_idx >= N || (!kept.empty() && k.start_idx < kept.back().end_idx)) break;
+      const double lon_k = arc.at(k.end_idx);
+      // the change lies on this line, or at its end (fb16: n24 sim 1125-223906, 31.04-31.84 s, "the fresh plan is at 1.00 at
+      // 8.66 m, the registered path at 0.90": the registered rise [.. 0.58>0.90] ending at 8.67 m was kept (0.90 within 0.1 of the
+      // merged needs 0.99 there), the fresh line after it was started at its 0.90, and the re-plan was the registered plan again:
+      // nine cycles of re-plans that changed nothing, c4df's 1.00 never registered)
+      if (lon_k >= diff_lon - 0.5) break;
+      const double level = cur.shift_length.at(k.end_idx);  // what the path really has at its end
+      // (fb18: on a steep line one path step is worth slope x 0.3 m of level, as in the generator's comparison)
+      const double k_slope = k.end_idx > k.start_idx && k.start_idx < N
+                               ? std::abs(k.end_shift_length - k.start_shift_length) /
+                                   std::max(arc.at(k.end_idx) - arc.at(k.start_idx), 0.3)
+                               : 0.0;
+      const double k_steep = std::max(0.0, k_slope - 0.2) * 0.6;
+      // (on the fresh plan's lines, or on the merged needs they were trimmed from: the trim combines lines within 0.5 m)
+      if (
+        std::abs(level - k.end_shift_length) >= 0.02 ||
+        (std::abs(level - level_at(lon_k)) >= th + k_steep &&
+         std::abs(level - generator_.neroAnchorEnvelope(k.end_idx, level_at(lon_k))) >= std::max(th, 0.1) + k_steep)) {
+        break;
+      }
+      kept.push_back(k);
+    }
+    while (!kept.empty()) {
+      const auto & last = kept.back();
+      const double lon_k = arc.at(last.end_idx);
+      // nothing else registered reaches into the kept span
+      const bool overlap = std::any_of(reg.begin(), reg.end(), [&](const auto & sl) {
+        const bool is_kept =
+          std::any_of(kept.begin(), kept.end(), [&sl](const auto & k) { return k.id == sl.id; });
+        return !is_kept && sl.start_idx < last.end_idx && sl.end_idx > i0;
+      });
+      if (overlap) {
+        kept.pop_back();
+        continue;
+      }
+      for (const auto & l : plan) {
+        if (l.end_longitudinal > lon_k + 1.0) lines.push_back(l);
+      }
+      if (!lines.empty() && lines.front().start_idx < last.end_idx) set_start(lines.front(), last.end_idx);
+      if (lines.empty()) {
+        if (const auto h = hold_line(last.end_idx, last.end_shift_length)) lines.push_back(h.value());
+      }
+      if (!lines.empty()) {
+        lines.front().start_shift_length = last.end_shift_length;
+        nero_ra_.mode = 1;
+        for (const auto & k : kept) nero_ra_.keep_ids.push_back(k.id);
+        nero_ra_.keep_until_lon = lon_k;
+        nero_ra_.n_chord = 0;
+        how = "the registered line(s) before the change stay";
+      }
+      break;
+    }
+  }
+  // 2 rest. fb18: a robot that stands (v < 0.3 m/s, helper isVehicleStopped) on a gentle slope of its path has no lateral
+  // speed either (rate x v): it joins from rest too. c02 sim 1126-105036, 63.29 s: v 0.00, "rate 0.041 /m" (the registered line
+  // started 0.03 m ahead, the path already rose between ego's two path points), read as lateral motion: a carrier from behind
+  // the standing robot, then stop-carriers, a new plan every second. Up to 0.09 /m: the path at the next point (0.3 m) is then
+  // within the 0.03 m of the proof below.
+  const bool standing = helper_->isVehicleStopped() && std::abs(rate) <= 0.09;
+  const bool at_rest = std::abs(rate) < RATE_EPS || standing;
+  if (nero_ra_.mode == 0 && at_rest) {
+    bool altered = false;  // the fresh plan's lines were changed for the join (else they are registered as the generator made them)
+    for (const auto & l : plan) {
+      if (l.end_longitudinal > 1.0) {
+        lines.push_back(l);
+      } else if (std::abs(l.end_shift_length - y0) >= 0.02) {
+        altered = true;
+      }
+    }
+    while (!lines.empty()) {
+      auto & f = lines.front();
+      if (helper_->isEnoughPrepareDistance(f.start_longitudinal)) break;
+      // fb18 (mk_n23_1425_rear sim 1126-104413, 8.93 s): a first line that would START a move away from the lane centre within
+      // the minimum prepare distance while the robot moves is not made to fit (its start pushed to the minimum prepare
+      // distance, 4.5 m for 1.8 m at 0.96 m/s): it is not registered, as the stock trim drops it ("prevent sudden steering").
+      // The robot goes on along its registered path, obstacle_stop slows it for what is in the way, and the line is planned
+      // once it has room (v above ~1 m/s: the outline starts at v x max_prepare_time) or the robot stands (close-distance
+      // avoidance; isEnoughPrepareDistance is true for a stopped robot). There the early start moved the robot 0.7 m out at
+      // 0.6-1.0 m/s before the car in the next lane (c3b7) was near enough for NERO_SOA_SIDE to hold it inside its lane; the car
+      // stood inside and waited. A line toward the centre, a hold, or a line that only replaces a registered move out
+      // (the registered path is not under it at its end) is fitted as before.
+      {
+        const double reg_end = helper_->getLinearShift(f.end.position);
+        const double out = std::abs(f.end_shift_length) - std::abs(y0);
+        const double under_reg = f.end_shift_length * reg_end > 0.0
+                                   ? std::abs(f.end_shift_length) - std::abs(reg_end)
+                                   : std::abs(f.end_shift_length);
+        if (out >= th && under_reg >= th) {
+          char b[240];
+          std::snprintf(
+            b, sizeof(b),
+            "the first line [%.2f>%.2f %.2f>%.2f] would start a move away from the centre within the minimum prepare "
+            "distance while the robot moves (v %.2f): not registered (stock: prevent sudden steering), it is planned with "
+            "room or from a stand",
+            f.start_longitudinal, f.end_longitudinal, y0, f.end_shift_length, getEgoSpeed());
+          fail(std::string(b), y0, rate);
+          return;
+        }
+      }
+      if (f.end_longitudinal >= arc.at(idx_p) + 1.0 && f.end_idx >= idx_p + 3) {
+        set_start(f, idx_p);  // "prevent sudden steering": no earlier than the minimum prepare distance
+        altered = true;
+        break;
+      }
+      if (std::abs(f.end_shift_length - y0) < th) {
+        lines.erase(lines.begin());  // a hold that near: nothing to do there
+        altered = true;
+        continue;
+      }
+      if (f.start_idx <= i0) {
+        set_start(f, i0 + 1);  // a level change that near: the comfort check below judges it
+        altered = true;
+      }
+      break;
+    }
+    if (lines.empty()) {
+      if (const auto h = hold_line(idx_p, y0)) lines.push_back(h.value());
+      altered = true;
+    }
+    if (!lines.empty()) {
+      if (std::abs(lines.front().start_shift_length - y0) >= 0.02) altered = true;
+      lines.front().start_shift_length = y0;
+      nero_ra_.mode = 2;
+      nero_ra_.base = y0;
+      // fb18: lines registered as the generator made them keep the stock memory (their raw parents); a chord only for a first
+      // line the join changed. c02 62.89 s / mk_s19_turn sim 1126-104033, 18.62 s: the unchanged first line [0.82>4.42
+      // 0.00>2.50] got a chord, its raw parents were capped under it, the next cycle's merged needs read 2.29 at 4.42 m against
+      // the registered 2.50, and the plan was registered again every cycle of the stand (2.50 -> 2.30 -> 2.10 -> 2.50 ...)
+      nero_ra_.n_chord = altered ? 1 : 0;
+      how = standing && std::abs(rate) >= RATE_EPS ? "from rest (the robot stands)" : "from rest";
+    }
+  }
+  // 3 / 4 in motion: a carrier through ego's shift and rate
+  if (nero_ra_.mode == 0 && !at_rest) {
+    if (i0 < 4) {
+      fail("no path behind the robot for a carrier", y0, rate);
+      return;
+    }
+    // the first place ahead where the fresh plan needs a level (the end of the fill from ego is none: the linear plan holds ego's
+    // linear level for the prepare distance there, which a robot in motion is not at)
+    size_t pin = plan.size();
+    for (size_t k = 0; k < plan.size(); ++k) {
+      if (plan.at(k).end_longitudinal >= PIN_MIN && plan.at(k).end_idx > i1 + 3 && generator_.neroAnchorIsNeed(plan.at(k))) {
+        pin = k;
+        break;
+      }
+    }
+    const size_t back_min = std::max<size_t>(2, findPathIndexFromArclength(arc, -25.0));
+    // 3 carrier to the fresh plan's first needed level
+    if (pin < plan.size() && back_min + 1 < i0) {
+      // the S-curve from a path point behind ego, through ego's shift and rate, to the level `target` at path point ie
+      const auto carrier_to = [&](const size_t ie, const double target, AvoidLine & c) {
+        const double dy = target - y0;
+        if (ie + 1 >= N || ie <= i1 + 3 || dy * rate <= 0.0 || std::abs(dy) < 0.02) return false;
+        // its slope at ego when it starts at path point ia: it grows as ia goes back along the path
+        const auto slope = [&](const size_t ia, const double amp, double & full) {
+          double f0 = 0.0, f1 = 0.0;
+          if (!unit(ia, ie, amp, f0, f1)) return std::numeric_limits<double>::quiet_NaN();
+          if (f0 > 0.9) return std::copysign(1.0e6, dy);  // ego at the very end of such a line: past the steepest it can be
+          full = dy / (1.0 - f0);
+          return full * (f1 - f0) / ds;
+        };
+        size_t far = back_min, nearest = i0 - 1;
+        double d_far = 0.0, d_near = 0.0;
+        const double s_near = slope(nearest, dy, d_near);
+        const double s_far = slope(far, dy, d_far);
+        if (!std::isfinite(s_near) || !std::isfinite(s_far) || std::abs(s_far) < std::abs(rate)) return false;
+        size_t best = nearest;
+        if (std::abs(s_near) < std::abs(rate)) {
+          while (nearest - far > 1) {
+            const size_t mid = (far + nearest) / 2;
+            double d_mid = 0.0;
+            const double s_mid = slope(mid, dy, d_mid);
+            if (!std::isfinite(s_mid) || std::abs(s_mid) >= std::abs(rate)) {
+              far = mid;
+            } else {
+              nearest = mid;
+            }
+          }
+          double d_a = 0.0, d_b = 0.0;
+          const double s_a = slope(far, dy, d_a);
+          const double s_b = slope(nearest, dy, d_b);
+          best = (std::isfinite(s_a) && std::abs(s_a - rate) < std::abs(s_b - rate)) ? far : nearest;
+        }
+        double full = 0.0;
+        double s_best = slope(best, dy, full);
+        if (std::isfinite(s_best)) s_best = slope(best, full, full);  // the curve of the real size
+        if (
+          !std::isfinite(s_best) || std::abs(full) > 5.0 ||
+          std::abs(s_best - rate) > std::max(RATE_EPS, 0.15 * std::abs(rate))) {
+          return false;
+        }
+        set_start(c, best);
+        set_end(c, ie);
+        c.start_shift_length = target - full;
+        c.end_shift_length = target;
+        return true;
+      };
+      size_t ie = plan.at(pin).end_idx;
+      double target = plan.at(pin).end_shift_length;
+      // an S-curve that ends at a level dy further on has, at a distance e before its end, at most the slope 3 dy / e (its last
+      // quarter): the level is reached with the rate y0' only up to e = 3 |dy| / |y0'|. A nearer level than the place asks is
+      // reached there (the lateral motion ends at the level, on the level's side of the place; the plan holds it from there)
+      bool tail = false;
+      {
+        const double dy = target - y0;
+        const double e_lim = 3.0 * std::abs(dy) / (1.03 * std::abs(rate));
+        if (dy * rate > 0.0 && arc.at(ie) > e_lim) {
+          const size_t it = findPathIndexFromArclength(arc, e_lim);
+          ie = (e_lim >= PIN_MIN && it > i1 + 4) ? it - 1 : N;
+          tail = true;
+        }
+      }
+      AvoidLine c = plan.at(pin);
+      bool ok = ie < N && carrier_to(ie, target, c);
+      // back toward the centre and sharper than the jerk limit: the carrier ends further on, where the sharpest comfortable one
+      // ends, on the fresh plan's level there (the jerk-limited return from the robot's shift and rate, no slower)
+      for (int it = 0; ok && !tail && it < 4; ++it) {
+        const bool toward = c.end_shift_length * y0 >= -1.0e-6 && std::abs(c.end_shift_length) < std::abs(y0) - 0.02;
+        if (!toward || helper_->isComfortable(AvoidLineArray{c})) break;
+        const double span = c.end_longitudinal - c.start_longitudinal;
+        const double need =
+          helper_->getSharpAvoidanceDistance(std::abs(c.end_shift_length - c.start_shift_length)) * 1.05 + 0.3;
+        const double e_new = c.end_longitudinal + std::max(need - span, 1.0);
+        if (e_new > arc.back() - 1.0) break;
+        const size_t ie_new = findPathIndexFromArclength(arc, e_new);
+        const double lv = level_at(arc.at(ie_new));
+        const double target_new = (lv * y0 >= -1.0e-6 && std::abs(lv) < std::abs(y0) - 0.02) ? lv : target;
+        AvoidLine c2 = plan.at(pin);
+        if (!carrier_to(ie_new, target_new, c2)) break;
+        c = c2;
+        ++carrier_relaxed;
+      }
+      if (ok) {
+        c.id = generate_uuid();
+        c.parent_ids.clear();
+        for (const auto & l : plan) {
+          if (l.end_longitudinal <= c.end_longitudinal + 1.0) {
+            c.parent_ids = utils::static_obstacle_avoidance::concatParentIds(c.parent_ids, l.parent_ids);
+          }
+        }
+        lines.push_back(c);
+        for (const auto & l : plan) {
+          if (l.end_longitudinal > c.end_longitudinal + 1.0) lines.push_back(l);
+        }
+        nero_ra_.mode = 3;
+        nero_ra_.base = c.start_shift_length;
+        nero_ra_.n_chord = 1;
+        how = tail ? "carrier to the plan's level (reached before its place)" : "carrier to the plan";
+      }
+    }
+    // 4 carrier to a stop of the lateral motion
+    if (nero_ra_.mode == 0) {
+      const double v = std::max(helper_->getAvoidanceEgoSpeed(), 0.5);
+      const double jerk = std::max(helper_->getLateralMaxJerkLimit(), 0.1);
+      // (+ 8 % and one path step: the ends fall on path points, and the comfort check must still read it as within the jerk limit)
+      double e_c = std::clamp(2.0 * v * std::sqrt(std::abs(rate) * v / jerk) * 1.08 + 0.3, 2.0, 15.0);
+      e_c = std::min({e_c, -arc.at(2) - 0.1, arc.at(N - 3) - 0.1});
+      size_t ia = e_c > 1.0 ? findPathIndexFromArclength(arc, -e_c) : i0;
+      size_t ie = e_c > 1.0 ? findPathIndexFromArclength(arc, e_c) : i0;
+      if (ia + 2 > i0) ia = i0 - 2;
+      if (ie < i1 + 3) ie = i1 + 3;
+      double f0 = 0.0, f1 = 0.0, full = rate * std::max(e_c, 1.0);
+      bool ok = e_c > 1.0 && ie + 1 < N && unit(ia, ie, full, f0, f1) && std::abs(f1 - f0) > 1.0e-6;
+      if (ok) {
+        full = rate * ds / (f1 - f0);
+        ok = unit(ia, ie, full, f0, f1) && std::abs(f1 - f0) > 1.0e-6;  // the curve of the real size
+      }
+      if (ok) {
+        full = rate * ds / (f1 - f0);
+        AvoidLine c;
+        set_start(c, ia);
+        set_end(c, ie);
+        c.start_shift_length = y0 - full * f0;
+        c.end_shift_length = c.start_shift_length + full;
+        const double lon_c = arc.at(ie);
+        for (const auto & l : plan) {
+          if (l.end_longitudinal > lon_c + 1.0) {
+            lines.push_back(l);
+          } else {
+            c.parent_ids = utils::static_obstacle_avoidance::concatParentIds(c.parent_ids, l.parent_ids);
+          }
+        }
+        lines.insert(lines.begin(), c);
+        nero_ra_.mode = 4;
+        nero_ra_.base = c.start_shift_length;
+        nero_ra_.n_chord = std::min<size_t>(2, lines.size());
+        how = "carrier to a stop";
+      }
+    }
+  }
+  if (nero_ra_.mode == 0 || lines.empty()) {
+    fail("no join through the robot's shift and rate", y0, rate);
+    return;
+  }
+  // the lines in sequence: each starts where the one before ends, at its level
+  for (size_t k = 1; k < lines.size();) {
+    auto & l = lines.at(k);
+    const auto & b = lines.at(k - 1);
+    if (l.start_idx < b.end_idx) set_start(l, b.end_idx);
+    l.start_shift_length = b.end_shift_length;
+    if (l.end_idx < l.start_idx + 3) {
+      lines.erase(lines.begin() + static_cast<std::ptrdiff_t>(k));
+      continue;
+    }
+    ++k;
+  }
+  // a line back toward the centre sharper than the jerk limit: as sharp as comfort allows, to the fresh plan's level there
+  size_t relaxed = carrier_relaxed;
+  for (size_t k = (nero_ra_.mode >= 3 ? 1 : 0); k < lines.size(); ++k) {
+    auto & l = lines.at(k);
+    const bool toward = l.start_shift_length * l.end_shift_length >= -1.0e-6 &&
+                        std::abs(l.end_shift_length) < std::abs(l.start_shift_length) - 0.02;
+    if (!toward || helper_->isComfortable(AvoidLineArray{l})) continue;
+    double end_lon = l.end_longitudinal;
+    double level = l.end_shift_length;
+    for (int it = 0; it < 3; ++it) {
+      const double need = helper_->getSharpAvoidanceDistance(std::abs(level - l.start_shift_length)) * 1.05 + 0.3;
+      if (l.start_longitudinal + need <= end_lon) break;
+      end_lon = l.start_longitudinal + need;
+      const double lv = level_at(end_lon);
+      if (lv * l.start_shift_length >= -1.0e-6 && std::abs(lv) < std::abs(l.start_shift_length)) level = lv;
+    }
+    if (end_lon > arc.back() - 1.0) continue;  // no room on the path: the comfort check judges it
+    set_end(l, findPathIndexFromArclength(arc, end_lon));
+    l.end_shift_length = level;
+    while (k + 1 < lines.size() && lines.at(k + 1).end_longitudinal <= l.end_longitudinal + 1.0) {
+      l.parent_ids = utils::static_obstacle_avoidance::concatParentIds(l.parent_ids, lines.at(k + 1).parent_ids);
+      lines.erase(lines.begin() + static_cast<std::ptrdiff_t>(k + 1));
+    }
+    if (k + 1 < lines.size()) {
+      if (lines.at(k + 1).start_idx < l.end_idx) set_start(lines.at(k + 1), l.end_idx);
+      lines.at(k + 1).start_shift_length = l.end_shift_length;
+    }
+    nero_ra_.n_chord = std::max(nero_ra_.n_chord, k + 1);
+    ++relaxed;
+  }
+  // a line that brings the robot back to the lane centre is never shorter than the module's nominal return from its level
+  // (getMaxAvoidanceDistance, what every outline's own return has), up to the return dead line. The max of a hold and of the tail
+  // of a nearer target's return gives a short late return; at low speed it is "comfortable" and the robot comes back sooner
+  // than the car does, beside parked cars that are not targets (mk_great s1 sim 1125-220152: an 8 m return at 1 m/s, d7d5 passed
+  // at 0.20 m; the car's return there is 15 m)
+  for (size_t k = (nero_ra_.mode >= 3 ? 1 : 0); k < lines.size(); ++k) {
+    auto & l = lines.at(k);
+    if (std::abs(l.end_shift_length) >= 0.1 || std::abs(l.start_shift_length) < 0.2) continue;
+    const double nominal = helper_->getMaxAvoidanceDistance(std::abs(l.start_shift_length));
+    const double end_max = std::min(arc.back() - 1.0, data.to_return_point);
+    const double end_lon = std::min(l.start_longitudinal + nominal, end_max);
+    if (end_lon <= l.end_longitudinal + 0.5) continue;
+    set_end(l, findPathIndexFromArclength(arc, end_lon));
+    while (k + 1 < lines.size() && lines.at(k + 1).end_longitudinal <= l.end_longitudinal + 1.0) {
+      l.parent_ids = utils::static_obstacle_avoidance::concatParentIds(l.parent_ids, lines.at(k + 1).parent_ids);
+      lines.erase(lines.begin() + static_cast<std::ptrdiff_t>(k + 1));
+    }
+    if (k + 1 < lines.size()) {
+      if (lines.at(k + 1).start_idx < l.end_idx) set_start(lines.at(k + 1), l.end_idx);
+      lines.at(k + 1).start_shift_length = l.end_shift_length;
+    }
+    nero_ra_.n_chord = std::max(nero_ra_.n_chord, k + 1);
+    ++relaxed;
+  }
+  // The whole joined plan is registered, or nothing (fb12). fb7-fb11 left the lines beyond the first uncomfortable one "for a
+  // later cycle" while every registered line was replaced: n24 s1 (sim 1125-222241) 21.41 s registered "[0.15>6.15 0.10>0.00]"
+  // alone, a4d5's registered avoidance [1.22>19.95 0.10>1.90] was gone, a4d5 fell to NEED_DECELERATION and the module braked to
+  // a stand (-2.02 m/s2). Now a line the re-plan made that is not comfortable makes the whole re-plan not comfortable (below):
+  // the registered plan stays.
+  const size_t cut = 0;
+  for (const auto & l : lines) {
+    if (l.end_idx < l.start_idx + 3 || l.end_idx >= N) {
+      fail("a line of the joined plan is too short for the path shifter", y0, rate);
+      return;
+    }
+  }
+  // which lines the re-plan made or changed: the anchor's own and everything from the first place the plans differ. The lines
+  // between are registered lines re-registered at their levels: like the stock module, the comfort and drivable-bound checks judge
+  // the new ones only (a registered line is not judged again at another speed)
+  {
+    const double diff_lon = generator_.neroAnchorDiffLon();
+    bool from_diff = false;
+    nero_ra_.comfortable = true;
+    for (size_t k = 0; k < lines.size(); ++k) {
+      from_diff = from_diff || lines.at(k).end_longitudinal >= diff_lon - 0.5;
+      const bool made = k < nero_ra_.n_chord || from_diff;
+      nero_ra_.made.push_back(made ? 1 : 0);
+      if (made && !helper_->isComfortable(AvoidLineArray{lines.at(k)})) nero_ra_.comfortable = false;
+    }
+  }
+  // the proof: the path shifter with the joined plan gives the registered path's shift at ego's path point and the next one
+  {
+    const auto keep = nero_ra_;
+    PathShifter t = path_shifter_;
+    ShiftedPath sp;
+    const bool drawn = neroAnchorApply(t, lines) && t.generate(&sp, true, SHIFT_TYPE::SPLINE) && sp.shift_length.size() == N;
+    const double e0 = drawn ? sp.shift_length.at(i0) - y0 : 0.0;
+    const double e1 = drawn ? sp.shift_length.at(i1) - y1 : 0.0;
+    if (!drawn || std::abs(e0) > 0.03 || std::abs(e1) > 0.03) {
+      char b[160];
+      std::snprintf(
+        b, sizeof(b), "the joined plan (%s) is %.3f / %.3f m off the registered path at ego", how.c_str(), e0, e1);
+      fail(drawn ? std::string(b) : std::string("the joined plan cannot be drawn"), y0, rate);
+      return;
+    }
+    // and it never takes a registered level away that this cycle's needs still have: at the end of every registered line ahead,
+    // the joined path is not under what is both registered and needed there by more than half of it (and 0.5 m: the trim's own
+    // tolerance, and an S-curve runs up to 1/6 of its size under its chord) (n24 s1 sim 1125-222241: a4d5's registered 1.90 at
+    // 19.95 m replaced by a plan at 0.00 there while the needs were 1.60)
+    for (const auto & sl : reg) {
+      if (sl.end_idx <= i1 + 3 || sl.end_idx >= N) continue;
+      const double need = generator_.neroAnchorEnvelope(sl.end_idx, sp.shift_length.at(sl.end_idx));
+      const double reg_level = cur.shift_length.at(sl.end_idx);
+      const double keep_level = std::abs(need) < std::abs(reg_level) ? need : reg_level;  // what is both registered and needed
+      const double got = sp.shift_length.at(sl.end_idx);
+      if (std::abs(keep_level) - (keep_level * got > 0.0 ? std::abs(got) : 0.0) > std::max(0.5, 0.5 * std::abs(keep_level))) {
+        char b[200];
+        std::snprintf(
+          b, sizeof(b),
+          "the joined plan (%s) is at %.2f at %.1f m where %.2f is registered and this cycle's needs are %.2f", how.c_str(), got,
+          arc.at(sl.end_idx), reg_level, need);
+        fail(std::string(b), y0, rate);
+        return;
+      }
+    }
+    nero_ra_ = keep;
+    nero_ra_.stamp_base = path_shifter_.getBaseOffset();
+    for (const auto & sl : reg) nero_ra_.stamp_ids.push_back(sl.id);
+    RCLCPP_INFO(
+      getLogger(),
+      "[NERO_SOA_ANCHOR] ego shift %.2f rate %.3f/m (%.2f m/s) lat %.2f | reg %zu line(s) base %.2f | re-plan (%s) mode %d %s: base "
+      "%.2f, at ego %+.3f / %+.3f m, lines:%s | relaxed %zu cut %zu | fresh:%s",
+      y0, rate, rate * getEgoSpeed(), ego_lat, reg.size(), path_shifter_.getBaseOffset(), why.c_str(), nero_ra_.mode, how.c_str(),
+      nero_ra_.mode == 1 ? path_shifter_.getBaseOffset() : nero_ra_.base, e0, e1, line_str(lines, 4).c_str(), relaxed, cut,
+      line_str(plan, 3).c_str());
+  }
+  data.new_shift_line = lines;
 }
 
 bool StaticObstacleAvoidanceModule::isValidShiftLine(
@@ -8071,8 +8919,17 @@ bool StaticObstacleAvoidanceModule::isValidShiftLine(
                                   parameters_->hard_drivable_bound_margin -
                                   parameters_->max_deviation_from_lane;
 
+    size_t nero_k = 0;
     for (const auto & shift_line : shift_lines) {
-      const size_t start_idx = shift_line.start_idx;
+      // NERO_SOA_REPLAN_ANCHOR: a registered line re-registered as it was is not judged again; a carrier starts behind the robot
+      // (that part is its own past: only what lies ahead is judged)
+      const bool nero_anchor = utils::static_obstacle_avoidance::nero_ra::cfg().on && nero_ra_.mode != 0;
+      const size_t nero_i = nero_k++;
+      if (nero_anchor && nero_i < nero_ra_.made.size() && nero_ra_.made.at(nero_i) == 0) {
+        continue;
+      }
+      const size_t start_idx =
+        nero_anchor ? std::max(shift_line.start_idx, avoid_data_.ego_closest_path_index) : shift_line.start_idx;
       const size_t end_idx = shift_line.end_idx;
 
       if (is_return_shift(
@@ -8333,9 +9190,30 @@ void StaticObstacleAvoidanceModule::updateRTCData()
   }
 
   const auto shift_line = helper_->getMainShiftLine(candidates);
-  if (helper_->getRelativeShiftToPath(shift_line) > 0.0) {
+  double relative_shift = helper_->getRelativeShiftToPath(shift_line);
+  // NERO_SOA_REPLAN_ANCHOR fb16: a re-plan whose every line ends on the registered path (a new shape to the same levels) has no
+  // relative shift; stock then registers no candidate status ("Direction is UNKNOWN") and the module is never activated for it, a
+  // wait that only the next change of the needs ends (n24 sim 1125-223906, 31.04-31.84 s). Its direction is that of its largest
+  // lateral change; the status carries the same isExecutionReady() (safe, comfortable, valid, ready) as any other.
+  if (
+    utils::static_obstacle_avoidance::nero_ra::cfg().on && nero_ra_.mode != 0 && std::abs(relative_shift) < 1.0e-6) {
+    double largest = 0.0;
+    for (const auto & l : candidates) {
+      const double d = l.end_shift_length - l.start_shift_length;
+      if (std::abs(d) > std::abs(largest)) largest = d;
+    }
+    if (std::abs(largest) > 1.0e-6) {
+      relative_shift = std::copysign(1.0e-3, largest);
+      RCLCPP_INFO_THROTTLE(
+        getLogger(), *clock_, 1000,
+        "[NERO_SOA_ANCHOR] RTC: the re-plan ends on the registered path everywhere; its candidate status takes the direction of "
+        "its largest change (%+.2f m)",
+        largest);
+    }
+  }
+  if (relative_shift > 0.0) {
     removePreviousRTCStatusRight();
-  } else if (helper_->getRelativeShiftToPath(shift_line) < 0.0) {
+  } else if (relative_shift < 0.0) {
     removePreviousRTCStatusLeft();
   } else {
     RCLCPP_WARN_STREAM(getLogger(), "Direction is UNKNOWN");
@@ -8347,7 +9225,7 @@ void StaticObstacleAvoidanceModule::updateRTCData()
   const auto & sl_back = candidates.back();
 
   output.path_candidate = data.candidate_path.path;
-  output.lateral_shift = helper_->getRelativeShiftToPath(shift_line);
+  output.lateral_shift = relative_shift;
   output.start_distance_to_path_change = sl_front.start_longitudinal;
   output.finish_distance_to_path_change = sl_back.end_longitudinal;
 

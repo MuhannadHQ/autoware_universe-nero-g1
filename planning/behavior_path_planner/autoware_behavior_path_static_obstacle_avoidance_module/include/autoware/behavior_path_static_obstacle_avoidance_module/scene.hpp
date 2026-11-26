@@ -769,6 +769,27 @@ private:
 
   PathShifter path_shifter_;
 
+  // NERO_SOA_REPLAN_ANCHOR (shift_line_generator.hpp, scene.cpp neroAnchorResolve): how this cycle's fresh plan is joined to the
+  // robot's state and what it replaces
+  struct NeroAnchor
+  {
+    int mode{0};  // 0 none; 1 the registered line(s) in progress are kept; 2 from rest; 3 carrier to the plan; 4 carrier to a stop
+    double base{0.0};  // the path shifter's base offset with the re-plan (modes 2-4)
+    std::vector<UUID> keep_ids{};  // mode 1: the registered lines that stay
+    double keep_until_lon{-1.0e9};  // mode 1: where the last of them ends [m from ego]
+    size_t n_chord{0};  // the first lines made by the anchor
+    double stamp_base{0.0};  // the registered plan the re-plan was joined to
+    std::vector<UUID> stamp_ids{};
+    std::vector<char> made{};  // per new line: 1 = made or changed by the re-plan (the comfort / drivable-bound checks judge these,
+                               // as the stock module judges its new lines only), 0 = a registered line re-registered as it was
+    bool comfortable{true};
+  };
+  mutable NeroAnchor nero_ra_;
+  void neroAnchorResolve(AvoidancePlanningData & data) const;
+  bool neroAnchorApply(PathShifter & path_shifter, const AvoidLineArray & lines) const;
+  void neroAnchorConfigure(PathShifter & path_shifter) const;
+  void neroAnchorSetBase(PathShifter & path_shifter, const double base) const;
+
   RegisteredShiftLineArray left_shift_array_;
 
   RegisteredShiftLineArray right_shift_array_;

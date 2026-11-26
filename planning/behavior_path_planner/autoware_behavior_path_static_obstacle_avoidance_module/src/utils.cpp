@@ -39,6 +39,7 @@
 #include <boost/geometry/algorithms/intersection.hpp>  // NERO_SOA_ENVELOPE_CAP
 #include <boost/geometry/algorithms/union.hpp>
 #include <boost/geometry/algorithms/within.hpp>  // NERO_SOA_INLANE_SOFT
+#include <chrono>
 #include <boost/geometry/geometries/point_xy.hpp>
 
 #include <lanelet2_routing/RoutingGraphContainer.h>
@@ -482,6 +483,24 @@ bool keepApprovedShortcut(
   const double need =
     calcShiftLength(isOnRight(o), o.overhang_points.front().first, 0.5 * vehicle_width + hard + e.approved_tol_m);
   if (approved_shift * need > 0.0 && std::abs(approved_shift) >= std::abs(need)) return true;
+  // NERO_SOA_FRAG_GRID=<close_m> (ownlane 2026-11-25; the 24 Nov 13:01:57 "it stopped" at c4df): the module rounds every shift to
+  // its quantize_size grid (0.1 m), so a need of 0.92 m is only ever answered by a 0.90 m line (read as 0.89 m on the spline path
+  // at the object): the check refused it every cycle and the robot stopped before the car (sim: cmd -3.4, 7 s crawl, two 29 s
+  // stands when the car's box grew 0.81 -> 1.02 m beside the robot). Compared on the same grid with 2 cm for the spline reading;
+  // within close_m of the vehicle's near end (too close for a new line anyway) the cushion approved_tol_m is dropped (the plain
+  // hard margin on the grid). Unset = the car.
+  static const double nero_grid = [] {
+    const char * v = std::getenv("NERO_SOA_FRAG_GRID");
+    return (v != nullptr && *v) ? std::atof(v) : -1.0;
+  }();
+  if (nero_grid > 0.0 && parameters->quantize_size > 1.0e-3 && approved_shift * need > 0.0) {
+    const double q = parameters->quantize_size;
+    const bool close = nero_grid > 1.5 && o.longitudinal - 0.5 * o.length < nero_grid;
+    const double need_m =
+      close ? std::abs(calcShiftLength(isOnRight(o), o.overhang_points.front().first, 0.5 * vehicle_width + hard))
+            : std::abs(need);
+    if (std::abs(approved_shift) >= std::round(need_m / q) * q - 0.02) return true;
+  }
   static rclcpp::Clock steady_clock(RCL_STEADY_TIME);
   RCLCPP_INFO_THROTTLE(
     rclcpp::get_logger(logger_namespace), steady_clock, 1000,
@@ -489,6 +508,18 @@ bool keepApprovedShortcut(
     "feasibility is checked",
     hexId(o.object.object_id).c_str(), approved_shift, need);
   return false;
+}
+
+// NERO_SOA_FRAG_PLAN=1 (ownlane-2 2026-11-25, QUEUE SOAFRAG-SIM, 24 Nov 13:01:57 "it stopped" at c4df): the shift this check asks of a
+// carried vehicle (hard + approved_tol_m), so the generator can plan the vehicle's line to it; 0 when the vehicle is not carried
+double planNeed(
+  const ObjectData & o, const double vehicle_width, const std::shared_ptr<AvoidanceParameters> & parameters)
+{
+  const auto & e = env();
+  if (!e.on || o.overhang_points.empty() || !carried(o)) return 0.0;
+  const auto & op = parameters->object_parameters.at(utils::getHighestProbLabel(o.object.classification));
+  const double hard = o.is_parked ? op.lateral_hard_margin_for_parked_vehicle : op.lateral_hard_margin;
+  return calcShiftLength(isOnRight(o), o.overhang_points.front().first, 0.5 * vehicle_width + hard + e.approved_tol_m);
 }
 
 // soa-1 (NERO_SOA_FRAG_STAND): does the approved shift at this object keep its class hard margin (without approved_tol_m)?
@@ -501,6 +532,15 @@ bool keepsHardMargin(
   const double hard = o.is_parked ? op.lateral_hard_margin_for_parked_vehicle : op.lateral_hard_margin;
   const double need = calcShiftLength(isOnRight(o), o.overhang_points.front().first, 0.5 * vehicle_width + hard);
   if (std::abs(need) < 1.0e-3) return true;
+  // NERO_SOA_FRAG_GRID (ownlane): the same comparison on the module's quantize grid (2 cm for the spline reading)
+  static const bool nero_grid = [] {
+    const char * v = std::getenv("NERO_SOA_FRAG_GRID");
+    return v != nullptr && std::atof(v) > 0.0;
+  }();
+  if (nero_grid && parameters->quantize_size > 1.0e-3 && approved_shift * need > 0.0) {
+    const double q = parameters->quantize_size;
+    return std::abs(approved_shift) >= std::round(std::abs(need) / q) * q - 0.02;
+  }
   return approved_shift * need > 0.0 && std::abs(approved_shift) >= std::abs(need);
 }
 
@@ -1507,7 +1547,48 @@ std::optional<double> getAvoidMargin(
         const double inlane = room + *nero_inlane_tol - 0.5 * vehicle_width;
         // keep_m applies to a vehicle carrying a fragment's history (NERO_SOA_AMBIGUOUS_FRAGMENT checks hard + 0.1 m for it)
         const double keep = nero_frag::carried(object) ? nero_inlane_keep : 0.0;
+        // NERO_SOA_INLANE_HOLD=<hold_s> (ownlane-2 2026-11-25, QUEUE INLANEFLIP-1125; the stock-side pattern is upstream #11046
+        // "prevent chattering in avoidance decision", on the car as NERO_SOA_NO_CHATTER): once an object got the in-lane verdict, it
+        // keeps it while it stays a target (seen again within hold_s): when the test fails later, the margin stays capped at
+        // max(in-lane margin, hard + keep_m) instead of jumping back to the stock soft margin. 24 Nov 13:01 sim 1125-162258: f8dd's
+        // box moved 0.29 m toward the lane (overhang -0.26 -> +0.03, 29.6 -> 30.1 s), the in-lane margin 1.00 failed hard + keep by a
+        // hair and the stock 1.06 took the shift 0.74 -> 1.09 m (body ~0.25 m over the centre line for 7.6 s). The hard margin (+ keep_m
+        // for a fragment-carried vehicle) is never cut. Unset = the car.
+        static const double nero_inlane_hold_s = [] {
+          const char * v = std::getenv("NERO_SOA_INLANE_HOLD");
+          return (v != nullptr && *v) ? std::atof(v) : -1.0;
+        }();
+        static std::map<std::string, std::chrono::steady_clock::time_point> nero_inlane_mem;
+        const auto & nu = object.object.object_id.uuid;
+        const std::string nkey(nu.begin(), nu.end());
+        const auto nnow = std::chrono::steady_clock::now();
+        // not for a fragment-carried vehicle (keep > 0): its line must keep NERO_SOA_AMBIGUOUS_FRAGMENT's hard + 0.1 m, and a held cap
+        // lowered c4df's line under it (sim 1125-182501: held 0.86 for stock 0.92, then the fragment rule refused 0.83-0.85 m for 14 s)
+        if (nero_inlane_hold_s > 0.0 && keep <= 0.0 && !(inlane >= min_avoid_margin + keep && inlane < stock)) {
+          const auto it = nero_inlane_mem.find(nkey);
+          if (it != nero_inlane_mem.end()) {
+            if (std::chrono::duration<double>(nnow - it->second).count() > nero_inlane_hold_s) {
+              nero_inlane_mem.erase(it);
+            } else {
+              const double held = std::max(inlane, min_avoid_margin + keep);
+              if (held < stock) {
+                it->second = nnow;
+                static rclcpp::Clock hold_clock(RCL_STEADY_TIME);
+                RCLCPP_INFO_THROTTLE(
+                  rclcpp::get_logger("static_obstacle_avoidance"), hold_clock, 500,
+                  "[NERO_SOA_INLANE_HOLD] %02x%02x: in-lane verdict held: margin %.2f (stock %.2f; in-lane %.2f, hard %.2f + "
+                  "keep %.2f; room to the lane line %.2f)",
+                  object.object.object_id.uuid[0], object.object.object_id.uuid[1], held, stock, inlane, min_avoid_margin,
+                  keep, room);
+                return held;
+              }
+            }
+          }
+        }
         if (inlane >= min_avoid_margin + keep && inlane < stock) {
+          if (nero_inlane_hold_s > 0.0) {
+            nero_inlane_mem[nkey] = nnow;
+          }
           static rclcpp::Clock dbg_clock(RCL_ROS_TIME);
           static const bool dbg = std::getenv("NERO_SOA_INLANE_DEBUG") != nullptr;
           if (dbg) {
