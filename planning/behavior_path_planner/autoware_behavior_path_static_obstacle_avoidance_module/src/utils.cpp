@@ -850,6 +850,23 @@ bool isMergingToEgoLane(const ObjectData & object)
  * @param parameters.
  * @return if the object is close to road shoulder of the lane, return true.
  */
+// lateavoid research (log only): NERO_SOA_LATE_DEBUG=1 prints the parked-vehicle check's inputs per vehicle and cycle
+void nero_late_parked_debug(
+  const ObjectData & object, const char * side, const lanelet::Id bound_ll, const double center_to_bound, const double arc_dist,
+  const double arc_len, const double shiftable_distance)
+{
+  static const bool dbg = std::getenv("NERO_SOA_LATE_DEBUG") != nullptr;
+  if (!dbg) return;
+  const auto c = lanelet::utils::to2D(object.overhang_lanelet.centerline());
+  RCLCPP_INFO(
+    rclcpp::get_logger("static_obstacle_avoidance"),
+    "[NERO_SOA_LATE] %s parked check: overhang_lanelet %ld (turn %s, len %.1f) side %s bound lanelet %ld centre->bound %.2f "
+    "arc dist %.2f at arc %.1f shiftable %.2f ratio %.2f long %.1f in_ix %d",
+    nero_frag::hexId(object.object.object_id).c_str(), object.overhang_lanelet.id(),
+    object.overhang_lanelet.attributeOr("turn_direction", "-"), static_cast<double>(lanelet::geometry::length(c)), side, bound_ll, center_to_bound,
+    arc_dist, arc_len, shiftable_distance, object.shiftable_ratio, object.longitudinal, object.is_within_intersection);
+}
+
 bool isParkedVehicle(
   ObjectData & object, const AvoidancePlanningData & data,
   const std::shared_ptr<RouteHandler> & route_handler,
@@ -914,6 +931,8 @@ bool isParkedVehicle(
     object.shiftable_ratio = arc_coordinates.distance / object_shiftable_distance;
 
     is_left_side_parked_vehicle = object.shiftable_ratio > parameters->object_check_shiftable_ratio;
+    nero_late_parked_debug(object, "left", most_left_lanelet.id(), center_to_left_boundary, arc_coordinates.distance,
+      arc_coordinates.length, object_shiftable_distance);
   }
 
   bool is_right_side_parked_vehicle = false;
@@ -964,6 +983,8 @@ bool isParkedVehicle(
 
     is_right_side_parked_vehicle =
       object.shiftable_ratio > parameters->object_check_shiftable_ratio;
+    nero_late_parked_debug(object, "right", most_right_lanelet.id(), center_to_right_boundary, arc_coordinates.distance,
+      arc_coordinates.length, object_shiftable_distance);
   }
 
   if (!is_left_side_parked_vehicle && !is_right_side_parked_vehicle) {

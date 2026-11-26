@@ -44,6 +44,12 @@
 #include <magic_enum.hpp>
 #include <tf2/utils.h>
 #include <lanelet2_core/geometry/LineString.h>
+#include <lanelet2_core/geometry/Lanelet.h>  // NERO_SOA_TURN_EXIT_ROOM
+#include <boost/geometry/algorithms/correct.hpp>  // NERO_SOA_TURN_EXIT_ROOM
+#include <boost/geometry/algorithms/envelope.hpp>
+#include <boost/geometry/algorithms/intersection.hpp>
+#include <boost/geometry/algorithms/is_valid.hpp>
+#include <boost/geometry/algorithms/within.hpp>
 #include <lanelet2_core/primitives/BasicRegulatoryElements.h>
 #include <autoware_utils/system/time_keeper.hpp>
 
@@ -62,6 +68,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <tuple>  // NERO_SOA_TURN_EXIT_ROOM memo
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -364,6 +371,206 @@ std::optional<size_t> neroLastPointKeptByCut(
   }
   return last;
 }
+
+// lateavoid (2026-11-26) NERO_SOA_TURN_EXIT_ROOM=<back_m>[,<min_cover>] (unset / 0 = stock): room at a turn's exit.
+// A turn lanelet (turn_direction) has no neighbour lanelet, so static avoidance's drivable area there ends at its own bound: a car
+// standing just inside the exit lane (23 Nov 14:58 #19: CAR 7d1a 3 m into 22034 after right turn 1444014) needs a shift that must
+// begin inside the turn, and isValidShiftLine refused it every cycle ("bound 1.47 m < 1.50 at shift 1.19") until obstacle_stop
+// stood the robot. Upstream's answer is the map's intersection_area polygon (#4206, use_intersection_areas); the Izdihar map has
+// none. This gives the turn the same room from the map's own lanelets: when the exit lane E has a neighbour (opposite or
+// same-direction lane) on a side where the turn T has none, T's edge on that side becomes T's bound up to a point P <back_m>
+// before its end, then straight to the near corner Q of that neighbour's mouth (where its bound meets the junction). The room
+// (the triangle P .. T's end .. Q) is used only if it lies beside T, is >= <min_cover> covered by other lanelets of the map
+// (junction lanelets: it is road per the map), and the neighbour is not a lanelet the robot came from (U-turns). P moves toward
+// the end until the room passes. Built from existing map points (their ids kept); the map is not changed. A map intersection_area
+// on T takes precedence (T skipped). NERO_SOA_TURN_EXIT_DEBUG=1 logs every room given.
+namespace nero_te
+{
+struct Cfg
+{
+  bool on{false};
+  double back_m{8.0};
+  double min_cover{0.95};
+  double max_gap_m{6.0};
+  bool debug{false};
+};
+const Cfg & cfg()
+{
+  static const Cfg c = [] {
+    Cfg k;
+    const char * v = std::getenv("NERO_SOA_TURN_EXIT_ROOM");
+    if (v != nullptr && std::atof(v) > 0.0) {
+      k.on = true;
+      k.back_m = std::atof(v);
+      const char * comma = std::strchr(v, ',');
+      if (comma != nullptr && std::atof(comma + 1) > 0.0) k.min_cover = std::atof(comma + 1);
+    }
+    k.debug = std::getenv("NERO_SOA_TURN_EXIT_DEBUG") != nullptr;
+    return k;
+  }();
+  return c;
+}
+
+// share of the room covered by lanelets of the map other than `self` (0.25 m grid)
+double coveredShare(
+  const autoware_utils::Polygon2d & room, const lanelet::LaneletMapConstPtr & map, const lanelet::Id self)
+{
+  autoware_utils::Box2d box;
+  boost::geometry::envelope(room, box);
+  const lanelet::BoundingBox2d bb(
+    lanelet::BasicPoint2d(box.min_corner().x(), box.min_corner().y()),
+    lanelet::BasicPoint2d(box.max_corner().x(), box.max_corner().y()));
+  std::vector<lanelet::ConstLanelet> near;
+  for (const auto & ll : map->laneletLayer.search(bb)) {
+    if (ll.id() != self) near.push_back(ll);
+  }
+  int in = 0;
+  int cov = 0;
+  constexpr double step = 0.25;
+  for (double x = box.min_corner().x() + 0.5 * step; x < box.max_corner().x(); x += step) {
+    for (double y = box.min_corner().y() + 0.5 * step; y < box.max_corner().y(); y += step) {
+      if (!boost::geometry::within(autoware_utils::Point2d(x, y), room)) continue;
+      ++in;
+      const lanelet::BasicPoint2d p(x, y);
+      for (const auto & ll : near) {
+        if (lanelet::geometry::inside(ll, p)) {
+          ++cov;
+          break;
+        }
+      }
+    }
+  }
+  return in > 0 ? static_cast<double>(cov) / static_cast<double>(in) : 0.0;
+}
+
+lanelet::LineString3d copyLine(const lanelet::Id id, const std::vector<lanelet::ConstPoint3d> & pts)
+{
+  lanelet::Points3d out;
+  for (const auto & p : pts) out.emplace_back(p.id(), p.x(), p.y(), p.z());
+  return lanelet::LineString3d(id, out);
+}
+
+// lanes[i] is the drivable lanes of current[i] (both built from the module's current lanelets in order)
+size_t expand(
+  std::vector<DrivableLanes> & lanes, const lanelet::ConstLanelets & current,
+  const std::shared_ptr<RouteHandler> & rh, const rclcpp::Logger & logger, rclcpp::Clock & clock)
+{
+  const auto & c = cfg();
+  if (!c.on || lanes.size() != current.size() || current.size() < 2) return 0;
+  const lanelet::LaneletMapConstPtr map = rh->getLaneletMapPtr();
+  constexpr lanelet::Id kSynth = 9100000000000LL;
+  size_t given = 0;
+  for (size_t i = 0; i + 1 < current.size(); ++i) {
+    const auto & T = current.at(i);
+    const auto & E = current.at(i + 1);
+    if (!T.hasAttribute("turn_direction") || T.hasAttribute("intersection_area")) continue;
+    auto & dT = lanes.at(i);
+    const auto & dE = lanes.at(i + 1);
+    for (const bool left : {true, false}) {
+      if ((left ? dT.left_lane : dT.right_lane).id() != T.id()) continue;  // T has a neighbour / room on this side
+      const auto & edgeE = left ? dE.left_lane : dE.right_lane;
+      if (edgeE.id() == E.id()) continue;  // the exit lane has none on this side either
+      bool from_behind = false;  // a U-turn: the neighbour is a lanelet the robot came from (route-dependent: checked every cycle)
+      for (size_t j = 0; j < i; ++j) from_behind = from_behind || current.at(j).id() == edgeE.id();
+      if (from_behind) continue;
+      // the room depends only on the map: worked out once per (turn, exit, neighbour, side) and kept (BPP's timer may run on any
+      // executor thread: one mutex)
+      static std::mutex memo_mtx;
+      static std::map<std::tuple<lanelet::Id, lanelet::Id, lanelet::Id, bool>, std::optional<lanelet::Lanelet>> memo;
+      const auto key = std::make_tuple(T.id(), E.id(), edgeE.id(), left);
+      {
+        std::lock_guard<std::mutex> lk(memo_mtx);
+        const auto it = memo.find(key);
+        if (it != memo.end()) {
+          if (it->second) {
+            (left ? dT.left_lane : dT.right_lane) = *it->second;
+            if (dT.left_lane.id() != T.id() && dT.right_lane.id() != T.id()) dT.middle_lanes.push_back(T);
+            ++given;
+            if (c.debug) {
+              RCLCPP_INFO_THROTTLE(
+                logger, clock, 1000, "[NERO_SOA_TURN_EXIT] turn %ld -> exit %ld: room on the %s toward %ld (kept)", T.id(), E.id(),
+                left ? "left" : "right", edgeE.id());
+            }
+          }
+          continue;
+        }
+      }
+      std::optional<lanelet::Lanelet> made;
+      const auto remember = [&]() {
+        std::lock_guard<std::mutex> lk(memo_mtx);
+        memo[key] = made;
+      };
+      do {
+      const auto tb = left ? T.leftBound3d() : T.rightBound3d();
+      const auto eb_own = left ? E.leftBound3d() : E.rightBound3d();
+      const auto eb = left ? edgeE.leftBound3d() : edgeE.rightBound3d();
+      if (tb.size() < 3 || eb.empty() || eb_own.empty()) break;
+      if (
+        tb.back().id() != eb_own.front().id() &&
+        lanelet::geometry::distance2d(tb.back(), eb_own.front()) > 0.05) {
+        break;  // T does not hand over to E's bound on this side
+      }
+      const auto q = eb.front();
+      const double gap = lanelet::geometry::distance2d(q, tb.back());
+      if (gap < 0.5 || gap > c.max_gap_m) break;
+      std::vector<double> to_end(tb.size(), 0.0);
+      for (size_t k = tb.size() - 1; k > 0; --k) {
+        to_end.at(k - 1) = to_end.at(k) + lanelet::geometry::distance2d(tb[k - 1], tb[k]);
+      }
+      const auto T_poly = lanelet::utils::to2D(T.polygon3d()).basicPolygon();
+      autoware_utils::Polygon2d t_poly;
+      for (const auto & p : T_poly) t_poly.outer().emplace_back(p.x(), p.y());
+      boost::geometry::correct(t_poly);
+      for (double back = c.back_m; back >= 2.0; back *= 0.75) {
+        size_t k = 0;
+        for (size_t j = 0; j + 1 < tb.size(); ++j) {
+          if (to_end.at(j) >= back) k = j;
+        }
+        if (k == 0 && to_end.front() < back) break;  // T is shorter than that
+        autoware_utils::Polygon2d room;
+        for (size_t j = k; j < tb.size(); ++j) room.outer().emplace_back(tb[j].x(), tb[j].y());
+        room.outer().emplace_back(q.x(), q.y());
+        boost::geometry::correct(room);
+        const double area = boost::geometry::area(room);
+        if (!boost::geometry::is_valid(room) || area < 0.5) continue;
+        std::vector<autoware_utils::Polygon2d> over;
+        boost::geometry::intersection(room, t_poly, over);
+        double over_area = 0.0;
+        for (const auto & o : over) over_area += boost::geometry::area(o);
+        if (over_area > 0.2 * area) continue;  // the chord cuts across T: no room beside it
+        const double cover = coveredShare(room, map, T.id());
+        if (cover < c.min_cover) continue;
+        std::vector<lanelet::ConstPoint3d> pts(tb.begin(), tb.begin() + static_cast<long>(k) + 1);
+        pts.push_back(q);
+        const auto other = left ? T.rightBound3d() : T.leftBound3d();
+        const auto side_ls = copyLine(kSynth + 4 * T.id() + (left ? 0 : 1), pts);
+        const auto other_ls =
+          copyLine(kSynth + 4 * T.id() + 2, std::vector<lanelet::ConstPoint3d>(other.begin(), other.end()));
+        const lanelet::Lanelet room_ll(
+          kSynth + 4 * T.id() + 3, left ? side_ls : other_ls, left ? other_ls : side_ls);
+        made = room_ll;
+        (left ? dT.left_lane : dT.right_lane) = room_ll;
+        if (dT.left_lane.id() != T.id() && dT.right_lane.id() != T.id()) {
+          dT.middle_lanes.push_back(T);  // room on both sides: T itself stays in the drivable lanes
+        }
+        ++given;
+        if (c.debug) {
+          RCLCPP_INFO_THROTTLE(
+            logger, clock, 1000,
+            "[NERO_SOA_TURN_EXIT] turn %ld (%s) -> exit %ld: room on the %s toward %ld's mouth corner (%.1f m from the turn's end), "
+            "P %.1f m before the end, %.1f m2, %.0f %% covered by other lanelets",
+            T.id(), T.attributeOr("turn_direction", "?"), E.id(), left ? "left" : "right", edgeE.id(), gap, back, area,
+            100.0 * cover);
+        }
+        break;
+      }
+      } while (false);
+      remember();
+    }
+  }
+  return given;
+}
+}  // namespace nero_te
 
 // stock combineDrivableLanes with the lanelet match by id only, plus the previous module's elements before the first
 // shared one kept in front
@@ -1474,6 +1681,7 @@ void StaticObstacleAvoidanceModule::fillFundamentalData(
         data.red_signal_lane = lanelet;
       }
     });
+  nero_te::expand(data.drivable_lanes, data.current_lanelets, planner_data_->route_handler, getLogger(), *clock_);
 
   // calc drivable bound
   auto tmp_path = getPreviousModuleOutput().path;
@@ -7585,6 +7793,8 @@ BehaviorModuleOutput StaticObstacleAvoidanceModule::plan()
           utils::static_obstacle_avoidance::generateExpandedDrivableLanes(
             lanelet, planner_data_, parameters_));
       });
+    nero_te::expand(
+      current_drivable_area_info.drivable_lanes, data.current_lanelets, planner_data_->route_handler, getLogger(), *clock_);
     // expand hatched road markings
     current_drivable_area_info.enable_expanding_hatched_road_markings =
       parameters_->use_hatched_road_markings;
